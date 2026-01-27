@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+import math
 
 
 class EmpiricalNormalization(nn.Module):
@@ -98,6 +99,15 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
             return rew / self.emp_norm._std
         else:
             return rew
+
+
+class ScaledNormalization(nn.Module):
+    def __init__(self, p: float = 2.0) -> None:
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return math.sqrt(x.shape[-1]) * nn.functional.normalize(x, p=self.p, dim=-1)
 
 
 """

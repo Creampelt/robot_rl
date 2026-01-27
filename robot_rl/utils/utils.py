@@ -12,7 +12,11 @@ import pathlib
 import torch
 import warnings
 from tensordict import TensorDict
-from typing import Callable
+from typing import Callable, TypeVar, Any
+import numpy as np
+
+
+T = TypeVar("T")
 
 
 def resolve_nn_activation(act_name: str) -> torch.nn.Module:
@@ -302,3 +306,50 @@ def resolve_obs_groups(
     print("-" * 80)
 
     return obs_groups
+
+
+def get_obs_dimensions(obs: TensorDict, obs_groups: list[str]) -> int:
+    num_obs: int = 0
+    for obs_group in obs_groups:
+        assert len(obs[obs_group].shape) == 2, "Only 1D observations are supported."
+        num_obs += obs[obs_group].shape[-1]
+    return num_obs
+
+
+def dtype_numpytotorch(np_dtype: Any) -> torch.dtype:
+    if isinstance(np_dtype, torch.dtype):
+        return np_dtype
+    if np_dtype == np.float16:
+        return torch.float16
+    elif np_dtype == np.float32:
+        return torch.float32
+    elif np_dtype == np.float64:
+        return torch.float64
+    elif np_dtype == np.int16:
+        return torch.int16
+    elif np_dtype == np.int32:
+        return torch.int32
+    elif np_dtype == np.int64:
+        return torch.int64
+    elif np_dtype == bool:  # noqa: E721
+        return torch.bool
+    elif np_dtype == np.uint8:
+        return torch.uint8
+    else:
+        raise ValueError(f"Unknown type {np_dtype}")
+
+
+# @torch.jit.script
+def uncertainty_penalized_mean(data: torch.Tensor, lam: float) -> torch.Tensor:
+    """Computes uncertainty-penalized mean, i.e.
+
+    .. math::
+
+        \mathbb{E}[X] - \gamma \cdot Uncertainty(X)
+
+    where Uncertainty(X) is the average pairwise difference between all entries of X.
+    """
+    N = data.shape[0]
+    mean = data.mean(dim=0)
+    uncertainty = torch.abs(data.unsqueeze(dim=0) - data.unsqueeze(dim=1)).sum(dim=(0, 1)) / (N**2 - N)
+    return mean - lam * uncertainty

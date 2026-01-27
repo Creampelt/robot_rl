@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from robot_rl.modules import ActorCritic
+from .actor_critic import ActorCritic
 from robot_rl.networks import MLP, EmpiricalNormalization
 
 

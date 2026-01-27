@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -31,8 +32,8 @@ class MLP(nn.Sequential):
     def __init__(
         self,
         input_dim: int,
-        output_dim: int | tuple[int] | list[int],
-        hidden_dims: tuple[int] | list[int],
+        output_dim: int | Sequence[int],
+        hidden_dims: Sequence[int],
         activation: str = "elu",
         last_activation: str | None = None,
     ):
@@ -72,7 +73,7 @@ class MLP(nn.Sequential):
             total_out_dim = reduce(lambda x, y: x * y, output_dim)
             # add a layer to reshape the output to the desired shape
             layers.append(nn.Linear(hidden_dims_processed[-1], total_out_dim))
-            layers.append(nn.Unflatten(output_dim))
+            layers.append(nn.Unflatten(-1, tuple(output_dim)))
 
         # add last activation function if specified
         if last_activation_mod is not None:

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
-from typing import Literal
+from typing import Literal, Generator
 
 from robot_rl.utils import split_and_pad_trajectories
 
@@ -25,14 +25,16 @@ class RolloutStorage:
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
             self.hidden_states: tuple | None = None
-            self.last_observations: torch.Tensor | None = None
+            self.next_observations: TensorDict | None = None
+            self.z: torch.Tensor | None = None
+            self.last_observations: TensorDict | None = None
 
         def clear(self):
             self.__init__()
 
     def __init__(
         self,
-        training_type: Literal["rl", "distillation"],
+        training_type: Literal["rl", "distillation", "url"],
         num_envs: int,
         num_transitions_per_env: int,
         obs: TensorDict,
@@ -41,7 +43,7 @@ class RolloutStorage:
         use_last_obs: bool = False,
     ):
         # store inputs
-        self.training_type = training_type
+        self.training_type: Literal["rl", "distillation", "url"] = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -60,15 +62,18 @@ class RolloutStorage:
         # for distillation
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-
         # for reinforcement learning
-        if training_type == "rl":
+        elif training_type == "rl":
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        elif training_type == "url":
+            self.next_observations: TensorDict = self.observations.clone()
+            self.z = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.gammas = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For last observation (for estimation)
         self.last_obs = self.observations.clone() if use_last_obs else None
@@ -94,13 +99,16 @@ class RolloutStorage:
         # for distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
-
         # for reinforcement learning
-        if self.training_type == "rl":
+        elif self.training_type == "rl":
             self.values[self.step].copy_(transition.values)
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
+        # for unsupervised RL
+        elif self.training_type == "url":
+            self.next_observations[self.step].copy_(transition.next_observations)
+            self.z[self.step].copy_(transition.z)
 
         # For last observation (for estimation)
         if self.last_obs is not None:
@@ -135,7 +143,13 @@ class RolloutStorage:
     def clear(self):
         self.step = 0
 
-    def compute_returns(self, last_values, gamma, lam, normalize_advantage: bool = True):
+    def compute_returns(
+        self,
+        last_values: torch.Tensor,
+        gamma: float,
+        lam: float,
+        normalize_advantage: bool = True,
+    ) -> None:
         advantage = 0
         for step in reversed(range(self.num_transitions_per_env)):
             # if we are at the last step, bootstrap the return value

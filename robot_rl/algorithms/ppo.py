@@ -129,7 +129,7 @@ class PPO:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
-        use_last_obs,
+        use_last_obs: bool,
     ) -> None:
         # create rollout storage
         self.storage = RolloutStorage(

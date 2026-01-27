@@ -5,13 +5,11 @@
 
 """Definitions for neural-network components for RL-agents."""
 
-from .actor_critic import ActorCritic
-from .actor_critic_recurrent import ActorCriticRecurrent
+from .actor_critic import *
+from .forward_backward import *
 from .rnd import *
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
-from .actor_critic_estimator import *
-from .actor_critic_mha import ActorCriticMHA
 from .probe import Probe
 from .sae import SAE
 from .symmetry import *
@@ -21,8 +19,11 @@ __all__ = [
     "ActorCriticRecurrent",
     "ActorCriticEstimator",
     "ActorCriticMHA",
+    "ForwardBackward",
     "StudentTeacher",
     "StudentTeacherRecurrent",
     "Probe",
     "SAE",
+    "resolve_estimator_config",
+    "resolve_rnd_config",
 ]
