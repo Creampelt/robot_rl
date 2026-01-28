@@ -8,5 +8,5 @@
 from .memory import Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization, ScaledNormalization
-from .parallel import ParallelMLP, ParallelEmbedding
+from .parallel import ParallelLinear, ParallelLayerNorm
 from .distributions import TruncatedNormal

@@ -8,12 +8,14 @@ import time
 import torch
 from collections import deque
 from tensordict import TensorDict
+import matplotlib.pyplot as plt
+import numpy as np
 
 import robot_rl
 from robot_rl.algorithms import FbCpr
 from robot_rl.env import VecEnv
 from robot_rl.modules import ForwardBackward
-from robot_rl.utils import resolve_obs_groups, store_code_state
+from robot_rl.utils import resolve_obs_groups, store_code_state, reset_parameters
 
 
 class OffPolicyRunner:
@@ -30,8 +32,10 @@ class OffPolicyRunner:
         self._configure_multi_gpu()
 
         # store training configuration
-        self.num_updates_per_step = self.cfg["num_updates_per_step"]
+        self.num_steps_per_env = self.cfg["num_steps_per_env"]
+        self.num_agent_updates = self.cfg["num_agent_updates"]
         self.num_seed_steps_per_env = self.cfg["num_seed_steps_per_env"]
+        self.num_steps_per_log = self.cfg["num_steps_per_log"]
         self.save_interval = self.cfg["save_interval"]
 
         # query observations from environment for algorithm construction
@@ -80,15 +84,18 @@ class OffPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        collection_time = 0.0
+        learn_time = 0.0
         for it in range(start_iter, tot_iter):
             start = time.time()
             z: torch.Tensor | None = None
             last_dones: torch.Tensor | None = None
+            is_seed = it <= self.num_seed_steps_per_env + start_iter
             # Rollout
             with torch.inference_mode():
                 z = self.alg.update_z(z, last_dones, self.env.num_envs)
                 # Sample actions
-                actions = self.alg.act(obs, z, last_dones)
+                actions = self.alg.act(obs, z, last_dones, random_sample=is_seed)
                 # Step the environment
                 obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                 # Move to device
@@ -116,32 +123,40 @@ class OffPolicyRunner:
                 last_dones = dones
 
                 stop = time.time()
-                collection_time = stop - start
+                collection_time += stop - start
                 start = stop
 
-            if it > self.num_seed_steps_per_env + start_iter:
-                # with torch.inference_mode():
-                self.alg.compute_returns()
+            if not is_seed and it % self.num_steps_per_env == 0:
+                with torch.inference_mode():
+                    self.alg.compute_returns()
 
                 # update policy
-                for _ in range(self.num_updates_per_step):
+                for _ in range(self.num_agent_updates):
                     loss_dict, extras = self.alg.update()
                     loss_infos.append(loss_dict)
                     algo_infos.append(extras["log"])
 
             stop = time.time()
-            learn_time = stop - start
+            learn_time += stop - start
             self.current_learning_iteration = it
             # log info
-            if self.log_dir is not None and not self.disable_logs:
+            if self.log_dir is not None and not self.disable_logs and it % self.num_steps_per_log == 0:
                 # Log information
                 self.log(locals())
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                collection_time = 0.0
+                learn_time = 0.0
 
-            # Clear episode infos
-            ep_infos.clear()
+                # Clear episode infos
+                ep_infos.clear()
+                algo_infos.clear()
+                loss_infos.clear()
+
+            # callback for video logging
+            if self.logger_type in ["wandb"]:
+                self.writer.callback(it)
 
             # Save code state
             if it == start_iter and not self.disable_logs:
@@ -206,7 +221,7 @@ class OffPolicyRunner:
                         loss_info[key] = loss_info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, loss_info[key].to(self.device)))
                 value = torch.mean(infotensor).item()
-                self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+                self.writer.add_scalar(f"Loss/{key}_loss", value, locs["it"])
                 loss_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
 
         # -- Algorithm info
@@ -245,10 +260,6 @@ class OffPolicyRunner:
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
-
-        # callback for video logging
-        if self.logger_type in ["wandb"]:
-            self.writer.callback(locs["it"])
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
@@ -332,11 +343,9 @@ class OffPolicyRunner:
     #     return self.alg.policy.act_inference
 
     def train_mode(self) -> None:
-        # -- PPO
-        self.alg.policy.train()
+        self.alg.train_mode()
 
     def eval_mode(self) -> None:
-        # -- PPO
         self.alg.policy.eval()
 
     def add_git_repo_to_log(self, repo_file_path):

@@ -17,7 +17,6 @@ class ParallelLinear(nn.Module):
         bias: bool = True,
         device: str | None = None,
         dtype: torch.dtype | None = None,
-        reset_params: bool = True,
     ) -> None:
         super().__init__()
 
@@ -39,9 +38,6 @@ class ParallelLinear(nn.Module):
             self.bias = nn.Parameter(torch.empty(bias_dim, **factory_kwargs))
         else:
             self.register_parameter("bias", None)
-
-        if reset_params:
-            self.reset_parameters()
 
     def reset_parameters(self) -> None:
         gain = nn.init.calculate_gain("relu")
@@ -82,6 +78,9 @@ class ParallelLinear(nn.Module):
         else:
             return torch.baddbmm(self.bias, x, self.weight)
 
+    def extra_repr(self) -> str:
+        return f"in_features={self.input_dim}, out_features={self.output_dim}, num_parallel={self.num_parallel}, bias={self.bias is not None}"
+
 
 class ParallelLayerNorm(nn.Module):
     def __init__(
@@ -91,7 +90,6 @@ class ParallelLayerNorm(nn.Module):
         eps: float = 1e-5,
         device: str | None = None,
         dtype: torch.dtype | None = None,
-        reset_params: bool = True,
     ) -> None:
         super().__init__()
         assert len(normalized_shape) == 1, "ParallelLayerNorm is currently only supported for single layer norms."
@@ -106,9 +104,6 @@ class ParallelLayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.empty(param_dim, **factory_kwargs))
         self.bias = nn.Parameter(torch.empty(param_dim, **factory_kwargs))
 
-        if reset_params:
-            self.reset_parameters()
-
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
         nn.init.zeros_(self.bias)
@@ -116,93 +111,5 @@ class ParallelLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(x, self.normalized_shape, eps=self.eps) * self.weight + self.bias
 
-
-class ParallelMLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        hidden_dims: Sequence[int] = [],
-        num_parallel: int = 1,
-        activation: str | Sequence[str] = "relu",
-        last_activation: bool = False,
-        reset_params: bool = True,
-    ) -> None:
-        super().__init__()
-
-        expected_acts = len(hidden_dims) + 2 if last_activation else len(hidden_dims) + 1
-        if not isinstance(activation, str):
-            assert len(activation) == expected_acts, f"Expected {expected_acts} activations, got {len(activation)}"
-        else:
-            activation = [activation] * expected_acts
-
-        layer_dims = [input_dim, *hidden_dims]
-        layers = []
-        for i, dim in enumerate(layer_dims[:-1]):
-            layers.append(
-                ParallelLinear(
-                    dim,
-                    layer_dims[i + 1],
-                    num_parallel,
-                    reset_params=reset_params,
-                )
-            )
-            layers.append(resolve_nn_activation(activation[i]))
-        layers.append(
-            ParallelLinear(
-                layer_dims[-1],
-                output_dim,
-                num_parallel,
-                reset_params=reset_params,
-            )
-        )
-        if last_activation:
-            layers.append(resolve_nn_activation(activation[-1]))
-
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
-
-
-class ParallelEmbedding(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        hidden_dims: Sequence[int] = [],
-        num_parallel: int = 1,
-        activation: str = "relu",
-        reset_params: bool = True,
-    ) -> None:
-        super().__init__()
-
-        layers = [
-            ParallelLinear(input_dim, hidden_dims[0], num_parallel, reset_params=reset_params),
-            ParallelLayerNorm((hidden_dims[0],), num_parallel),
-            nn.Tanh(),
-        ]
-        for i, dim in enumerate(hidden_dims[:-1]):
-            layers.append(
-                ParallelLinear(
-                    dim,
-                    hidden_dims[i + 1],
-                    num_parallel,
-                    reset_params=reset_params,
-                )
-            )
-            layers.append(resolve_nn_activation(activation))
-        layers.append(
-            ParallelLinear(
-                hidden_dims[-1],
-                output_dim,
-                num_parallel,
-                reset_params=reset_params,
-            )
-        )
-        layers.append(resolve_nn_activation(activation))
-
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+    def extra_repr(self) -> str:
+        return f"{self.normalized_shape}, eps={self.eps}, num_parallel={self.num_parallel}"

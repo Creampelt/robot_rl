@@ -8,7 +8,7 @@ from tensordict import TensorDict
 
 from robot_rl.modules import ForwardBackward
 from robot_rl.storage import ReplayBuffer
-from robot_rl.utils import uncertainty_penalized_mean
+from robot_rl.utils import compute_td_targets, reset_parameters
 
 
 class FbCpr:
@@ -26,7 +26,6 @@ class FbCpr:
         weight_decay: float = 0.0,
         max_grad_norm: float | None = None,
         clip_actions: float = 0.2,
-        tau: float = 0.01,
         gamma: float = 0.99,
         train_goal_ratio: float = 0.5,
         forward_backward_pessimism: float = 0.0,
@@ -74,7 +73,6 @@ class FbCpr:
         self.batch_size = batch_size
         self.clip_actions = clip_actions
         self.max_grad_norm = max_grad_norm
-        self.tau = tau
         self.gamma = gamma
         self.z_dim = self.policy.z_dim
 
@@ -108,11 +106,22 @@ class FbCpr:
         pass
 
     def train_mode(self) -> None:
-        self.policy.train()
+        # initialize weights for training
+        self.policy.apply(reset_parameters)
+        self.policy.train(True, device=self.device)
 
-    def act(self, obs: TensorDict, z: torch.Tensor, dones: torch.Tensor | None) -> torch.Tensor:
+    def act(
+        self,
+        obs: TensorDict,
+        z: torch.Tensor,
+        dones: torch.Tensor | None,
+        random_sample: bool = False,
+    ) -> torch.Tensor:
         # compute the actions and values
         self.transition.actions = self.policy.act(obs, z).detach()
+        # uniformly sample from action space if specified
+        if random_sample:
+            self.transition.actions.uniform_(-1.0, 1.0).detach()
         # record obs and dones before env.step()
         self.transition.observations = obs
         self.transition.dones = dones
@@ -192,7 +201,7 @@ class FbCpr:
         extras.update(actor_extras)
 
         with torch.no_grad():
-            self.policy.soft_update_targets(self.tau)
+            self.policy.soft_update_targets()
 
         return loss_dict, {"log": extras}
 
@@ -220,15 +229,16 @@ class FbCpr:
             target_Fs = self.policy.F(next_obs, z, next_actions, use_target=True)
             target_B = self.policy.B(next_obs, use_target=True)
             target_Ms = torch.matmul(target_Fs, target_B.T)
-            target_M = uncertainty_penalized_mean(target_Ms, self.forward_backward_pessimism)
+            target_M = compute_td_targets(target_Ms, self.forward_backward_pessimism)
 
         Fs = self.policy.F(obs, z, actions)  # num_parallel x batch_size x z_dim
         B = self.policy.B(next_obs)  # batch_size x z_dim
         Ms = torch.matmul(Fs, B.T)  # num_parallel x batch_size x batch_size
 
+        # FB loss
         diff = Ms - gammas * target_M
         fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
-        fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
+        fb_diag = -torch.diagonal(Ms, dim1=1, dim2=2).mean()
         fb_loss = fb_offdiag + fb_diag
 
         # Orthonormality loss
@@ -237,17 +247,18 @@ class FbCpr:
         orth_diag = -cov.diag().mean()
         orth_loss = self.ortho_loss_coef * (orth_offdiag + orth_diag)
 
-        # Critic loss
+        # Fz regularization loss
         q_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
         with torch.no_grad():
-            next_values = self.policy.evaluate(next_obs, z, next_actions, use_target=True)  # batch_size
-            next_values = uncertainty_penalized_mean(next_values, self.forward_backward_pessimism)
+            next_Qs = (target_Fs * z).sum(dim=-1)
+            # next_Qs = self.policy.evaluate(next_obs, z, next_actions, use_target=True)  # batch_size
+            next_Q = compute_td_targets(next_Qs, self.forward_backward_pessimism)
             cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
             implicit_reward = (torch.matmul(B, cov.inverse()) * z).sum(dim=-1)  # batch_size
-            target_Q = implicit_reward.detach() + gammas.squeeze() * next_values  # batch_size
-            target_Q = target_Q.expand(self.policy.critic_num_parallel, -1)  # num_parallel x batch_size
-        Qs = self.policy.evaluate(obs, z, actions)  # num_parallel x batch_size
-        q_loss = self.value_loss_coef * 0.5 * Qs.shape[0] * nn.functional.mse_loss(Qs, target_Q)
+            target_Q = implicit_reward.detach() + gammas.squeeze() * next_Q  # batch_size
+            target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
+        Qs = (Fs * z).sum(dim=-1)  # self.policy.evaluate(obs, z, actions)  # num_parallel x batch_size
+        q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * nn.functional.mse_loss(Qs, target_Q)
 
         loss = fb_loss + orth_loss + q_loss
 
@@ -263,8 +274,8 @@ class FbCpr:
 
         loss_dict = {
             "forward_backward": fb_loss.detach(),
-            "orthonormality": orth_loss.detach() / self.ortho_loss_coef,
-            "value": q_loss.detach() / self.value_loss_coef,
+            "orthonormality": orth_loss.detach(),
+            "value_regularization": q_loss.detach(),
         }
 
         extras = {
@@ -284,7 +295,7 @@ class FbCpr:
     def _update_actor(self, obs: TensorDict, z: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict]:
         actions = self.policy.act(obs, z, clip=self.clip_actions)
         Qs = self.policy.evaluate(obs, z, actions)
-        Q = uncertainty_penalized_mean(Qs, self.actor_pessimism)
+        Q = compute_td_targets(Qs, self.actor_pessimism)
         actor_loss = -Q.mean()
 
         # optimize actor

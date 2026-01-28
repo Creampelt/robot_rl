@@ -339,17 +339,20 @@ def dtype_numpytotorch(np_dtype: Any) -> torch.dtype:
         raise ValueError(f"Unknown type {np_dtype}")
 
 
-# @torch.jit.script
-def uncertainty_penalized_mean(data: torch.Tensor, lam: float) -> torch.Tensor:
-    """Computes uncertainty-penalized mean, i.e.
+@torch.jit.script
+def compute_td_targets(data: torch.Tensor, lam: float) -> torch.Tensor:
+    """Computes TD targets, i.e.
 
     .. math::
 
-        \mathbb{E}[X] - \gamma \cdot Uncertainty(X)
-
-    where Uncertainty(X) is the average pairwise difference between all entries of X.
+        mean(x) - \frac{lam}{n^2 - n} \sum_{i, j} |x_i - x_j|
     """
     N = data.shape[0]
     mean = data.mean(dim=0)
     uncertainty = torch.abs(data.unsqueeze(dim=0) - data.unsqueeze(dim=1)).sum(dim=(0, 1)) / (N**2 - N)
     return mean - lam * uncertainty
+
+
+def reset_parameters(m: torch.nn.Module) -> None:
+    if hasattr(m, "reset_parameters"):
+        m.reset_parameters()
