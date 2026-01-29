@@ -1,21 +1,17 @@
 from __future__ import annotations
 
-from typing import Callable
-
 import os
 import statistics
 import time
 import torch
 from collections import deque
 from tensordict import TensorDict
-import matplotlib.pyplot as plt
-import numpy as np
 
 import robot_rl
 from robot_rl.algorithms import FbCpr
 from robot_rl.env import VecEnv
 from robot_rl.modules import ForwardBackward
-from robot_rl.utils import resolve_obs_groups, store_code_state, reset_parameters
+from robot_rl.utils import resolve_obs_groups, store_code_state
 
 
 class OffPolicyRunner:

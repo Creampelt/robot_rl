@@ -254,7 +254,6 @@ class ForwardBackward(nn.Module):
         return self.distribution.sample(clip=clip)
 
     def F(self, obs: TensorDict, z: torch.Tensor, action: torch.Tensor, use_target: bool = False) -> torch.Tensor:
-        # Note: does not affect torch gradient tracking. Only computes stopgrad from TD targets
         normalized_obs = self.get_critic_obs(obs)
         normalized_obs = self.critic_obs_normalizer(normalized_obs)
         obs_z = torch.cat([normalized_obs, z], dim=-1)

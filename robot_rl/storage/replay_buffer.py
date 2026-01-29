@@ -127,7 +127,7 @@ class ReplayBuffer:
             self._curr_idx -= self.capacity
 
     def compute_returns(self, gamma: float) -> None:
-        self.gammas = gamma * (~self.next_terminated).float()
+        self.gammas = gamma * (1 - self.next_terminated).float()
 
     def sample_mini_batch(self, device: str) -> tuple[TensorDict, torch.Tensor, torch.Tensor, TensorDict, torch.Tensor]:
         # sample indices from uniform distribution

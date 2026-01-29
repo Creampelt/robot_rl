@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Literal
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -286,8 +285,6 @@ class FbCpr:
             "F1_norm": Fs[0].detach().norm(dim=-1).mean(),
             "B_norm": B.detach().norm(dim=-1).mean(),
             "z_norm": z.detach().norm(dim=-1).mean(),
-            # "proj": (Fs @ B.T).norm(),
-            # "residual": (Fs - (Fs @ B.T) @ B).norm(),
         }
 
         return loss_dict, extras
