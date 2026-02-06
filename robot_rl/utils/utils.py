@@ -355,4 +355,4 @@ def compute_td_targets(data: torch.Tensor, lam: float) -> torch.Tensor:
 
 def reset_parameters(m: torch.nn.Module) -> None:
     if hasattr(m, "reset_parameters"):
-        m.reset_parameters()
+        m.reset_parameters()  # type: ignore

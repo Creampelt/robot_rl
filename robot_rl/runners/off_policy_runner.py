@@ -89,7 +89,7 @@ class OffPolicyRunner:
             is_seed = it <= self.num_seed_steps_per_env + start_iter
             # Rollout
             with torch.inference_mode():
-                z = self.alg.update_z(z, last_dones, self.env.num_envs)
+                z = self.alg.update_rollout_z(z, last_dones, self.env.num_envs)
                 # Sample actions
                 actions = self.alg.act(obs, z, last_dones, random_sample=is_seed)
                 # Step the environment

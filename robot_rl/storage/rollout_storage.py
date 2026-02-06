@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
-from typing import Literal, Generator
+from typing import Literal
 
 from robot_rl.utils import split_and_pad_trajectories
 

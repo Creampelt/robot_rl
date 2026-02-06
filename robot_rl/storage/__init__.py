@@ -7,6 +7,7 @@
 
 from .rollout_storage import RolloutStorage
 from .replay_buffer import ReplayBuffer
+from .trajectory_buffer import TrajectoryBuffer
 from .z_buffer import ZBuffer
 
-__all__ = ["RolloutStorage", "ReplayBuffer", "ZBuffer"]
+__all__ = ["RolloutStorage", "ReplayBuffer", "TrajectoryBuffer", "ZBuffer"]

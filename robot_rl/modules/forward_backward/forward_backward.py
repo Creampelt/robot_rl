@@ -1,10 +1,8 @@
-from typing import Sequence, cast
+from typing import Sequence
 import copy
-import math
 
 import torch
 import torch.nn as nn
-import torch.distributions as pyd
 from tensordict import TensorDict
 
 from robot_rl.networks import (
@@ -13,8 +11,7 @@ from robot_rl.networks import (
     ScaledNormalization,
     TruncatedNormal,
 )
-from robot_rl.utils import get_obs_dimensions, resolve_nn_activation, reset_parameters
-import matplotlib.pyplot as plt
+from robot_rl.utils import get_obs_dimensions, resolve_nn_activation
 
 
 class _SimpleEmbedding(nn.Module):
@@ -136,20 +133,25 @@ class ForwardBackward(nn.Module):
         obs_groups: dict[str, list[str]],
         num_actions: int,
         z_dim: int = 100,
-        tau: float = 0.01,
+        fb_tau: float = 0.01,
+        critic_tau: float = 0.005,
         init_noise_std: float = 0.2,
-        actor_num_parallel: int = 1,
-        forward_num_parallel: int = 2,
-        backward_num_parallel: int = 1,
         actor_obs_normalization: bool = True,
         critic_obs_normalization: bool = True,
         z_normalization: bool = True,
         backward_out_normalization: bool = True,
+        actor_num_parallel: int = 1,
         actor_hidden_dims: Sequence[int] = [1024, 1024, 1024],
         actor_num_embedding_layers: int = 2,
+        forward_num_parallel: int = 2,
         forward_hidden_dims: Sequence[int] = [1024, 1024, 1024],
         forward_num_embedding_layers: int = 2,
+        backward_num_parallel: int = 1,
         backward_hidden_dims: Sequence[int] = [256, 256],
+        discriminator_hidden_dims: Sequence[int] = [1024, 1024, 1024],
+        critic_num_parallel: int = 2,
+        critic_hidden_dims: Sequence[int] = [1024, 1024, 1024],
+        critic_num_embedding_layers: int = 2,
         **kwargs,
     ):
         if kwargs:
@@ -160,7 +162,8 @@ class ForwardBackward(nn.Module):
         super().__init__()
 
         self.z_dim = z_dim
-        self.tau = tau
+        self.fb_tau = fb_tau
+        self.critic_tau = critic_tau
         self.init_noise_std = init_noise_std
 
         # get the observation dimensions
@@ -191,13 +194,27 @@ class ForwardBackward(nn.Module):
             forward_num_embedding_layers,
             forward_num_parallel,
         )
-
         self.backward_map = _SimpleMLP(
             self.num_critic_obs,
             z_dim,
             backward_hidden_dims,
             num_parallel=backward_num_parallel,
-            last_activation=ScaledNormalization(),
+            last_activation=ScaledNormalization() if backward_out_normalization else "identity",
+        )
+        # discriminator
+        self.discriminator = _SimpleMLP(
+            self.num_critic_obs + self.z_dim,
+            1,
+            discriminator_hidden_dims,
+            last_activation="sigmoid",
+        )
+        # critic
+        self.critic = _SimpleMLP(
+            (self.num_critic_obs + self.z_dim, self.num_critic_obs + num_actions),
+            self.z_dim,
+            critic_hidden_dims,
+            critic_num_embedding_layers,
+            critic_num_parallel,
         )
         self.critic_obs_normalizer = (
             nn.BatchNorm1d(self.num_critic_obs, affine=False, momentum=0.01)
@@ -212,20 +229,26 @@ class ForwardBackward(nn.Module):
         # placeholders for target networks and paramlists
         self.target_forward_map: _SimpleMLP | None = None
         self.target_backward_map: _SimpleMLP | None = None
+        self.target_critic: _SimpleMLP | None = None
 
         self._forward_paramlist: tuple[torch.Tensor, ...] | None = None
         self._backward_paramlist: tuple[torch.Tensor, ...] | None = None
+        self._critic_paramlist: tuple[torch.Tensor, ...] | None = None
         self._target_forward_paramlist: tuple[torch.Tensor, ...] | None = None
         self._target_backward_paramlist: tuple[torch.Tensor, ...] | None = None
+        self._target_critic_paramlist: tuple[torch.Tensor, ...] | None = None
 
     def train(self, mode: bool = True, device: str | None = None):
         self.target_forward_map = copy.deepcopy(self.forward_map).to(device)
         self.target_backward_map = copy.deepcopy(self.backward_map).to(device)
+        self.target_critic = copy.deepcopy(self.critic).to(device)
         # create paramlists
         self._forward_paramlist = tuple(x.data for x in self.forward_map.parameters())
         self._backward_paramlist = tuple(x.data for x in self.backward_map.parameters())
+        self._critic_paramlist = tuple(x.data for x in self.critic.parameters())
         self._target_forward_paramlist = tuple(x.data for x in self.target_forward_map.parameters())
         self._target_backward_paramlist = tuple(x.data for x in self.target_backward_map.parameters())
+        self._target_critic_paramlist = tuple(x.data for x in self.target_critic.parameters())
         return self
 
     def reset(self, dones=None):
@@ -253,20 +276,44 @@ class ForwardBackward(nn.Module):
         self.update_distribution((obs_z, normalized_obs))
         return self.distribution.sample(clip=clip)
 
-    def F(self, obs: TensorDict, z: torch.Tensor, action: torch.Tensor, use_target: bool = False) -> torch.Tensor:
+    def F(
+        self,
+        obs: TensorDict,
+        z: torch.Tensor,
+        action: torch.Tensor,
+        use_target: bool = False,
+    ) -> torch.Tensor:
         normalized_obs = self.get_critic_obs(obs)
         normalized_obs = self.critic_obs_normalizer(normalized_obs)
         obs_z = torch.cat([normalized_obs, z], dim=-1)
         obs_action = torch.cat([normalized_obs, action], dim=-1)
 
         forward_map = self.target_forward_map if use_target else self.forward_map
+        assert forward_map is not None
         return forward_map((obs_z, obs_action))
 
     def B(self, goal_obs: TensorDict, use_target: bool = False) -> torch.Tensor:
         normalized_obs = self.get_critic_obs(goal_obs)
         normalized_obs = self.critic_obs_normalizer(normalized_obs)
+
         backward_map = self.target_backward_map if use_target else self.backward_map
+        assert backward_map is not None, "backward_map is None. Did you initialize before training?"
         return backward_map(normalized_obs)
+
+    def D(self, obs: TensorDict, z: torch.Tensor) -> torch.Tensor:
+        normalized_obs = self.get_critic_obs(obs)
+        normalized_obs = self.critic_obs_normalizer(normalized_obs)
+        return self.discriminator(torch.cat([normalized_obs, z], dim=-1))
+
+    def Q(self, obs: TensorDict, z: torch.Tensor, action: torch.Tensor, use_target: bool = False) -> torch.Tensor:
+        normalized_obs = self.get_critic_obs(obs)
+        normalized_obs = self.critic_obs_normalizer(normalized_obs)
+        obs_z = torch.cat([normalized_obs, z], dim=-1)
+        obs_action = torch.cat([normalized_obs, action], dim=-1)
+
+        forward_map = self.target_forward_map if use_target else self.forward_map
+        assert forward_map is not None, "forward_map is None. Did you initialize before training?"
+        return forward_map((obs_z, obs_action))
 
     def evaluate(
         self,
@@ -275,24 +322,13 @@ class ForwardBackward(nn.Module):
         action: torch.Tensor,
         use_target: bool = False,
     ) -> torch.Tensor:
-        Fs = self.F(obs, z, action, use_target=use_target)
-        return torch.sum(Fs * z, dim=-1)  # num_parallel x batch_size
-
-    def sample_z(
-        self,
-        size: int,
-        goal_obs: TensorDict | None = None,
-        goal_ratio: float = 0.5,
-        device: str = "cpu",
-    ) -> torch.Tensor:
-        """Sample random z from normal distribution, normalize if enabled."""
-        z = torch.randn((size, self.z_dim), dtype=torch.float32, device=device)
-        if goal_obs is not None:
-            perm = torch.randperm(size, device=device)
-            goal_z = self.goal_inference(goal_obs[perm])
-            mask = torch.rand((size, 1), device=device) < goal_ratio
-            z = torch.where(mask, goal_z, z)
-        return self.z_normalizer(z)
+        normalized_obs = self.get_critic_obs(obs)
+        normalized_obs = self.critic_obs_normalizer(normalized_obs)
+        obs_z = torch.cat([normalized_obs, z], dim=-1)
+        obs_action = torch.cat([normalized_obs, action], dim=-1)
+        critic = self.target_critic if use_target else self.critic
+        assert critic is not None, "critic is None. Did you initialize before training?"
+        return critic((obs_z, obs_action))
 
     """
     Inference
@@ -300,7 +336,8 @@ class ForwardBackward(nn.Module):
 
     @torch.no_grad()
     def goal_inference(self, goal_obs: TensorDict) -> torch.Tensor:
-        return self.B(goal_obs)
+        z = self.B(goal_obs)
+        return self.z_normalizer(z)
 
     @torch.no_grad()
     def reward_inference(
@@ -310,7 +347,7 @@ class ForwardBackward(nn.Module):
         weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         wr = reward if weight is None else reward * weight
-        B = self.goal_inference(next_obs)
+        B = self.B(next_obs)
         z = torch.matmul(wr.T, B)
         return self.z_normalizer(z)
 
@@ -323,8 +360,9 @@ class ForwardBackward(nn.Module):
     """
 
     def soft_update_targets(self) -> None:
-        self._soft_update_params(self._forward_paramlist, self._target_forward_paramlist)
-        self._soft_update_params(self._backward_paramlist, self._target_backward_paramlist)
+        self._soft_update_params(self._forward_paramlist, self._target_forward_paramlist, self.fb_tau)
+        self._soft_update_params(self._backward_paramlist, self._target_backward_paramlist, self.fb_tau)
+        self._soft_update_params(self._critic_paramlist, self._target_critic_paramlist, self.critic_tau)
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         return self._get_obs(obs, "policy")
@@ -338,11 +376,15 @@ class ForwardBackward(nn.Module):
 
     def _soft_update_params(
         self,
-        params: tuple[torch.Tensor, ...],
-        target_params: tuple[torch.Tensor, ...],
+        params: tuple[torch.Tensor, ...] | None,
+        target_params: tuple[torch.Tensor, ...] | None,
+        tau: float,
     ) -> None:
-        torch._foreach_mul_(target_params, self.tau)  # type: ignore
-        torch._foreach_add_(target_params, params, alpha=(1 - self.tau))  # type: ignore
+        assert params is not None and target_params is not None, (
+            "Params or target params is None. Ensure that you have initialized before training."
+        )
+        torch._foreach_mul_(target_params, tau)  # type: ignore
+        torch._foreach_add_(target_params, params, alpha=(1 - tau))  # type: ignore
 
     def _get_obs(self, obs: TensorDict, group: str) -> torch.Tensor:
         obs_list = []
