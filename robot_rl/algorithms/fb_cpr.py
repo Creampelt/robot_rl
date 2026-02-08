@@ -136,10 +136,12 @@ class FbCpr:
         self.policy.eval()
 
     def train_mode(self) -> None:
+        self.policy.train()
+
+    def prepare_for_training(self) -> None:
         # initialize weights for training
         self.policy.apply(reset_parameters)
         self.policy.init_targets(self.device)
-        self.policy.train()
 
     def act(
         self,

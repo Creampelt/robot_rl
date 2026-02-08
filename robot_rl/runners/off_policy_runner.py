@@ -68,6 +68,7 @@ class OffPolicyRunner:
 
         # start learning
         obs = self.env.get_observations().to(self.device)
+        self.alg.prepare_for_training()
         self.train_mode()
 
         # Book keeping
