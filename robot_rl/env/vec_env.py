@@ -96,3 +96,14 @@ class VecEnv(ABC):
                tensor. If it is a tensor, the mean of the tensor is used for logging.
         """
         raise NotImplementedError
+
+    def reset(self) -> tuple[TensorDict, dict]:  # noqa: D102
+        raise NotImplementedError
+
+    def reset_to(
+        self,
+        state: dict[str, dict[str, dict[str, torch.Tensor]]],
+        seed: int | None = None,
+        is_relative: bool = False,
+    ) -> tuple[TensorDict, dict]:
+        raise NotImplementedError

@@ -170,6 +170,9 @@ class ForwardBackward(nn.Module):
         self.obs_groups = obs_groups
         self.num_actor_obs = get_obs_dimensions(obs, obs_groups["policy"])
         self.num_critic_obs = get_obs_dimensions(obs, obs_groups["critic"])
+        self.num_forward_obs = get_obs_dimensions(obs, obs_groups["forward"])
+        self.num_backward_obs = get_obs_dimensions(obs, obs_groups["backward"])
+        self.num_discriminator_obs = get_obs_dimensions(obs, obs_groups["discriminator"])
 
         # actor
         self.actor = _SimpleMLP(
@@ -188,26 +191,43 @@ class ForwardBackward(nn.Module):
 
         # forward and backward mappings
         self.forward_map = _SimpleMLP(
-            (self.num_critic_obs + self.z_dim, self.num_critic_obs + num_actions),
+            (self.num_forward_obs + self.z_dim, self.num_forward_obs + num_actions),
             self.z_dim,
             forward_hidden_dims,
             forward_num_embedding_layers,
             forward_num_parallel,
         )
+        self.forward_obs_normalizer = (
+            nn.BatchNorm1d(self.num_forward_obs, affine=False, momentum=0.01)
+            if critic_obs_normalization
+            else nn.Identity()
+        )
         self.backward_map = _SimpleMLP(
-            self.num_critic_obs,
+            self.num_backward_obs,
             z_dim,
             backward_hidden_dims,
             num_parallel=backward_num_parallel,
             last_activation=ScaledNormalization() if backward_out_normalization else "identity",
         )
+        self.backward_obs_normalizer = (
+            nn.BatchNorm1d(self.num_backward_obs, affine=False, momentum=0.01)
+            if critic_obs_normalization
+            else nn.Identity()
+        )
+
         # discriminator
         self.discriminator = _SimpleMLP(
-            self.num_critic_obs + self.z_dim,
+            self.num_discriminator_obs + self.z_dim,
             1,
             discriminator_hidden_dims,
             last_activation="sigmoid",
         )
+        self.discriminator_obs_normalizer = (
+            nn.BatchNorm1d(self.num_discriminator_obs, affine=False, momentum=0.01)
+            if critic_obs_normalization
+            else nn.Identity()
+        )
+
         # critic
         self.critic = _SimpleMLP(
             (self.num_critic_obs + self.z_dim, self.num_critic_obs + num_actions),
@@ -238,7 +258,7 @@ class ForwardBackward(nn.Module):
         self._target_backward_paramlist: tuple[torch.Tensor, ...] | None = None
         self._target_critic_paramlist: tuple[torch.Tensor, ...] | None = None
 
-    def train(self, mode: bool = True, device: str | None = None):
+    def init_targets(self, device: str | None = None):
         self.target_forward_map = copy.deepcopy(self.forward_map).to(device)
         self.target_backward_map = copy.deepcopy(self.backward_map).to(device)
         self.target_critic = copy.deepcopy(self.critic).to(device)
@@ -274,6 +294,8 @@ class ForwardBackward(nn.Module):
         normalized_obs = self.actor_obs_normalizer(normalized_obs)
         obs_z = torch.cat([normalized_obs, z], dim=-1)
         self.update_distribution((obs_z, normalized_obs))
+
+        assert self.distribution is not None
         return self.distribution.sample(clip=clip)
 
     def F(
@@ -283,8 +305,8 @@ class ForwardBackward(nn.Module):
         action: torch.Tensor,
         use_target: bool = False,
     ) -> torch.Tensor:
-        normalized_obs = self.get_critic_obs(obs)
-        normalized_obs = self.critic_obs_normalizer(normalized_obs)
+        normalized_obs = self.get_forward_obs(obs)
+        normalized_obs = self.forward_obs_normalizer(normalized_obs)
         obs_z = torch.cat([normalized_obs, z], dim=-1)
         obs_action = torch.cat([normalized_obs, action], dim=-1)
 
@@ -293,16 +315,16 @@ class ForwardBackward(nn.Module):
         return forward_map((obs_z, obs_action))
 
     def B(self, goal_obs: TensorDict, use_target: bool = False) -> torch.Tensor:
-        normalized_obs = self.get_critic_obs(goal_obs)
-        normalized_obs = self.critic_obs_normalizer(normalized_obs)
+        normalized_obs = self.get_backward_obs(goal_obs)
+        normalized_obs = self.backward_obs_normalizer(normalized_obs)
 
         backward_map = self.target_backward_map if use_target else self.backward_map
-        assert backward_map is not None, "backward_map is None. Did you initialize before training?"
+        assert backward_map is not None, "backward_map is None. Did you call `init_targets` before training?"
         return backward_map(normalized_obs)
 
     def D(self, obs: TensorDict, z: torch.Tensor) -> torch.Tensor:
-        normalized_obs = self.get_critic_obs(obs)
-        normalized_obs = self.critic_obs_normalizer(normalized_obs)
+        normalized_obs = self.get_discriminator_obs(obs)
+        normalized_obs = self.discriminator_obs_normalizer(normalized_obs)
         return self.discriminator(torch.cat([normalized_obs, z], dim=-1))
 
     def Q(self, obs: TensorDict, z: torch.Tensor, action: torch.Tensor, use_target: bool = False) -> torch.Tensor:
@@ -312,7 +334,7 @@ class ForwardBackward(nn.Module):
         obs_action = torch.cat([normalized_obs, action], dim=-1)
 
         forward_map = self.target_forward_map if use_target else self.forward_map
-        assert forward_map is not None, "forward_map is None. Did you initialize before training?"
+        assert forward_map is not None, "forward_map is None. Did you call `init_targets` before training?"
         return forward_map((obs_z, obs_action))
 
     def evaluate(
@@ -327,7 +349,7 @@ class ForwardBackward(nn.Module):
         obs_z = torch.cat([normalized_obs, z], dim=-1)
         obs_action = torch.cat([normalized_obs, action], dim=-1)
         critic = self.target_critic if use_target else self.critic
-        assert critic is not None, "critic is None. Did you initialize before training?"
+        assert critic is not None, "critic is None. Did you call `init_targets` before training?"
         return critic((obs_z, obs_action))
 
     """
@@ -370,6 +392,18 @@ class ForwardBackward(nn.Module):
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
         return self._get_obs(obs, "critic")
 
+    def get_forward_obs(self, obs: TensorDict) -> torch.Tensor:
+        return self._get_obs(obs, "forward")
+
+    def get_backward_obs(self, obs: TensorDict) -> torch.Tensor:
+        return self._get_obs(obs, "backward")
+
+    def get_discriminator_obs(self, obs: TensorDict) -> torch.Tensor:
+        return self._get_obs(obs, "discriminator")
+
+    def get_expert_obs(self, obs: TensorDict) -> torch.Tensor:
+        return self._get_obs(obs, "expert")
+
     """
     Helpers
     """
@@ -381,7 +415,7 @@ class ForwardBackward(nn.Module):
         tau: float,
     ) -> None:
         assert params is not None and target_params is not None, (
-            "Params or target params is None. Ensure that you have initialized before training."
+            "Params or target params is None. Ensure that you call `init_targets` before training."
         )
         torch._foreach_mul_(target_params, tau)  # type: ignore
         torch._foreach_add_(target_params, params, alpha=(1 - tau))  # type: ignore

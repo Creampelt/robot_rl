@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Any
 
 import os
 import statistics
@@ -11,7 +12,7 @@ import robot_rl
 from robot_rl.algorithms import FbCpr
 from robot_rl.env import VecEnv
 from robot_rl.modules import ForwardBackward
-from robot_rl.utils import resolve_obs_groups, store_code_state
+from robot_rl.utils import resolve_obs_groups, store_code_state, pad_to_size
 
 
 class OffPolicyRunner:
@@ -28,11 +29,12 @@ class OffPolicyRunner:
         self._configure_multi_gpu()
 
         # store training configuration
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.num_agent_updates = self.cfg["num_agent_updates"]
-        self.num_seed_steps_per_env = self.cfg["num_seed_steps_per_env"]
-        self.num_steps_per_log = self.cfg["num_steps_per_log"]
-        self.save_interval = self.cfg["save_interval"]
+        self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
+        self.num_agent_updates: int = self.cfg["num_agent_updates"]
+        self.num_seed_steps_per_env: int = self.cfg["num_seed_steps_per_env"]
+        self.num_steps_per_log: int = self.cfg["num_steps_per_log"]
+        self.num_evals: int = self.cfg["num_evals"]
+        self.save_interval: int = self.cfg["save_interval"]
 
         # query observations from environment for algorithm construction
         obs = self.env.get_observations()
@@ -69,6 +71,7 @@ class OffPolicyRunner:
         self.train_mode()
 
         # Book keeping
+        eval_infos: list[dict[str, torch.Tensor]] = []
         ep_infos: list[dict[str, torch.Tensor]] = []
         loss_infos: list[dict[str, torch.Tensor]] = []
         algo_infos: list[dict[str, torch.Tensor]] = []
@@ -80,13 +83,26 @@ class OffPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        num_steps_per_eval = int(num_learning_iterations / self.num_evals)
+        eval_time = 0.0
         collection_time = 0.0
         learn_time = 0.0
         for it in range(start_iter, tot_iter):
+            # eval to update priorities
+            if (it - start_iter) % num_steps_per_eval == 0:
+                start = time.time()
+                eval_infos.extend(self.eval())
+                stop = time.time()
+                eval_time += stop - start
+                self.train_mode()
+
             start = time.time()
+
+            # initialize some variables
             z: torch.Tensor | None = None
             last_dones: torch.Tensor | None = None
             is_seed = it <= self.num_seed_steps_per_env + start_iter
+
             # Rollout
             with torch.inference_mode():
                 z = self.alg.update_rollout_z(z, last_dones, self.env.num_envs)
@@ -142,10 +158,12 @@ class OffPolicyRunner:
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                eval_time = 0.0
                 collection_time = 0.0
                 learn_time = 0.0
 
                 # Clear episode infos
+                eval_infos.clear()
                 ep_infos.clear()
                 algo_infos.clear()
                 loss_infos.clear()
@@ -167,76 +185,98 @@ class OffPolicyRunner:
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-    def log(self, locs: dict, width: int = 80, pad: int = 35):
+    def eval(self) -> list[dict[str, torch.Tensor]]:
+        assert self.alg.expert_buffer is not None
+
+        self.eval_mode()
+        eval_infos: list[dict[str, torch.Tensor]] = []
+        with torch.inference_mode():
+            num_joints: int = self.env.unwrapped.scene["robot"].num_joints  # type: ignore
+            sequence_length = self.alg.expert_buffer.sequence_length
+
+            for start_idx, eval_obs in self.alg.expert_buffer.get_batch_motions(self.env.num_envs, device=self.device):
+                eval_motions = self.alg.policy.get_expert_obs(eval_obs)
+                mini_batch_size = eval_motions.shape[0]
+                eval_zs = self.alg.policy.goal_inference(eval_obs.view(-1)).view(mini_batch_size, sequence_length, -1)
+                eval_zs = pad_to_size(eval_zs, self.env.num_envs, dim=0)
+
+                first_motions = pad_to_size(eval_motions[:, 0, :], self.env.num_envs, dim=0)
+                obs, _ = self.env.reset_to(
+                    {
+                        "articulation": {
+                            "robot": {
+                                "root_pose": first_motions[:, :7],
+                                "root_velocity": first_motions[:, 7:13],
+                                "joint_position": first_motions[:, 13 : 13 + num_joints],
+                                "joint_velocity": first_motions[:, 13 + num_joints :],
+                            }
+                        }
+                    },
+                    is_relative=True,
+                )
+                actual_qpos = torch.zeros((mini_batch_size, sequence_length, num_joints), device=self.device)
+                for it in range(sequence_length):
+                    actions = self.alg.policy.act(obs, eval_zs[:, it, :])
+                    # pad out remaining envs with zeros
+                    actions = pad_to_size(actions, self.env.num_envs, dim=0)
+                    obs, _, _, _ = self.env.step(actions.to(self.env.device))
+                    obs_tensor = self.alg.policy.get_expert_obs(obs)
+                    actual_qpos[:, it, :] = obs_tensor[:mini_batch_size, 13 : 13 + num_joints].to(self.device)
+
+                eval_qpos = eval_motions[:, :, 13 : 13 + num_joints]
+                eval_info = self.alg.update_priorities(actual_qpos, eval_qpos, start_idx)
+                eval_infos.append(eval_info)
+        return eval_infos
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         assert self.writer is not None
         # Compute the collection size
         collection_size = self.env.num_envs * self.gpu_world_size
         # Update total time-steps and time
-        self.tot_timesteps += collection_size
-        self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
+        if locs["eval_time"] > 0.0:
+            iteration_time += locs["eval_time"]
+        self.tot_timesteps += collection_size
+        self.tot_time += iteration_time
+
+        # -- Eval info
+        eval_string = self._get_infos_str(
+            locs["eval_infos"],
+            locs["it"],
+            pad=pad,
+            writer_format="Evaluation/{}",
+            console_format="Mean evaluation {}",
+        )
 
         # -- Episode info
-        ep_string = ""
-        if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs["ep_infos"]:
-                    # handle scalar and zero dimensional tensor infos
-                    if key not in ep_info:
-                        continue
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor).item()
-                # log to logger and terminal
-                if "/" in key:
-                    self.writer.add_scalar(key, value, locs["it"])
-                    ep_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-                else:
-                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
-                    ep_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
+        ep_string = self._get_infos_str(
+            locs["ep_infos"],
+            locs["it"],
+            pad=pad,
+            writer_format="Episode/{}",
+            console_format="Mean episode {}",
+        )
 
         mean_std = self.alg.policy.action_std.mean().item()
-        fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
+        fps = int(collection_size / iteration_time)
 
         # -- Losses
-        loss_string = ""
-        if locs["loss_infos"]:
-            for key in locs["loss_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for loss_info in locs["loss_infos"]:
-                    # handle scalar and zero dimensional tensor infos
-                    if key not in loss_info:
-                        continue
-                    if not isinstance(loss_info[key], torch.Tensor):
-                        loss_info[key] = torch.Tensor([loss_info[key]])
-                    if len(loss_info[key].shape) == 0:
-                        loss_info[key] = loss_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, loss_info[key].to(self.device)))
-                value = torch.mean(infotensor).item()
-                self.writer.add_scalar(f"Loss/{key}_loss", value, locs["it"])
-                loss_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+        loss_string = self._get_infos_str(
+            locs["loss_infos"],
+            locs["it"],
+            pad=pad,
+            writer_format="Loss/{}_loss",
+            console_format="Mean {} loss",
+        )
 
         # -- Algorithm info
-        train_string = ""
-        if locs["algo_infos"]:
-            for key in locs["algo_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for algo_info in locs["algo_infos"]:
-                    # handle scalar and zero dimensional tensor infos
-                    if key not in algo_info:
-                        continue
-                    if not isinstance(algo_info[key], torch.Tensor):
-                        algo_info[key] = torch.Tensor([algo_info[key]])
-                    if len(algo_info[key].shape) == 0:
-                        algo_info[key] = algo_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, algo_info[key].to(self.device)))
-                value = torch.mean(infotensor).item()
-                self.writer.add_scalar(f"Train/{key}", value, locs["it"])
-                train_string += f"""{f"Train/{key}:":>{pad}} {value:.4f}\n"""
+        train_string = self._get_infos_str(
+            locs["algo_infos"],
+            locs["it"],
+            pad=pad,
+            writer_format="Train/{}",
+            console_format="Train/{}",
+        )
 
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std, locs["it"])
@@ -259,13 +299,18 @@ class OffPolicyRunner:
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
+        time_string = f"""collection: {locs["collection_time"]:.3f}s, learning: {locs["learn_time"]:.3f}s"""
+        if locs["eval_time"] > 0.0:
+            time_string += f", eval: {locs['eval_time']:.3f}s"
+
         log_string = (
             f"""{"#" * width}\n"""
             f"""{str.center(width, " ")}\n\n"""
-            f"""{"Computation:":>{pad}} {fps:.0f} steps/s (collection: {locs["collection_time"]:.3f}s, learning {
-                locs["learn_time"]:.3f}s)\n"""
+            f"""{"Computation:":>{pad}} {fps:.0f} steps/s ({time_string})\n"""
             f"""{"Mean action noise std:":>{pad}} {mean_std:.2f}\n"""
         )
+        # -- Evaluation
+        log_string += eval_string
         # -- Losses
         log_string += loss_string
         # -- Training info
@@ -342,7 +387,7 @@ class OffPolicyRunner:
         self.alg.train_mode()
 
     def eval_mode(self) -> None:
-        self.alg.policy.eval()
+        self.alg.test_mode()
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
@@ -417,3 +462,31 @@ class OffPolicyRunner:
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+
+    def _get_infos_str(
+        self, infos: list[dict[str, Any]], it: int, pad: int, writer_format: str, console_format: str
+    ) -> str:
+        assert self.writer is not None
+        if not infos:
+            return ""
+        info_string = ""
+        for key in infos[0]:
+            infotensor = torch.tensor([], device=self.device)
+            for info in infos:
+                # handle scalar and zero dimensional tensor infos
+                if key not in info:
+                    continue
+                if not isinstance(info[key], torch.Tensor):
+                    info[key] = torch.Tensor([info[key]])
+                if len(info[key].shape) == 0:
+                    info[key] = info[key].unsqueeze(0)
+                infotensor = torch.cat((infotensor, info[key].to(self.device)))
+            value = torch.mean(infotensor).item()
+            # log to logger and terminal
+            if "/" in key:
+                self.writer.add_scalar(key, value, it)
+                info_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+            else:
+                self.writer.add_scalar(writer_format.format(key), value, it)
+                info_string += f"""{f"{console_format.format(key)}:":>{pad}} {value:.4f}\n"""
+        return info_string

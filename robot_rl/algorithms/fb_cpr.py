@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import glob
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,7 +9,7 @@ from tensordict import TensorDict
 
 from robot_rl.modules import ForwardBackward
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer
-from robot_rl.utils import compute_td_targets, reset_parameters
+from robot_rl.utils import compute_td_targets, reset_parameters, compute_emd
 
 
 class FbCpr:
@@ -19,6 +21,8 @@ class FbCpr:
     def __init__(
         self,
         policy: ForwardBackward,
+        motion_dir: str,
+        expert_sequence_length: int,
         actor_learning_rate: float = 1e-4,
         forward_learning_rate: float = 1e-4,
         backward_learning_rate: float = 1e-4,
@@ -94,6 +98,10 @@ class FbCpr:
         self.gamma = gamma
         self.z_dim = self.policy.z_dim
 
+        motion_dir = os.path.abspath(motion_dir)
+        self.motion_paths = glob.glob(os.path.join(motion_dir, "*.pt"))
+        self.expert_sequence_length = expert_sequence_length
+
         # Precompute useful variables
         self._off_diag = 1 - torch.eye(batch_size, batch_size, device=self.device)
         self._off_diag_sum = self._off_diag.sum()
@@ -109,7 +117,6 @@ class FbCpr:
         actions_shape: tuple[int, ...] | list[int],
         capacity_scale: int,
         device: str,
-        motion_paths: list[str],
     ) -> None:
         if isinstance(episode_length_steps, torch.Tensor):
             episode_length_steps = int(episode_length_steps.max().item())
@@ -123,15 +130,16 @@ class FbCpr:
             self.batch_size,
             device,
         )
-        self.expert_buffer = TrajectoryBuffer(motion_paths, self.batch_size, device)
+        self.expert_buffer = TrajectoryBuffer(self.motion_paths, self.batch_size, self.expert_sequence_length, device)
 
     def test_mode(self) -> None:
-        pass
+        self.policy.eval()
 
     def train_mode(self) -> None:
         # initialize weights for training
         self.policy.apply(reset_parameters)
-        self.policy.train(True, device=self.device)
+        self.policy.init_targets(self.device)
+        self.policy.train()
 
     def act(
         self,
@@ -188,6 +196,7 @@ class FbCpr:
             return new_z
         return torch.where(dones.view(-1, 1), new_z, z)
 
+    @torch.no_grad()
     def sample_mixed_z(self, goal_obs: TensorDict, expert_z: torch.Tensor) -> torch.Tensor:
         z = self._sample_random_z(self.batch_size)
         mixed_types = torch.multinomial(self._mixed_z_probs, self.batch_size, replacement=True).view(-1, 1)
@@ -215,7 +224,7 @@ class FbCpr:
             next_obs_batch,
             gammas_batch,
         ) = self.replay_buffer.sample_mini_batch(self.device)
-        expert_obs_batch, expert_next_obs_batch = self.expert_buffer.sample()
+        expert_obs_batch, expert_next_obs_batch = self.expert_buffer.sample(self.device)
         expert_z_batch = self.policy.goal_inference(expert_next_obs_batch)
         mixed_z = self.sample_mixed_z(next_obs_batch, expert_z_batch)
         loss_dict = {}
@@ -252,6 +261,28 @@ class FbCpr:
             self.policy.soft_update_targets()
 
         return loss_dict, {"log": extras}
+
+    def update_priorities(
+        self,
+        qpos: torch.Tensor,
+        expert_qpos: torch.Tensor,
+        start_idx: int,
+    ) -> dict[str, torch.Tensor]:
+        assert self.expert_buffer is not None
+
+        # compute priorities as 2^{max(0.5, min(2, emd)) * 4}
+        mini_batch_size = qpos.shape[0]
+        emds = torch.empty((mini_batch_size,), device=self.device)
+        for i in range(mini_batch_size):
+            emds[i] = compute_emd(qpos[i], expert_qpos[i])
+        priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 4)
+
+        # save to expert buffer
+        self.expert_buffer.update_priorities(priorities, slice(start_idx, start_idx + priorities.shape[0]))
+
+        return {
+            "emd": emds.detach().cpu(),
+        }
 
     """
     Helper functions
@@ -303,14 +334,13 @@ class FbCpr:
         # Fz regularization loss
         q_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
         with torch.no_grad():
-            next_Qs = (target_Fs * z).sum(dim=-1)
-            # next_Qs = self.policy.evaluate(next_obs, z, next_actions, use_target=True)  # batch_size
+            next_Qs = (target_Fs * z).sum(dim=-1)  # batch_size
             next_Q = compute_td_targets(next_Qs, self.forward_backward_pessimism)
             cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
             implicit_reward = (torch.matmul(B, cov.inverse()) * z).sum(dim=-1)  # batch_size
             target_Q = implicit_reward.detach() + gammas.squeeze() * next_Q  # batch_size
             target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
-        Qs = (Fs * z).sum(dim=-1)  # self.policy.evaluate(obs, z, actions)  # num_parallel x batch_size
+        Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch_size
         q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * nn.functional.mse_loss(Qs, target_Q)
 
         loss = fb_loss + orth_loss + q_loss
@@ -389,10 +419,10 @@ class FbCpr:
         expert_loss = -nn.functional.logsigmoid(expert_logits)
 
         # compute gradient loss
-        normalized_obs = self.policy.get_critic_obs(obs)
-        normalized_obs = self.policy.critic_obs_normalizer(normalized_obs)
-        normalized_expert_obs = self.policy.get_critic_obs(expert_obs)
-        normalized_expert_obs = self.policy.critic_obs_normalizer(normalized_expert_obs)
+        normalized_obs = self.policy.get_discriminator_obs(obs)
+        normalized_obs = self.policy.discriminator_obs_normalizer(normalized_obs)
+        normalized_expert_obs = self.policy.get_discriminator_obs(expert_obs)
+        normalized_expert_obs = self.policy.discriminator_obs_normalizer(normalized_expert_obs)
 
         alpha = torch.rand(self.batch_size, 1, device=self.device)
         interpolates = torch.cat(

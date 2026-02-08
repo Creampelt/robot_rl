@@ -14,6 +14,7 @@ import warnings
 from tensordict import TensorDict
 from typing import Callable, TypeVar, Any
 import numpy as np
+import ot
 
 
 T = TypeVar("T")
@@ -356,3 +357,26 @@ def compute_td_targets(data: torch.Tensor, lam: float) -> torch.Tensor:
 def reset_parameters(m: torch.nn.Module) -> None:
     if hasattr(m, "reset_parameters"):
         m.reset_parameters()  # type: ignore
+
+
+def compute_distance_matrix(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    x_norm = torch.sum(x**2, dim=-1, keepdim=True)
+    y_norm = torch.sum(y**2, dim=-1, keepdim=True).transpose(-2, -1)
+    mat = x_norm + y_norm - 2 * (x @ y.transpose(-2, -1))
+    # ensure no negative values from numerical imprecision
+    return mat.clamp_(min=0.0)
+
+
+def compute_emd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    assert len(x.shape) == 2 and len(y.shape) == 2, "Only 2D tensors are supported for EMD computation."
+    cost_matrix = compute_distance_matrix(x, y)
+    x_pot = torch.ones(x.shape[0], device=x.device) / x.shape[0]
+    y_pot = torch.ones(y.shape[0], device=y.device) / y.shape[0]
+    return ot.emd2(x_pot, y_pot, cost_matrix, numItermax=100000)
+
+
+def pad_to_size(x: torch.Tensor, size: int, dim: int = 0) -> torch.Tensor:
+    assert x.shape[dim] <= size
+    shape = list(x.shape)
+    shape[dim] = size - shape[dim]
+    return torch.cat([x, torch.zeros(shape, device=x.device)], dim=dim)
