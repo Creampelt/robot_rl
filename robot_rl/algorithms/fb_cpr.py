@@ -22,6 +22,7 @@ class FbCpr:
         self,
         policy: ForwardBackward,
         motion_dir: str,
+        expert_bucket_size: int,
         expert_sequence_length: int,
         actor_learning_rate: float = 1e-4,
         forward_learning_rate: float = 1e-4,
@@ -37,6 +38,8 @@ class FbCpr:
         forward_backward_pessimism: float = 0.0,
         actor_pessimism: float = 0.5,
         critic_pessimism: float = 0.0,
+        discriminator_reg_coef: float = 1.0,
+        reward_reg_coef: float = 1.0,
         value_loss_coef: float = 1.0,
         ortho_loss_coef: float = 1.0,
         grad_loss_coef: float = 1.0,
@@ -88,6 +91,8 @@ class FbCpr:
         self.forward_backward_pessimism = forward_backward_pessimism
         self.actor_pessimism = actor_pessimism
         self.critic_pessimism = critic_pessimism
+        self.discriminator_reg_coef = discriminator_reg_coef
+        self.reward_reg_coef = reward_reg_coef
         self.value_loss_coef = value_loss_coef
         self.ortho_loss_coef = ortho_loss_coef
         self.grad_loss_coef = grad_loss_coef
@@ -100,14 +105,12 @@ class FbCpr:
 
         motion_dir = os.path.abspath(motion_dir)
         self.motion_paths = glob.glob(os.path.join(motion_dir, "*.pt"))
+        self.expert_bucket_size = expert_bucket_size
         self.expert_sequence_length = expert_sequence_length
 
         # Precompute useful variables
         self._off_diag = 1 - torch.eye(batch_size, batch_size, device=self.device)
         self._off_diag_sum = self._off_diag.sum()
-        self._mixed_z_probs = torch.tensor(
-            [train_goal_ratio, expert_asm_ratio, 1 - train_goal_ratio - expert_asm_ratio], device=self.device
-        )
 
     def init_storage(
         self,
@@ -130,7 +133,13 @@ class FbCpr:
             self.batch_size,
             device,
         )
-        self.expert_buffer = TrajectoryBuffer(self.motion_paths, self.batch_size, self.expert_sequence_length, device)
+        self.expert_buffer = TrajectoryBuffer(
+            self.motion_paths,
+            self.batch_size,
+            self.expert_bucket_size,
+            self.policy.obs_groups["expert"],
+            device,
+        )
 
     def test_mode(self) -> None:
         self.policy.eval()
@@ -198,23 +207,6 @@ class FbCpr:
             return new_z
         return torch.where(dones.view(-1, 1), new_z, z)
 
-    @torch.no_grad()
-    def sample_mixed_z(self, goal_obs: TensorDict, expert_z: torch.Tensor) -> torch.Tensor:
-        z = self._sample_random_z(self.batch_size)
-        mixed_types = torch.multinomial(self._mixed_z_probs, self.batch_size, replacement=True).view(-1, 1)
-
-        # z's from goal_obs
-        perm = torch.randperm(self.batch_size, device=self.device)
-        goal_z = self.policy.B(goal_obs[perm])
-        goal_z = self.policy.z_normalizer(goal_z)
-        z = torch.where(mixed_types == 0, goal_z, z)
-
-        # expert z's
-        perm = torch.randperm(self.batch_size, device=self.device)
-        z = torch.where(mixed_types == 1, expert_z[perm], z)
-
-        return z
-
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         assert self.replay_buffer is not None and self.expert_buffer is not None, (
             "Buffers have not yet been initialized. You must call `init_storage` before training."
@@ -226,9 +218,8 @@ class FbCpr:
             next_obs_batch,
             gammas_batch,
         ) = self.replay_buffer.sample_mini_batch(self.device)
-        expert_obs_batch, expert_next_obs_batch = self.expert_buffer.sample(self.device)
+        expert_obs_batch, expert_next_obs_batch = self.expert_buffer.sample(self.expert_sequence_length, self.device)
         expert_z_batch = self.policy.goal_inference(expert_next_obs_batch)
-        mixed_z = self.sample_mixed_z(next_obs_batch, expert_z_batch)
         loss_dict = {}
         extras = {}
 
@@ -238,16 +229,16 @@ class FbCpr:
             actions_batch,
             next_obs_batch,
             gammas_batch,
-            mixed_z,
+            z_batch,
         )
         critic_loss_dict, critic_extras = self._update_critic(
             obs_batch,
-            mixed_z,
+            z_batch,
             actions_batch,
             next_obs_batch,
             gammas_batch,
         )
-        actor_loss_dict, actor_extras = self._update_actor(obs_batch, mixed_z)
+        actor_loss_dict, actor_extras = self._update_actor(obs_batch, z_batch)
 
         loss_dict.update(disc_loss_dict)
         loss_dict.update(fb_loss_dict)
@@ -376,17 +367,24 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def _update_actor(self, obs: TensorDict, z: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict]:
+    def _update_actor(
+        self,
+        obs: TensorDict,
+        z: torch.Tensor,
+        # rewards: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], dict]:
         actions = self.policy.act(obs, z, clip=self.clip_actions)
 
         Qs_discriminator = self.policy.evaluate(obs, z, actions)
-        Q_discriminator = compute_td_targets(Qs_discriminator, self.actor_pessimism)
+        Q_discriminator = (
+            -self.discriminator_reg_coef * compute_td_targets(Qs_discriminator, self.actor_pessimism).mean()
+        )
 
         Fs = self.policy.F(obs, z, actions)
         Qs_fb = (Fs * z).sum(-1)
-        Q_fb = compute_td_targets(Qs_fb, self.actor_pessimism)
+        Q_fb = -compute_td_targets(Qs_fb, self.actor_pessimism).mean()
 
-        actor_loss = -Q_discriminator.mean() * Q_fb.abs().mean() - Q_fb.mean()
+        actor_loss = Q_fb + Q_discriminator
 
         # optimize actor
         self.actor_optimizer.zero_grad()
@@ -395,17 +393,13 @@ class FbCpr:
             nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
         self.actor_optimizer.step()
 
-        with torch.no_grad():
-            loss_dict = {
-                "actor": actor_loss.detach(),
-            }
+        loss_dict = {
+            "actor": actor_loss.detach(),
+            "actor/discriminator": Q_discriminator.detach(),
+            "actor/forward_backward": Q_fb.detach(),
+        }
 
-            extras = {
-                "actor/discriminator_value": Q_discriminator.mean().detach(),
-                "actor/fb_value": Q_fb.mean().detach(),
-            }
-
-        return loss_dict, extras
+        return loss_dict, {}
 
     def _update_discriminator(
         self,

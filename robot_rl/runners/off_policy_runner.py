@@ -60,6 +60,9 @@ class OffPolicyRunner:
         # initialize writer
         self._prepare_logging_writer()
 
+        # add expert buffer to environment
+        self.env.unwrapped.set_expert_buffer(self.alg.expert_buffer)
+
         # randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
@@ -91,11 +94,16 @@ class OffPolicyRunner:
         for it in range(start_iter, tot_iter):
             # eval to update priorities
             if (it - start_iter) % num_steps_per_eval == 0:
-                start = time.time()
-                eval_infos.extend(self.eval())
-                stop = time.time()
-                eval_time += stop - start
-                self.train_mode()
+                with torch.inference_mode():
+                    # run evaluation
+                    start = time.time()
+                    eval_infos.extend(self.eval())
+                    stop = time.time()
+                    eval_time += stop - start
+
+                    # reset to training
+                    self.env.reset()
+                    self.train_mode()
 
             start = time.time()
 
@@ -193,12 +201,13 @@ class OffPolicyRunner:
         eval_infos: list[dict[str, torch.Tensor]] = []
         with torch.inference_mode():
             num_joints: int = self.env.unwrapped.scene["robot"].num_joints  # type: ignore
-            sequence_length = self.alg.expert_buffer.sequence_length
+            bucket_size = self.alg.expert_buffer.bucket_size
 
-            for start_idx, eval_obs in self.alg.expert_buffer.get_batch_motions(self.env.num_envs, device=self.device):
-                eval_motions = self.alg.policy.get_expert_obs(eval_obs)
-                mini_batch_size = eval_motions.shape[0]
-                eval_zs = self.alg.policy.goal_inference(eval_obs.view(-1)).view(mini_batch_size, sequence_length, -1)
+            idx = 0
+            for eval_obs in self.alg.expert_buffer.get_batch_motions(self.env.num_envs, device=self.device):
+                mini_batch_size = eval_obs.shape[0]
+                eval_motions = self.alg.expert_buffer.get_expert_obs(eval_obs)
+                eval_zs = self.alg.policy.goal_inference(eval_obs.view(-1)).view(mini_batch_size, bucket_size, -1)
                 eval_zs = pad_to_size(eval_zs, self.env.num_envs, dim=0)
 
                 first_motions = pad_to_size(eval_motions[:, 0, :], self.env.num_envs, dim=0)
@@ -215,18 +224,20 @@ class OffPolicyRunner:
                     },
                     is_relative=True,
                 )
-                actual_qpos = torch.zeros((mini_batch_size, sequence_length, num_joints), device=self.device)
-                for it in range(sequence_length):
+                actual_qpos = torch.zeros((mini_batch_size, bucket_size, num_joints), device=self.device)
+                for it in range(bucket_size):
                     actions = self.alg.policy.act(obs, eval_zs[:, it, :])
                     # pad out remaining envs with zeros
                     actions = pad_to_size(actions, self.env.num_envs, dim=0)
                     obs, _, _, _ = self.env.step(actions.to(self.env.device))
-                    obs_tensor = self.alg.policy.get_expert_obs(obs)
+                    obs_tensor = self.alg.expert_buffer.get_expert_obs(obs)
                     actual_qpos[:, it, :] = obs_tensor[:mini_batch_size, 13 : 13 + num_joints].to(self.device)
 
                 eval_qpos = eval_motions[:, :, 13 : 13 + num_joints]
-                eval_info = self.alg.update_priorities(actual_qpos, eval_qpos, start_idx)
+                eval_info = self.alg.update_priorities(actual_qpos, eval_qpos, idx)
                 eval_infos.append(eval_info)
+
+                idx += mini_batch_size
         return eval_infos
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
@@ -465,7 +476,12 @@ class OffPolicyRunner:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
 
     def _get_infos_str(
-        self, infos: list[dict[str, Any]], it: int, pad: int, writer_format: str, console_format: str
+        self,
+        infos: list[dict[str, Any]],
+        it: int,
+        pad: int,
+        writer_format: str,
+        console_format: str,
     ) -> str:
         assert self.writer is not None
         if not infos:
@@ -484,10 +500,6 @@ class OffPolicyRunner:
                 infotensor = torch.cat((infotensor, info[key].to(self.device)))
             value = torch.mean(infotensor).item()
             # log to logger and terminal
-            if "/" in key:
-                self.writer.add_scalar(key, value, it)
-                info_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-            else:
-                self.writer.add_scalar(writer_format.format(key), value, it)
-                info_string += f"""{f"{console_format.format(key)}:":>{pad}} {value:.4f}\n"""
+            self.writer.add_scalar(writer_format.format(key), value, it)
+            info_string += f"""{f"{console_format.format(key)}:":>{pad}} {value:.4f}\n"""
         return info_string

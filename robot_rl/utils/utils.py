@@ -380,3 +380,10 @@ def pad_to_size(x: torch.Tensor, size: int, dim: int = 0) -> torch.Tensor:
     shape = list(x.shape)
     shape[dim] = size - shape[dim]
     return torch.cat([x, torch.zeros(shape, device=x.device)], dim=dim)
+
+
+def get_obs(obs: TensorDict, obs_groups: list[str]) -> torch.Tensor:
+    obs_list = []
+    for obs_group in obs_groups:
+        obs_list.append(obs[obs_group])
+    return torch.cat(obs_list, dim=-1)

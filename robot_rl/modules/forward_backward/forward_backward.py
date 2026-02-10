@@ -11,7 +11,7 @@ from robot_rl.networks import (
     ScaledNormalization,
     TruncatedNormal,
 )
-from robot_rl.utils import get_obs_dimensions, resolve_nn_activation
+from robot_rl.utils import get_obs_dimensions, resolve_nn_activation, get_obs
 
 
 class _SimpleEmbedding(nn.Module):
@@ -387,22 +387,19 @@ class ForwardBackward(nn.Module):
         self._soft_update_params(self._critic_paramlist, self._target_critic_paramlist, self.critic_tau)
 
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
-        return self._get_obs(obs, "policy")
+        return get_obs(obs, self.obs_groups["policy"])
 
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
-        return self._get_obs(obs, "critic")
+        return get_obs(obs, self.obs_groups["critic"])
 
     def get_forward_obs(self, obs: TensorDict) -> torch.Tensor:
-        return self._get_obs(obs, "forward")
+        return get_obs(obs, self.obs_groups["forward"])
 
     def get_backward_obs(self, obs: TensorDict) -> torch.Tensor:
-        return self._get_obs(obs, "backward")
+        return get_obs(obs, self.obs_groups["backward"])
 
     def get_discriminator_obs(self, obs: TensorDict) -> torch.Tensor:
-        return self._get_obs(obs, "discriminator")
-
-    def get_expert_obs(self, obs: TensorDict) -> torch.Tensor:
-        return self._get_obs(obs, "expert")
+        return get_obs(obs, self.obs_groups["discriminator"])
 
     """
     Helpers
