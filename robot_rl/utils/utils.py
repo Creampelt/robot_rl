@@ -387,3 +387,39 @@ def get_obs(obs: TensorDict, obs_groups: list[str]) -> torch.Tensor:
     for obs_group in obs_groups:
         obs_list.append(obs[obs_group])
     return torch.cat(obs_list, dim=-1)
+
+
+def forward_sliding_mean(x: torch.Tensor, window_len: int, dim: int = 0) -> torch.Tensor:
+    # Move target dim to position 0 for simplicity
+    perm = [i for i in range(x.dim()) if i != dim]
+    perm.insert(1, dim)
+    x = x.permute(perm)
+
+    cumsum = torch.cumsum(x, dim=0)
+    pad = torch.zeros(1, *cumsum.shape[1:], device=cumsum.device)
+    cumsum = torch.cat([pad, cumsum], dim=0)
+
+    L = x.shape[0]
+    start_idx = torch.arange(L, device=x.device)
+    end_idx = torch.clamp(start_idx + window_len, max=L)
+    lengths = (end_idx - start_idx).view(L, *([1] * (x.dim() - 1)))
+
+    mean = (cumsum[end_idx] - cumsum[start_idx]) / lengths
+    inv_perm = [perm.index(i) for i in range(len(perm))]
+    return mean.permute(inv_perm)
+
+
+class eval_mode:
+    def __init__(self, *models: torch.nn.Module) -> None:
+        self.models = models
+        self.prev_states: list[bool] = []
+
+    def __enter__(self) -> None:
+        self.prev_states.clear()
+        for model in self.models:
+            self.prev_states.append(model.training)
+            model.train(False)
+
+    def __exit__(self, *args) -> None:
+        for model, state in zip(self.models, self.prev_states):
+            model.train(state)

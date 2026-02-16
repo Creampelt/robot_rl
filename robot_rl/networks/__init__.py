@@ -7,6 +7,11 @@
 
 from .memory import Memory
 from .mlp import MLP
-from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization, ScaledNormalization
+from .normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+    ScaledNormalization,
+    EMANormalization,
+)
 from .parallel import ParallelLinear, ParallelLayerNorm
 from .distributions import TruncatedNormal

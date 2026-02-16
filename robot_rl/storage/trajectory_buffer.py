@@ -12,13 +12,11 @@ class TrajectoryBuffer(ExpertBuffer):
     def __init__(
         self,
         motion_paths: list[str],
-        batch_size: int,
         bucket_size: int,
         expert_obs_groups: list[str],
         device: str = "cpu",
     ) -> None:
         self.device = device
-        self.batch_size = batch_size
         self.bucket_size = bucket_size
         self.obs_groups = expert_obs_groups
 
@@ -26,19 +24,25 @@ class TrajectoryBuffer(ExpertBuffer):
         self.num_motions = self.motions.shape[0]
         self.priorities = torch.ones((self.motions.shape[0],), device=device)
 
-    def sample(self, sequence_length: int, device: str | None = None) -> tuple[TensorDict, TensorDict]:
-        """Sample expert_obs and expert_next_obs with sequences weighted by priorities (see `update_priorities`).
-        Observations within each sequence are sampled uniformly. Returns obs and next_obs sequences of shape
-        (batch_size, *obs_shape)."""
-        num_eps = self.batch_size // sequence_length
-        ep_indices = torch.multinomial(self.priorities, num_eps, replacement=True)
-        ep_indices = ep_indices.unsqueeze(1)
-        # max start_idx is bucket_size - sequence_length - 1
-        start_indices = torch.randint(0, self.bucket_size - sequence_length, (num_eps,), device=self.device)
-        seq_window = start_indices.unsqueeze(1) + torch.arange(0, sequence_length, device=self.device).unsqueeze(0)
+    def sample(self, batch_size: int, device: str | None = None) -> tuple[TensorDict, TensorDict]:
+        """Sample current and next expert observations from multinomial distribution weighted by priorities (see
+        `update_priorities`).
+
+        Args:
+            batch_size: The batch size to sample.
+            device: The device to move the output to. Defaults to None, which keeps the observations on the buffer's
+                device.
+
+        Returns:
+            A tuple containing the expert obs and next obs as TensorDicts. Shape is (batch_size).
+        """
+        # sample episodes according to priorities
+        ep_indices = torch.multinomial(self.priorities, batch_size, replacement=True)
+        # uniformly sample from sequence
+        seq_indices = torch.randint(0, self.bucket_size - 1, (batch_size,), device=self.device)
         return (
-            self.motions[ep_indices, seq_window].view(-1).to(device),
-            self.motions[ep_indices, seq_window + 1].view(-1).to(device),
+            self.motions[ep_indices, seq_indices].to(device),
+            self.motions[ep_indices, seq_indices + 1].to(device),
         )
 
     def sample_states(self, num_envs: int) -> torch.Tensor:

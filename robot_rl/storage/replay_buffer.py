@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
-from typing import Literal
 from dataclasses import dataclass
 
 
@@ -16,6 +15,7 @@ class ReplayBuffer:
     class Transition:
         observations: TensorDict | None = None
         actions: torch.Tensor | None = None
+        rewards: torch.Tensor | None = None
         dones: torch.Tensor | None = None
         context: torch.Tensor | None = None
         next_observations: TensorDict | None = None
@@ -29,6 +29,7 @@ class ReplayBuffer:
             assert (
                 self.observations is not None
                 and self.actions is not None
+                and self.rewards is not None
                 and self.context is not None
                 and self.next_observations is not None
                 and self.next_terminated is not None
@@ -40,6 +41,7 @@ class ReplayBuffer:
             return ReplayBuffer.FullTransition(
                 self.observations,
                 self.actions,
+                self.rewards,
                 dones,
                 self.context,
                 self.next_observations,
@@ -50,6 +52,7 @@ class ReplayBuffer:
     class FullTransition:
         observations: TensorDict
         actions: torch.Tensor
+        rewards: torch.Tensor
         dones: torch.Tensor | None
         context: torch.Tensor
         next_observations: TensorDict
@@ -57,7 +60,6 @@ class ReplayBuffer:
 
     def __init__(
         self,
-        training_type: Literal["rl"],
         num_envs: int,
         capacity_per_env: int,
         obs: TensorDict,
@@ -67,7 +69,6 @@ class ReplayBuffer:
         device: str = "cpu",
     ):
         # store inputs
-        self.training_type: Literal["rl"] = training_type
         self.num_envs = num_envs
         self.capacity = capacity_per_env * num_envs
         self.device = device
@@ -80,6 +81,7 @@ class ReplayBuffer:
             device=self.device,
         )
         self.actions = torch.zeros(self.capacity, *actions_shape, device=self.device)
+        self.rewards = torch.zeros(self.capacity, device=self.device)
         self.context = torch.zeros(self.capacity, z_dim, device=self.device)
         self.next_observations: TensorDict = self.observations.clone()
         self.next_terminated = torch.zeros(self.capacity, 1, device=self.device).byte()
@@ -95,7 +97,7 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return self.capacity if self._is_full else self._curr_idx
 
-    def add_transitions(self, transition: Transition):
+    def add_transitions(self, transition: Transition) -> None:
         # ensure all fields are full
         full_transition = transition.to_full()
         # only include transitions that haven't terminated (otherwise next_obs is state after reset)
@@ -117,6 +119,7 @@ class ReplayBuffer:
         self.observations.update_at_(full_transition.observations[valid_idxs].to(self.device), buf_idxs)
         self.next_observations.update_at_(full_transition.next_observations[valid_idxs].to(self.device), buf_idxs)
         self.actions.index_copy_(0, buf_idxs, full_transition.actions[valid_idxs].to(self.device))
+        self.rewards.index_copy_(0, buf_idxs, full_transition.rewards[valid_idxs].to(self.device))
         self.context.index_copy_(0, buf_idxs, full_transition.context[valid_idxs].to(self.device))
         self.next_terminated.index_copy_(0, buf_idxs, full_transition.next_terminated[valid_idxs].to(self.device))
 
@@ -129,14 +132,17 @@ class ReplayBuffer:
     def compute_returns(self, gamma: float) -> None:
         self.gammas = gamma * (1 - self.next_terminated).float()
 
-    def sample_mini_batch(self, device: str) -> tuple[TensorDict, torch.Tensor, torch.Tensor, TensorDict, torch.Tensor]:
+    def sample_mini_batch(
+        self, device: str | None = None
+    ) -> tuple[TensorDict, TensorDict, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # sample indices from uniform distribution
         self._indices.random_(0, len(self))
 
         return (
             self.observations[self._indices].to(device),
-            self.actions[self._indices].to(device),
-            self.context[self._indices].to(device),
             self.next_observations[self._indices].to(device),
+            self.actions[self._indices].to(device),
+            self.rewards[self._indices].to(device),
             self.gammas[self._indices].to(device),
+            self.context[self._indices].to(device),
         )

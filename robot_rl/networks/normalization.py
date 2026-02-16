@@ -110,6 +110,56 @@ class ScaledNormalization(nn.Module):
         return math.sqrt(x.shape[-1]) * nn.functional.normalize(x, p=self.p, dim=-1)
 
 
+class EMANormalization(nn.Module):
+    """Exponential moving average."""
+
+    def __init__(
+        self,
+        tau: float = 0.99,
+        epsilon: float = 1e-8,
+        shape: tuple[int, ...] = (1,),
+        translate: bool = False,
+        scale: bool = False,
+    ) -> None:
+        super().__init__()
+        self.tau = tau
+        self.epsilon = epsilon
+        self.translate = translate
+        self.scale = scale
+        self.register_buffer("mean", torch.zeros(shape, dtype=torch.float32))
+        self.register_buffer("mean_square", torch.zeros(shape, dtype=torch.float32))
+        self.register_buffer("counter", torch.LongTensor([0]))
+
+    def forward(self, x):
+        m = x.mean()
+        sm = x.pow(2).mean()
+        self.mean.data = self.tau * self.mean + (1 - self.tau) * m  # type: ignore
+        self.mean_square.data = self.tau * self.mean_square + (1 - self.tau) * sm  # type: ignore
+        self.counter += 1  # type: ignore
+        norm = 1 - self.tau**self.counter
+        ema_mean = self.mean / norm  # type: ignore
+        ema_mean_square = self.mean_square / norm  # type: ignore
+        var = torch.clamp(ema_mean_square - ema_mean**2, min=self.epsilon)
+
+        translate_mean = ema_mean if self.translate else 0
+        scale_std = torch.sqrt(var) if self.scale else 1
+        return (x - translate_mean) / scale_std
+
+    @property
+    def S(self) -> torch.Tensor:
+        norm = 1 - self.tau**self.counter
+        ema_mean = self.mean / norm  # type: ignore
+        ema_mean_square = self.mean_square / norm  # type: ignore
+        var = torch.clamp(ema_mean_square - ema_mean**2, self.epsilon)
+        return var
+
+    @property
+    def M(self) -> torch.Tensor:
+        norm = 1 - self.tau**self.counter
+        ema_mean = self.mean / norm  # type: ignore
+        return ema_mean
+
+
 """
 Helper class.
 """

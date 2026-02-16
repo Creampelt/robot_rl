@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any
 
 import os
+import gc
 import statistics
 import time
 import torch
@@ -32,8 +33,7 @@ class OffPolicyRunner:
         self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
         self.num_agent_updates: int = self.cfg["num_agent_updates"]
         self.num_seed_steps_per_env: int = self.cfg["num_seed_steps_per_env"]
-        self.num_steps_per_log: int = self.cfg["num_steps_per_log"]
-        self.num_evals: int = self.cfg["num_evals"]
+        self.log_interval: int = self.cfg["log_interval"]
         self.save_interval: int = self.cfg["save_interval"]
 
         # query observations from environment for algorithm construction
@@ -84,16 +84,19 @@ class OffPolicyRunner:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Start training
+        # initialize some variables
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-        num_steps_per_eval = int(num_learning_iterations / self.num_evals)
         eval_time = 0.0
         collection_time = 0.0
         learn_time = 0.0
+        z: torch.Tensor | None = None
+        last_dones: torch.Tensor | None = None
+
+        # Start training
         for it in range(start_iter, tot_iter):
             # eval to update priorities
-            if (it - start_iter) % num_steps_per_eval == 0:
+            if (it - start_iter) % self.save_interval == 0:
                 with torch.inference_mode():
                     # run evaluation
                     start = time.time()
@@ -105,16 +108,17 @@ class OffPolicyRunner:
                     self.env.reset()
                     self.train_mode()
 
-            start = time.time()
+                    # reset training variables
+                    z = None
+                    last_dones = None
+                    obs = self.env.get_observations().to(self.device)
 
-            # initialize some variables
-            z: torch.Tensor | None = None
-            last_dones: torch.Tensor | None = None
+            start = time.time()
             is_seed = it <= self.num_seed_steps_per_env + start_iter
 
             # Rollout
             with torch.inference_mode():
-                z = self.alg.update_rollout_z(z, last_dones, self.env.num_envs)
+                z = self.alg.update_rollout_z(z, self.env.unwrapped.common_step_counter, self.env.num_envs)  # type: ignore
                 # Sample actions
                 actions = self.alg.act(obs, z, last_dones, random_sample=is_seed)
                 # Step the environment
@@ -156,16 +160,17 @@ class OffPolicyRunner:
                     loss_dict, extras = self.alg.update()
                     loss_infos.append(loss_dict)
                     algo_infos.append(extras["log"])
+                gc.collect()
 
             stop = time.time()
             learn_time += stop - start
             self.current_learning_iteration = it
             # log info
-            if self.log_dir is not None and not self.disable_logs and it % self.num_steps_per_log == 0:
+            if self.log_dir is not None and not self.disable_logs and it % self.log_interval == 0:
                 # Log information
                 self.log(locals())
                 # Save model
-                if it % self.save_interval == 0:
+                if (it - start_iter) % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
                 eval_time = 0.0
                 collection_time = 0.0
@@ -242,6 +247,9 @@ class OffPolicyRunner:
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         assert self.writer is not None
+
+        print(torch.cuda.memory_summary())
+
         # Compute the collection size
         collection_size = self.env.num_envs * self.gpu_world_size
         # Update total time-steps and time
@@ -446,6 +454,7 @@ class OffPolicyRunner:
             obs,
             [self.env.num_actions],
             self.cfg["storage_scale"],
+            self.cfg["z_buffer_capacity"],
             self.cfg["storage_device"],
         )
 
