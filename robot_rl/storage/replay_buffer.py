@@ -129,7 +129,7 @@ class ReplayBuffer:
             self._is_full = True
             self._curr_idx -= self.capacity
 
-    def compute_returns(self, gamma: float) -> None:
+    def compute_gammas(self, gamma: float) -> None:
         self.gammas = gamma * (1 - self.next_terminated).float()
 
     def sample_mini_batch(

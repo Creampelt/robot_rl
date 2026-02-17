@@ -66,7 +66,9 @@ class TrajectoryBuffer(ExpertBuffer):
 
     def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:
         self.priorities[indices] = priorities.to(self.device)
-        # self.priorities /= self.priorities.sum()
+
+    def normalize_priorities(self) -> None:
+        self.priorities /= self.priorities.sum()
 
     def get_expert_obs(self, obs: TensorDict) -> torch.Tensor:
         return get_obs(obs, self.obs_groups)

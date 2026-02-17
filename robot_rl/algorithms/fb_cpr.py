@@ -225,7 +225,7 @@ class FbCpr:
         self.transition.rewards = rewards
         # Record the and next obs and next terminated (after env.step)
         # Terminated is all dones that are not time_outs (used to compute discount factor)
-        self.transition.next_terminated = (dones * extras["time_outs"]).byte()
+        self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
 
         # record the transition
@@ -233,23 +233,27 @@ class FbCpr:
         self.transition.clear()
         self.policy.reset(dones)
 
-    def compute_returns(self) -> None:
-        self.replay_buffer.compute_returns(self.gamma)
+    def compute_gammas(self) -> None:
+        self.replay_buffer.compute_gammas(self.gamma)
 
     def update_rollout_z(
         self,
         z: torch.Tensor | None,
-        step: int,
+        step: torch.Tensor,
         num_envs: int,
     ) -> torch.Tensor:
+        step = step.long()
         # update from replay buffer
         if z is None:
             z = self._sample_random_z(num_envs)
-        elif step % self.steps_per_z_update == 0:
+        elif torch.any(
+            step % self.steps_per_z_update == 0
+        ):  # step tensor is all same value, but we do torch.any just to be safe
             z = self.z_buffer.sample(num_envs, device=self.device)
 
         # update from expert buffer
-        if step % self.expert_rollout_length == 0 or self.expert_rollout_envs is None or self.expert_rollout_z is None:
+        rollout_idx = step % self.expert_rollout_length
+        if torch.any(rollout_idx == 0) or self.expert_rollout_envs is None or self.expert_rollout_z is None:
             expert_env_mask = torch.rand(num_envs, device=self.device) > self.expert_rollout_ratio
             self.expert_rollout_envs = torch.argwhere(expert_env_mask).flatten()
             num_expert_updates = self.expert_rollout_envs.shape[0]
@@ -266,7 +270,8 @@ class FbCpr:
             self.expert_rollout_z = cast(
                 torch.Tensor, self.policy.z_normalizer(expert_z)
             )  # num_expert_updates, expert_rollout_length, z_dim
-        z[self.expert_rollout_envs] = self.expert_rollout_z[:, step % self.expert_rollout_length]
+        env_idxs = torch.arange(self.expert_rollout_envs.shape[0])
+        z[self.expert_rollout_envs] = self.expert_rollout_z[env_idxs, rollout_idx[self.expert_rollout_envs]]
 
         return z
 
@@ -324,6 +329,9 @@ class FbCpr:
         return {
             "emd": emds.detach().cpu(),
         }
+
+    def normalize_priorities(self) -> None:
+        self.expert_buffer.normalize_priorities()
 
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         obs, next_obs, actions, rewards, gammas, train_z = self.replay_buffer.sample_mini_batch(self.device)
@@ -444,10 +452,10 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "discriminator": loss.mean().detach(),
-                "discriminator/train": unlabeled_loss.mean().detach(),
-                "discriminator/expert": expert_loss.mean().detach(),
-                "discriminator/gradient": grad_loss.mean().detach(),
+                "Discriminator_Loss/total": loss.mean().detach(),
+                "Discriminator_Loss/train": unlabeled_loss.mean().detach(),
+                "Discriminator_Loss/expert": expert_loss.mean().detach(),
+                "Discriminator_Loss/gradient": grad_loss.mean().detach(),
             }
 
         return loss_dict, {}
@@ -511,19 +519,18 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "FB/forward_backward": fb_loss.mean().detach(),
-                "FB/orthonormality": orth_loss.mean().detach(),
-                "FB/value_regularization": q_loss.mean().detach(),
+                "Forward_Backward_Loss/total": loss.mean().detach(),
+                "Forward_Backward_Loss/fb": fb_loss.mean().detach(),
+                "Forward_Backward_Loss/ortho": orth_loss.mean().detach(),
+                "Forward_Backward_Loss/value_reg": q_loss.mean().detach(),
             }
 
             extras = {
-                "FB/target_M": target_M.mean().detach(),
-                "FB/M1": Ms[0].mean().detach(),
-                "FB/F1": Fs[0].mean().detach(),
-                "FB/B": B.mean().detach(),
-                "FB/F1_norm": Fs[0].norm(dim=-1).mean().detach(),
-                "FB/B_norm": B.norm(dim=-1).mean().detach(),
-                "FB/z_norm": z.norm(dim=-1).mean().detach(),
+                "fb_target_successor_measure": target_M.mean().detach(),
+                "fb_successor_measure": Ms[0].mean().detach(),
+                "fb_forward": Fs[0].mean().detach(),
+                "fb_backward": B.mean().detach(),
+                "fb_forward_norm": Fs[0].norm(dim=-1).mean().detach(),
             }
 
         return loss_dict, extras
@@ -556,13 +563,13 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "disc_critic": loss.mean().detach(),
+                "Critic_Loss/discriminator_critic": loss.mean().detach(),
             }
 
             extras_dict = {
-                "disc_critic/target_Q": target_Q.mean().detach(),
-                "disc_critic/Q": Qs.mean().detach(),
-                "disc_critic/discriminator_reward": discriminator_reward.mean().detach(),
+                "discriminator_target_value": target_Q.mean().detach(),
+                "discriminator_value": Qs.mean().detach(),
+                "discriminator_reward": discriminator_reward.mean().detach(),
             }
 
         return loss_dict, extras_dict
@@ -592,12 +599,12 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "aux_critic": loss.mean().detach(),
+                "Critic_Loss/auxiliary_critic": loss.mean().detach(),
             }
 
             extras_dict = {
-                "aux_critic/target_Q": target_Q.mean().detach(),
-                "aux_critic/Q": Qs.mean().detach(),
+                "aux_target_value": target_Q.mean().detach(),
+                "aux_value": Qs.mean().detach(),
             }
 
         return loss_dict, extras_dict
@@ -637,14 +644,14 @@ class FbCpr:
 
         with torch.no_grad():
             loss_dict = {
-                "actor": actor_loss.mean().detach(),
-                "actor/discriminator": Q_discriminator.mean().detach(),
-                "actor/aux": Q_aux.mean().detach(),
-                "actor/forward_backward": Q_fb.mean().detach(),
+                "Actor_Loss/total": actor_loss.mean().detach(),
+                "Actor_Loss/discriminator": Q_discriminator.mean().detach(),
+                "Actor_Loss/aux": Q_aux.mean().detach(),
+                "Actor_Loss/fb": Q_fb.mean().detach(),
             }
 
             extras_dict = {
-                "actor/reg_weight": reg_weight.mean().detach(),
+                "actor_reg_weight": reg_weight.mean().detach(),
             }
 
         return loss_dict, extras_dict

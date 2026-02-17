@@ -11,7 +11,7 @@ from tensordict import TensorDict
 
 import robot_rl
 from robot_rl.algorithms import FbCpr
-from robot_rl.env import VecEnv
+from robot_rl.env import URLVecEnv
 from robot_rl.modules import ForwardBackward
 from robot_rl.utils import resolve_obs_groups, store_code_state, pad_to_size
 
@@ -19,7 +19,7 @@ from robot_rl.utils import resolve_obs_groups, store_code_state, pad_to_size
 class OffPolicyRunner:
     """Off-policy runner for training and evaluation of unsupervised/self-supervised methods."""
 
-    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+    def __init__(self, env: URLVecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
@@ -34,6 +34,7 @@ class OffPolicyRunner:
         self.num_agent_updates: int = self.cfg["num_agent_updates"]
         self.num_seed_steps_per_env: int = self.cfg["num_seed_steps_per_env"]
         self.log_interval: int = self.cfg["log_interval"]
+        self.eval_interval: int = self.cfg["eval_interval"]
         self.save_interval: int = self.cfg["save_interval"]
 
         # query observations from environment for algorithm construction
@@ -61,7 +62,7 @@ class OffPolicyRunner:
         self._prepare_logging_writer()
 
         # add expert buffer to environment
-        self.env.unwrapped.set_expert_buffer(self.alg.expert_buffer)
+        self.env.set_expert_buffer(self.alg.expert_buffer)
 
         # randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
@@ -95,30 +96,32 @@ class OffPolicyRunner:
 
         # Start training
         for it in range(start_iter, tot_iter):
-            # eval to update priorities
-            if (it - start_iter) % self.save_interval == 0:
-                with torch.inference_mode():
+            with torch.inference_mode():
+                # eval to update priorities
+                if (it - start_iter) % self.eval_interval == 0:
+                    # save and clear rewbuffer and lenbuffer if in the middle of an episode
+                    if cur_episode_length.any():
+                        rewbuffer.extend(cur_reward_sum[:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[:, 0].cpu().numpy().tolist())
+                        cur_reward_sum[:] = 0
+                        cur_episode_length[:] = 0
+
                     # run evaluation
                     start = time.time()
                     eval_infos.extend(self.eval())
                     stop = time.time()
                     eval_time += stop - start
 
-                    # reset to training
-                    self.env.reset()
-                    self.train_mode()
-
-                    # reset training variables
-                    z = None
+                    # reset env and training variables
+                    obs, _ = self.env.reset()
+                    obs = obs.to(self.device)
                     last_dones = None
-                    obs = self.env.get_observations().to(self.device)
 
-            start = time.time()
-            is_seed = it <= self.num_seed_steps_per_env + start_iter
+                start = time.time()
+                is_seed = it <= self.num_seed_steps_per_env + start_iter
 
-            # Rollout
-            with torch.inference_mode():
-                z = self.alg.update_rollout_z(z, self.env.unwrapped.common_step_counter, self.env.num_envs)  # type: ignore
+                # Rollout
+                z = self.alg.update_rollout_z(z, cur_episode_length, self.env.num_envs)
                 # Sample actions
                 actions = self.alg.act(obs, z, last_dones, random_sample=is_seed)
                 # Step the environment
@@ -153,7 +156,7 @@ class OffPolicyRunner:
 
             if not is_seed and it % self.num_steps_per_env == 0:
                 with torch.inference_mode():
-                    self.alg.compute_returns()
+                    self.alg.compute_gammas()
 
                 # update policy
                 for _ in range(self.num_agent_updates):
@@ -202,53 +205,57 @@ class OffPolicyRunner:
     def eval(self) -> list[dict[str, torch.Tensor]]:
         assert self.alg.expert_buffer is not None
 
+        # switch to eval mode
         self.eval_mode()
+
         eval_infos: list[dict[str, torch.Tensor]] = []
-        with torch.inference_mode():
-            num_joints: int = self.env.unwrapped.scene["robot"].num_joints  # type: ignore
-            bucket_size = self.alg.expert_buffer.bucket_size
+        bucket_size = self.alg.expert_buffer.bucket_size
 
-            idx = 0
-            for eval_obs in self.alg.expert_buffer.get_batch_motions(self.env.num_envs, device=self.device):
-                mini_batch_size = eval_obs.shape[0]
-                eval_motions = self.alg.expert_buffer.get_expert_obs(eval_obs)
-                eval_zs = self.alg.policy.goal_inference(eval_obs.view(-1)).view(mini_batch_size, bucket_size, -1)
-                eval_zs = pad_to_size(eval_zs, self.env.num_envs, dim=0)
+        idx = 0
+        for eval_obs in self.alg.expert_buffer.get_batch_motions(self.env.num_envs, device=self.device):
+            mini_batch_size = eval_obs.shape[0]
+            eval_motions = self.alg.expert_buffer.get_expert_obs(eval_obs)
+            eval_zs = self.alg.policy.goal_inference(eval_obs.view(-1)).view(mini_batch_size, bucket_size, -1)
+            eval_zs = pad_to_size(eval_zs, self.env.num_envs, dim=0)
 
-                first_motions = pad_to_size(eval_motions[:, 0, :], self.env.num_envs, dim=0)
-                obs, _ = self.env.reset_to(
-                    {
-                        "articulation": {
-                            "robot": {
-                                "root_pose": first_motions[:, :7],
-                                "root_velocity": first_motions[:, 7:13],
-                                "joint_position": first_motions[:, 13 : 13 + num_joints],
-                                "joint_velocity": first_motions[:, 13 + num_joints :],
-                            }
+            first_motions = pad_to_size(eval_motions[:, 0, :], self.env.num_envs, dim=0)
+            # assume that motions only contains root state and joint state
+            num_joints = (first_motions.shape[1] - 13) // 2
+            obs, _ = self.env.reset_to(
+                {
+                    "articulation": {
+                        "robot": {
+                            "root_pose": first_motions[:, :7],
+                            "root_velocity": first_motions[:, 7:13],
+                            "joint_position": first_motions[:, 13 : 13 + num_joints],
+                            "joint_velocity": first_motions[:, 13 + num_joints :],
                         }
-                    },
-                    is_relative=True,
-                )
-                actual_qpos = torch.zeros((mini_batch_size, bucket_size, num_joints), device=self.device)
-                for it in range(bucket_size):
-                    actions = self.alg.policy.act(obs, eval_zs[:, it, :])
-                    # pad out remaining envs with zeros
-                    actions = pad_to_size(actions, self.env.num_envs, dim=0)
-                    obs, _, _, _ = self.env.step(actions.to(self.env.device))
-                    obs_tensor = self.alg.expert_buffer.get_expert_obs(obs)
-                    actual_qpos[:, it, :] = obs_tensor[:mini_batch_size, 13 : 13 + num_joints].to(self.device)
+                    }
+                },
+                is_relative=True,
+            )
+            actual_qpos = torch.zeros((mini_batch_size, bucket_size, num_joints), device=self.device)
+            for it in range(bucket_size):
+                actions = self.alg.policy.act(obs, eval_zs[:, it, :])
+                # pad out remaining envs with zeros
+                actions = pad_to_size(actions, self.env.num_envs, dim=0)
+                obs, _, _, _ = self.env.step(actions.to(self.env.device))
+                obs_tensor = self.alg.expert_buffer.get_expert_obs(obs)
+                actual_qpos[:, it, :] = obs_tensor[:mini_batch_size, 13 : 13 + num_joints].to(self.device)
 
-                eval_qpos = eval_motions[:, :, 13 : 13 + num_joints]
-                eval_info = self.alg.update_priorities(actual_qpos, eval_qpos, idx)
-                eval_infos.append(eval_info)
+            eval_qpos = eval_motions[:, :, 13 : 13 + num_joints]
+            eval_info = self.alg.update_priorities(actual_qpos, eval_qpos, idx)
+            eval_infos.append(eval_info)
 
-                idx += mini_batch_size
+            idx += mini_batch_size
+        self.alg.normalize_priorities()
+
+        # revert to train mode
+        self.train_mode()
         return eval_infos
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         assert self.writer is not None
-
-        print(torch.cuda.memory_summary())
 
         # Compute the collection size
         collection_size = self.env.num_envs * self.gpu_world_size
@@ -273,8 +280,8 @@ class OffPolicyRunner:
             locs["ep_infos"],
             locs["it"],
             pad=pad,
-            writer_format="Episode/{}",
-            console_format="Mean episode {}",
+            writer_format="{}",  # episode infos have their own categories
+            console_format="Mean {}",
         )
 
         mean_std = self.alg.policy.action_std.mean().item()
@@ -285,8 +292,8 @@ class OffPolicyRunner:
             locs["loss_infos"],
             locs["it"],
             pad=pad,
-            writer_format="Loss/{}_loss",
-            console_format="Mean {} loss",
+            writer_format="{}_loss",  # loss infos have their own categories
+            console_format="Mean {}_loss",
         )
 
         # -- Algorithm info
@@ -396,12 +403,6 @@ class OffPolicyRunner:
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
-
-    # def get_inference_policy(self, device: str | None = None) -> Callable:
-    #     self.eval_mode()  # switch to evaluation mode (dropout for example)
-    #     if device is not None:
-    #         self.alg.policy.to(device)
-    #     return self.alg.policy.act_inference
 
     def train_mode(self) -> None:
         self.alg.train_mode()

@@ -369,7 +369,7 @@ def compute_distance_matrix(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 def compute_emd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     assert len(x.shape) == 2 and len(y.shape) == 2, "Only 2D tensors are supported for EMD computation."
-    cost_matrix = compute_distance_matrix(x, y)
+    cost_matrix = compute_distance_matrix(x, y).detach()
     x_pot = torch.ones(x.shape[0], device=x.device) / x.shape[0]
     y_pot = torch.ones(y.shape[0], device=y.device) / y.shape[0]
     return ot.emd2(x_pot, y_pot, cost_matrix, numItermax=100000)

@@ -6,5 +6,6 @@
 """Submodule defining the environment definitions."""
 
 from .vec_env import VecEnv
+from .url_vec_env import URLVecEnv
 
-__all__ = ["VecEnv"]
+__all__ = ["VecEnv", "URLVecEnv"]
