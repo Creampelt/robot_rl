@@ -1,8 +1,7 @@
 from typing import Iterator
-from random import randint
 
 import torch
-from tensordict import TensorDict, cat as td_cat
+from tensordict import TensorDict
 
 from robot_rl.utils import get_obs
 from .expert_buffer import ExpertBuffer
@@ -11,18 +10,20 @@ from .expert_buffer import ExpertBuffer
 class TrajectoryBuffer(ExpertBuffer):
     def __init__(
         self,
-        motion_paths: list[str],
-        bucket_size: int,
+        motion_path: str,
         expert_obs_groups: list[str],
         device: str = "cpu",
     ) -> None:
         self.device = device
-        self.bucket_size = bucket_size
         self.obs_groups = expert_obs_groups
 
-        self.motions = self._parse_motion_paths(motion_paths, device)  # num_motions x bucket_size
-        self.num_motions = self.motions.shape[0]
+        # motions file should be obs tensordict with batch shape (num_motions, bucket_size)
+        self.motions = torch.load(motion_path, weights_only=False).to(device)
+        assert len(self.motions.shape) == 2
+        self.num_motions, self.bucket_size = self.motions.shape
         self.priorities = torch.ones((self.motions.shape[0],), device=device)
+
+        print(f"[INFO] Successfully loaded {self.num_motions} motions with length {self.bucket_size}.")
 
     def sample(self, batch_size: int, device: str | None = None) -> tuple[TensorDict, TensorDict]:
         """Sample current and next expert observations from multinomial distribution weighted by priorities (see
@@ -72,19 +73,3 @@ class TrajectoryBuffer(ExpertBuffer):
 
     def get_expert_obs(self, obs: TensorDict) -> torch.Tensor:
         return get_obs(obs, self.obs_groups)
-
-    def _parse_motion_paths(self, motion_paths: list[str], device: str) -> TensorDict:
-        motions: list[TensorDict] = []
-        motion_lengths = torch.zeros(len(motion_paths), dtype=torch.int)
-        for i, motion_path in enumerate(motion_paths):
-            # disable weights so we can load tensordict
-            motion = torch.load(motion_path, weights_only=False)
-            assert isinstance(motion, TensorDict), f"Invalid obs type {type(motion)}, expected TensorDict"
-            # if motion is not evenly divisible by sequence length, we take the largest divisible section and randomly
-            # align the window
-            remainder = motion.shape[0] % self.bucket_size
-            start_idx = randint(0, remainder)
-            end_idx = start_idx + motion.shape[0] - remainder
-            motions.append(motion[start_idx:end_idx].reshape(-1, self.bucket_size))
-            motion_lengths[i] = motion.shape[0]
-        return td_cat(motions, dim=0).to(device)  # type: ignore

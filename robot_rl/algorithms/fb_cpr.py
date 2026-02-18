@@ -2,7 +2,6 @@ from __future__ import annotations
 from typing import cast
 
 import os
-import glob
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -23,8 +22,7 @@ class FbCpr:
     def __init__(
         self,
         policy: ForwardBackward,
-        motion_dir: str,
-        expert_bucket_size: int,
+        motion_path: str,
         expert_sequence_length: int,
         steps_per_z_update: int,
         actor_learning_rate: float = 1e-4,
@@ -131,9 +129,7 @@ class FbCpr:
         self.gamma = gamma
         self.z_dim = self.policy.z_dim
 
-        motion_dir = os.path.abspath(motion_dir)
-        self.motion_paths = glob.glob(os.path.join(motion_dir, "*.pt"))
-        self.expert_bucket_size = expert_bucket_size
+        self.motion_path = os.path.abspath(motion_path)
         self.expert_sequence_length = expert_sequence_length
 
         # Precompute useful variables
@@ -177,8 +173,7 @@ class FbCpr:
             device,
         )
         self._expert_buffer = TrajectoryBuffer(
-            self.motion_paths,
-            self.expert_bucket_size,
+            self.motion_path,
             self.policy.obs_groups["expert"],
             device,
         )
