@@ -35,7 +35,7 @@ class MLP(nn.Sequential):
         output_dim: int | Sequence[int],
         hidden_dims: Sequence[int],
         activation: str = "elu",
-        last_activation: str | None = None,
+        last_activation: str | nn.Module | None = None,
     ):
         """Initialize the MLP.
 
@@ -52,7 +52,12 @@ class MLP(nn.Sequential):
 
         # resolve activation functions
         activation_mod = resolve_nn_activation(activation)
-        last_activation_mod = resolve_nn_activation(last_activation) if last_activation is not None else None
+        if isinstance(last_activation, str):
+            last_activation_mod = resolve_nn_activation(last_activation)
+        elif last_activation is not None:
+            last_activation_mod = last_activation
+        else:
+            last_activation_mod = None
         # resolve number of hidden dims if they are -1
         hidden_dims_processed = [input_dim if dim == -1 else dim for dim in hidden_dims]
 

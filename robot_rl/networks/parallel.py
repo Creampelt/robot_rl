@@ -3,9 +3,6 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
-from rsl_rl.utils import resolve_nn_activation
 
 
 class ParallelLinear(nn.Module):
@@ -85,22 +82,20 @@ class ParallelLinear(nn.Module):
 class ParallelLayerNorm(nn.Module):
     def __init__(
         self,
-        normalized_shape: Sequence[int],
+        dim: int,
         num_parallel: int,
         eps: float = 1e-5,
         device: str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
-        assert len(normalized_shape) == 1, "ParallelLayerNorm is currently only supported for single layer norms."
-
-        self.normalized_shape = normalized_shape
+        self.normalized_shape = (dim,)
         self.num_parallel = num_parallel
         self.eps = eps
         self.use_linear = num_parallel == 1
 
         factory_kwargs = {"device": device, "dtype": dtype}
-        param_dim = normalized_shape if self.use_linear else (num_parallel, 1, *normalized_shape)
+        param_dim = self.normalized_shape if self.use_linear else (num_parallel, 1, *self.normalized_shape)
         self.weight = nn.Parameter(torch.empty(param_dim, **factory_kwargs))
         self.bias = nn.Parameter(torch.empty(param_dim, **factory_kwargs))
 

@@ -15,3 +15,4 @@ from .normalization import (
 )
 from .parallel import ParallelLinear, ParallelLayerNorm
 from .distributions import TruncatedNormal
+from .forward_backward import Embedding, ResidualEmbedding, EmbeddedNet, EmbeddedResNet

@@ -6,124 +6,13 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from robot_rl.networks import (
-    ParallelLinear,
-    ParallelLayerNorm,
     ScaledNormalization,
     TruncatedNormal,
+    EmbeddedResNet,
+    EmbeddedNet,
+    MLP,
 )
-from robot_rl.utils import get_obs_dimensions, resolve_nn_activation, get_obs, eval_mode
-
-
-class _SimpleEmbedding(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        hidden_dims: Sequence[int] = [],
-        num_parallel: int = 1,
-        activation: str = "relu",
-    ) -> None:
-        super().__init__()
-
-        layers = [
-            ParallelLinear(input_dim, hidden_dims[0], num_parallel),
-            ParallelLayerNorm((hidden_dims[0],), num_parallel),
-            nn.Tanh(),
-        ]
-        for i, dim in enumerate(hidden_dims[:-1]):
-            layers.append(
-                ParallelLinear(
-                    dim,
-                    hidden_dims[i + 1],
-                    num_parallel,
-                )
-            )
-            layers.append(resolve_nn_activation(activation))
-        layers.append(
-            ParallelLinear(
-                hidden_dims[-1],
-                output_dim,
-                num_parallel,
-            )
-        )
-        layers.append(resolve_nn_activation(activation))
-
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
-
-
-class _SimpleMLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int | Sequence[int],
-        output_dim: int,
-        hidden_dims: Sequence[int],
-        num_embedding_layers: int = 0,
-        num_parallel: int = 1,
-        last_activation: str | nn.Module = "identity",
-    ) -> None:
-        super().__init__()
-        assert hidden_dims, "hidden_dims must have at least one layer."
-        self.num_parallel = num_parallel
-        self.embeddings: nn.ModuleList | None = None
-
-        layers = []
-        if num_embedding_layers > 0:
-            assert isinstance(input_dim, Sequence)
-            embedding_dims = hidden_dims[: num_embedding_layers - 1]
-            embed_out_dim = hidden_dims[num_embedding_layers - 1] // num_embedding_layers
-
-            self.embeddings = nn.ModuleList(
-                [
-                    _SimpleEmbedding(
-                        d,
-                        embed_out_dim,
-                        embedding_dims,
-                        num_parallel,
-                    )
-                    for d in input_dim
-                ]
-            )
-        else:
-            assert isinstance(input_dim, int)
-            layers += [
-                ParallelLinear(input_dim, hidden_dims[0], num_parallel),
-                ParallelLayerNorm((hidden_dims[0],), num_parallel),
-                nn.Tanh(),
-            ]
-
-        for i, dim in enumerate(hidden_dims[num_embedding_layers - 1 : -1]):
-            layers.append(
-                ParallelLinear(
-                    dim,
-                    hidden_dims[i + 1],
-                    num_parallel,
-                )
-            )
-            layers.append(nn.ReLU())
-        layers.append(ParallelLinear(hidden_dims[-1], output_dim, num_parallel))
-        if isinstance(last_activation, str):
-            layers.append(resolve_nn_activation(last_activation))
-        else:
-            layers.append(last_activation)
-
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
-        if self.num_parallel > 1:
-            if isinstance(x, tuple):
-                x = tuple([x_i.expand(self.num_parallel, -1, -1) for x_i in x])
-            else:
-                x = x.expand(self.num_parallel, -1, -1)
-
-        if self.embeddings is not None:
-            assert isinstance(x, tuple) and len(x) == len(self.embeddings)
-            embed_out = [e(x_i) for e, x_i in zip(self.embeddings, x)]
-            x = torch.concat(embed_out, dim=-1)
-        assert isinstance(x, torch.Tensor)
-        return self.model(x)
+from robot_rl.utils import get_obs_dimensions, get_obs, eval_mode
 
 
 class ForwardBackward(nn.Module):
@@ -141,14 +30,13 @@ class ForwardBackward(nn.Module):
         z_normalization: bool = True,
         backward_out_normalization: bool = True,
         actor_num_parallel: int = 1,
-        actor_hidden_dims: Sequence[int] = [1024, 1024, 1024],
-        actor_num_embedding_layers: int = 2,
-        backward_num_parallel: int = 1,
-        backward_hidden_dims: Sequence[int] = [256, 256],
-        discriminator_hidden_dims: Sequence[int] = [1024, 1024, 1024],
+        actor_embedding_dims: Sequence[int] = [2048, 2048, 2048, 2048],
+        actor_hidden_dims: Sequence[int] = [2048, 2048, 2048, 2048, 2048, 2048],
         critic_num_parallel: int = 2,
-        critic_hidden_dims: Sequence[int] = [1024, 1024, 1024],
-        critic_num_embedding_layers: int = 2,
+        critic_embedding_dims: Sequence[int] = [2048, 2048, 2048, 2048],
+        critic_hidden_dims: Sequence[int] = [2048, 2048, 2048, 2048, 2048, 2048],
+        backward_hidden_dims: Sequence[int] = [256],
+        discriminator_hidden_dims: Sequence[int] = [1024, 1024],
         **kwargs,
     ):
         if kwargs:
@@ -171,11 +59,11 @@ class ForwardBackward(nn.Module):
         self.num_discriminator_obs = get_obs_dimensions(obs, obs_groups["discriminator"])
 
         # actor
-        self.actor = _SimpleMLP(
+        self.actor = EmbeddedResNet(
             (self.num_actor_obs + z_dim, self.num_actor_obs),
             num_actions,
+            actor_embedding_dims,
             actor_hidden_dims,
-            actor_num_embedding_layers,
             actor_num_parallel,
             last_activation="tanh",
         )
@@ -186,11 +74,11 @@ class ForwardBackward(nn.Module):
         )
 
         # backward mapping
-        self.backward_map = _SimpleMLP(
+        self.backward_map = MLP(
             self.num_backward_obs,
             z_dim,
             backward_hidden_dims,
-            num_parallel=backward_num_parallel,
+            activation="relu",
             last_activation=ScaledNormalization() if backward_out_normalization else "identity",
         )
         self.backward_obs_normalizer = (
@@ -200,10 +88,11 @@ class ForwardBackward(nn.Module):
         )
 
         # discriminator
-        self.discriminator = _SimpleMLP(
+        self.discriminator = MLP(
             self.num_discriminator_obs + self.z_dim,
             1,
             discriminator_hidden_dims,
+            activation="relu",
             last_activation="sigmoid",
         )
         self.discriminator_obs_normalizer = (
@@ -213,25 +102,25 @@ class ForwardBackward(nn.Module):
         )
 
         # critics (forward, discriminator, auxiliary)
-        self.forward_map = _SimpleMLP(
+        self.forward_map = EmbeddedResNet(
             (self.num_critic_obs + self.z_dim, self.num_critic_obs + num_actions),
             self.z_dim,
+            critic_embedding_dims,
             critic_hidden_dims,
-            critic_num_embedding_layers,
             critic_num_parallel,
         )
-        self.disc_critic = _SimpleMLP(
+        self.disc_critic = EmbeddedResNet(
             (self.num_critic_obs + self.z_dim, self.num_critic_obs + num_actions),
             1,
+            critic_embedding_dims,
             critic_hidden_dims,
-            critic_num_embedding_layers,
             critic_num_parallel,
         )
-        self.aux_critic = _SimpleMLP(
+        self.aux_critic = EmbeddedResNet(
             (self.num_critic_obs + self.z_dim, self.num_critic_obs + num_actions),
             1,
+            critic_embedding_dims,
             critic_hidden_dims,
-            critic_num_embedding_layers,
             critic_num_parallel,
         )
 
@@ -246,10 +135,10 @@ class ForwardBackward(nn.Module):
         self.distribution: TruncatedNormal | None = None
 
         # placeholders for target networks and paramlists
-        self.target_forward_map: _SimpleMLP | None = None
-        self.target_backward_map: _SimpleMLP | None = None
-        self.target_disc_critic: _SimpleMLP | None = None
-        self.target_aux_critic: _SimpleMLP | None = None
+        self.target_forward_map: EmbeddedNet | None = None
+        self.target_backward_map: MLP | None = None
+        self.target_disc_critic: EmbeddedNet | None = None
+        self.target_aux_critic: EmbeddedNet | None = None
 
         self._forward_paramlist: tuple[torch.Tensor, ...] | None = None
         self._backward_paramlist: tuple[torch.Tensor, ...] | None = None
@@ -290,8 +179,8 @@ class ForwardBackward(nn.Module):
     def action_std(self) -> torch.Tensor:
         return self.distribution.stddev
 
-    def update_distribution(self, x: tuple[torch.Tensor, torch.Tensor]) -> None:
-        mean = self.actor(x)
+    def update_distribution(self, obs_z: torch.Tensor, obs: torch.Tensor) -> None:
+        mean = self.actor(obs_z, obs)
         self.distribution = TruncatedNormal(mean, self.init_noise_std)
 
     def update_normalization(self, obs: TensorDict) -> None:
@@ -310,7 +199,7 @@ class ForwardBackward(nn.Module):
     def act(self, obs: TensorDict, z: torch.Tensor, clip: float | None = None, **kwargs) -> torch.Tensor:
         normalized_obs = self.get_actor_obs(obs)
         obs_z = torch.cat([normalized_obs, z], dim=-1)
-        self.update_distribution((obs_z, normalized_obs))
+        self.update_distribution(obs_z, normalized_obs)
         assert self.distribution is not None
         return self.distribution.sample(clip=clip)
 
@@ -327,7 +216,7 @@ class ForwardBackward(nn.Module):
 
         forward_map = self.target_forward_map if use_target else self.forward_map
         assert forward_map is not None
-        return forward_map((obs_z, obs_action))
+        return forward_map(obs_z, obs_action)
 
     def B(self, goal_obs: TensorDict, use_target: bool = False) -> torch.Tensor:
         normalized_obs = self.get_backward_obs(goal_obs)
@@ -352,7 +241,7 @@ class ForwardBackward(nn.Module):
 
         disc_critic = self.target_disc_critic if use_target else self.disc_critic
         assert disc_critic is not None, "disc_critic is None. Did you call `init_targets` before training?"
-        return disc_critic((obs_z, obs_action))
+        return disc_critic(obs_z, obs_action)
 
     def evaluate_aux(
         self,
@@ -367,7 +256,7 @@ class ForwardBackward(nn.Module):
 
         aux_critic = self.target_aux_critic if use_target else self.aux_critic
         assert aux_critic is not None, "aux_critic is None. Did you call `init_targets` before training?"
-        return aux_critic((obs_z, obs_action))
+        return aux_critic(obs_z, obs_action)
 
     """
     Inference
