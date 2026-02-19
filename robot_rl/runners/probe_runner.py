@@ -261,6 +261,7 @@ class ProbeRunner:
             self.alg.probe_obs_normalizer.load_state_dict(loaded_dict["probe_obs_norm_state_dict"])
         # -- load current learning iteration
         self.current_learning_iteration = loaded_dict["iter"]
+        self.env.unwrapped.common_env_step = loaded_dict["iter"]  # type: ignore
         return loaded_dict["infos"]
 
     def load_actor(self, path: str, load_optimizer: bool = False) -> dict:
