@@ -17,7 +17,7 @@ class FbCpr:
     """FB-CPR algorithm (https://arxiv.org/pdf/2504.11054)."""
 
     policy: ForwardBackward
-    """The actor critic module."""
+    """The policy module."""
 
     def __init__(
         self,
@@ -270,6 +270,7 @@ class FbCpr:
 
         return z
 
+    @torch.compile(mode="reduce-overhead", fullgraph=True)
     @torch.no_grad()
     def sample_mixed_z(self, goal_obs: TensorDict, expert_z: torch.Tensor) -> torch.Tensor:
         z = self._sample_random_z(self.batch_size)
@@ -291,6 +292,7 @@ class FbCpr:
 
         return z
 
+    @torch.compile(mode="reduce-overhead", fullgraph=True)
     @torch.no_grad()
     def encode_expert(self, obs: TensorDict) -> torch.Tensor:
         expert_B = self.policy.B(obs)  # batch_size, z_dim
@@ -335,6 +337,8 @@ class FbCpr:
         # update parameters for all normalizers
         self.policy.update_normalization(obs)
         self.policy.update_normalization(next_obs)
+
+        torch.compiler.cudagraph_mark_step_begin()
 
         # encode expert z
         expert_z = self.encode_expert(expert_next_obs)
@@ -382,6 +386,9 @@ class FbCpr:
 
         with torch.no_grad():
             self.policy.soft_update_targets()
+            # clone to avoid issues with accessing memory outside cudagraphs when logging
+            loss_dict = {k: v.clone() for k, v in loss_dict.items()}
+            extras = {k: v.clone() for k, v in extras.items()}
 
         return loss_dict, {"log": extras}
 
@@ -400,6 +407,7 @@ class FbCpr:
         z = self.policy.z_normalizer(z)
         return z
 
+    @torch.compile(mode="reduce-overhead")
     def _update_discriminator(
         self,
         obs: TensorDict,
@@ -415,30 +423,7 @@ class FbCpr:
         loss = torch.mean(expert_loss + unlabeled_loss)
 
         # compute gradient penalty loss
-        normalized_obs = self.policy.get_discriminator_obs(obs)
-        normalized_expert_obs = self.policy.get_discriminator_obs(expert_obs)
-
-        alpha = torch.rand(self.batch_size, 1, device=self.device)
-
-        interpolates = torch.cat(
-            [
-                (alpha * normalized_obs + (1 - alpha) * normalized_expert_obs).requires_grad_(True),
-                (alpha * z + (1 - alpha) * expert_z).requires_grad_(True),
-            ],
-            dim=1,
-        )
-        d_interpolates = self.policy.discriminator(interpolates)
-        gradients = torch.autograd.grad(
-            outputs=d_interpolates,
-            inputs=interpolates,
-            grad_outputs=torch.ones_like(d_interpolates),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-
-        grad_loss = self.grad_loss_coef * torch.mean(torch.square(gradients.norm(2, dim=1) - 1))
-
+        grad_loss = self.grad_loss_coef * self._gradient_wgan_penalty(obs, z, expert_obs, expert_z)
         loss += grad_loss
 
         self.discriminator_optimizer.zero_grad()
@@ -455,6 +440,7 @@ class FbCpr:
 
         return loss_dict, {}
 
+    @torch.compile(mode="reduce-overhead")
     def _update_forward_backward(
         self,
         obs: TensorDict,
@@ -530,6 +516,7 @@ class FbCpr:
 
         return loss_dict, extras
 
+    @torch.compile(mode="reduce-overhead")
     def _update_disc_critic(
         self,
         obs: TensorDict,
@@ -569,6 +556,7 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
+    @torch.compile(mode="reduce-overhead")
     def _update_aux_critic(
         self,
         obs: TensorDict,
@@ -604,6 +592,7 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
+    @torch.compile(mode="reduce-overhead")
     def _update_actor(
         self,
         obs: TensorDict,
@@ -650,3 +639,35 @@ class FbCpr:
             }
 
         return loss_dict, extras_dict
+
+    @torch.compiler.disable
+    def _gradient_wgan_penalty(
+        self,
+        obs: TensorDict,
+        z: torch.Tensor,
+        expert_obs: TensorDict,
+        expert_z: torch.Tensor,
+    ) -> torch.Tensor:
+        # get obs tensors from tensordicts
+        normalized_obs = self.policy.get_discriminator_obs(obs)
+        normalized_expert_obs = self.policy.get_discriminator_obs(expert_obs)
+
+        alpha = torch.rand(self.batch_size, 1, device=self.device)
+
+        interpolates = torch.cat(
+            [
+                (alpha * normalized_obs + (1 - alpha) * normalized_expert_obs).requires_grad_(True),
+                (alpha * z + (1 - alpha) * expert_z).requires_grad_(True),
+            ],
+            dim=1,
+        )
+        d_interpolates = self.policy.discriminator(interpolates)
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(d_interpolates),
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        return torch.mean(torch.square(gradients.norm(2, dim=1) - 1))
