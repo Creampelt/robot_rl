@@ -476,7 +476,12 @@ class OffPolicyRunner:
             elif self.logger_type == "wandb":
                 from robot_rl.utils.wandb_utils import WandbSummaryWriter
 
-                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer = WandbSummaryWriter(
+                    log_dir=self.log_dir,
+                    flush_secs=10,
+                    num_envs=self.env.num_envs,
+                    cfg=self.cfg,
+                )
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
