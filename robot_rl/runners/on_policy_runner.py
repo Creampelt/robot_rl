@@ -346,6 +346,7 @@ class OnPolicyRunner:
         # -- load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
+            self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.num_steps_per_env  # type: ignore
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
@@ -490,7 +491,12 @@ class OnPolicyRunner:
             elif self.logger_type == "wandb":
                 from robot_rl.utils.wandb_utils import WandbSummaryWriter
 
-                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer = WandbSummaryWriter(
+                    log_dir=self.log_dir,
+                    flush_secs=10,
+                    num_envs=self.env.num_envs,
+                    cfg=self.cfg,
+                )
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter

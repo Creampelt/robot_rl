@@ -19,7 +19,7 @@ except ModuleNotFoundError:
 class WandbSummaryWriter(SummaryWriter):
     """Summary writer for Weights and Biases."""
 
-    def __init__(self, log_dir: str, flush_secs: int, cfg):
+    def __init__(self, log_dir: str, flush_secs: int, num_envs: int, cfg: dict):
         super().__init__(log_dir, flush_secs)
 
         try:
@@ -50,9 +50,11 @@ class WandbSummaryWriter(SummaryWriter):
 
         run_name = os.path.split(log_dir)[-1]
         self.run.log({"log_dir": run_name}, step=0 if not self.shared else None)
-        self.run.define_metric("*", step_metric="local_step")
+        self.run.define_metric("*", step_metric="local_step")  # global step (custom defined for async video logging)
+        self.run.define_metric("*", step_metric="env_step")  # env step (step * num_envs)
 
         self.saved_videos = {}
+        self.num_envs = num_envs  # save num_envs to use for recording env_step
 
     def store_config(self, env_cfg: dict, runner_cfg: dict, alg_cfg: dict, policy_cfg: dict):
         self.run.config.update({"runner_cfg": runner_cfg})
@@ -79,7 +81,7 @@ class WandbSummaryWriter(SummaryWriter):
             new_style=new_style,
         )
         self.run.log(
-            {self._map_path(tag): scalar_value, "local_step": global_step},
+            {self._map_path(tag): scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs},
             step=global_step if not self.shared else None,
         )
 
@@ -96,7 +98,7 @@ class WandbSummaryWriter(SummaryWriter):
     def save_file(self, path, iter=None):
         self.run.save(path, base_path=os.path.dirname(path))
 
-    def log_video_files(self, log_name: str = "Video", video_subdir: str | None = "videos"):
+    def log_video_files(self, global_step: int, log_name: str = "Video", video_subdir: str | None = "videos"):
         if video_subdir is not None:
             video_dir = pathlib.Path(os.path.join(self.log_dir, video_subdir))
         else:
@@ -118,7 +120,7 @@ class WandbSummaryWriter(SummaryWriter):
                 elif video_info["size"] == video_size_kb and video_size_kb > 100:
                     # wait 10 steps after recording has been completed
                     if video_info["steps"] > 10:
-                        self.add_video(video_name, log_name=log_name)
+                        self.add_video(video_name, global_step, log_name=log_name)
                         self.saved_videos[video_name]["recorded"] = True
                     else:
                         video_info["steps"] += 1
@@ -126,8 +128,14 @@ class WandbSummaryWriter(SummaryWriter):
                     self.saved_videos[video_name]["size"] = video_size_kb
                     self.saved_videos[video_name]["steps"] = 0
 
-    def add_video(self, video_path: str, log_name: str = "Video"):
-        self.run.log({log_name: wandb.Video(video_path, format="mp4")})
+    def add_video(self, video_path: str, global_step: int, log_name: str = "Video"):
+        self.run.log(
+            {
+                log_name: wandb.Video(video_path, format="mp4"),
+                "local_step": global_step,
+                "env_step": global_step * self.num_envs,
+            }
+        )
 
     def callback(self, step):
-        self.log_video_files()
+        self.log_video_files(step)
