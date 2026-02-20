@@ -102,8 +102,8 @@ class OffPolicyRunner:
                 if (it - start_iter) % self.eval_interval == 0:
                     # save and clear rewbuffer and lenbuffer if in the middle of an episode
                     if cur_episode_length.any():
-                        rewbuffer.extend(cur_reward_sum[:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[:, 0].cpu().numpy().tolist())
+                        rewbuffer.extend(cur_reward_sum.cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length.cpu().numpy().tolist())
                         cur_reward_sum[:] = 0
                         cur_episode_length[:] = 0
 
@@ -262,9 +262,7 @@ class OffPolicyRunner:
         collection_size = self.env.num_envs * self.num_steps_per_env * self.gpu_world_size
         learn_size = self.alg.batch_size * self.num_agent_updates * self.gpu_world_size
         # Update total time-steps and time
-        iteration_time = locs["collection_time"] + locs["learn_time"]
-        if locs["eval_time"] > 0.0:
-            iteration_time += locs["eval_time"]
+        iteration_time = locs["collection_time"] + locs["learn_time"] + locs["eval_time"]
         self.tot_timesteps += collection_size
         self.tot_updates += learn_size
         self.tot_time += iteration_time
@@ -315,6 +313,8 @@ class OffPolicyRunner:
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+        if locs["eval_time"] > 0.0:
+            self.writer.add_scalar("Perf/evaluation_time", locs["eval_time"], locs["it"])
 
         # -- Training
         if len(locs["rewbuffer"]) > 0:
