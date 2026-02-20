@@ -287,6 +287,22 @@ class ForwardBackward(nn.Module):
     Public utils
     """
 
+    def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
+        """Load the parameters of the model.
+
+        Args:
+            state_dict (dict): State dictionary of the model.
+            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
+                           module's state_dict() function.
+
+        Returns:
+            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
+                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
+        """
+
+        super().load_state_dict(state_dict, strict=strict)
+        return True  # training resumes
+
     def soft_update_targets(self) -> None:
         self._soft_update_params(self._forward_paramlist, self._target_forward_paramlist, self.fb_tau)
         self._soft_update_params(self._backward_paramlist, self._target_backward_paramlist, self.fb_tau)

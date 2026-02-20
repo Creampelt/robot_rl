@@ -53,6 +53,7 @@ class OffPolicyRunner:
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
+        self.tot_updates = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [robot_rl.__file__]
@@ -258,12 +259,14 @@ class OffPolicyRunner:
         assert self.writer is not None
 
         # Compute the collection size
-        collection_size = self.env.num_envs * self.gpu_world_size
+        collection_size = self.env.num_envs * self.num_steps_per_env * self.gpu_world_size
+        learn_size = self.alg.batch_size * self.num_agent_updates * self.gpu_world_size
         # Update total time-steps and time
         iteration_time = locs["collection_time"] + locs["learn_time"]
         if locs["eval_time"] > 0.0:
             iteration_time += locs["eval_time"]
         self.tot_timesteps += collection_size
+        self.tot_updates += learn_size
         self.tot_time += iteration_time
 
         # -- Eval info
@@ -285,7 +288,7 @@ class OffPolicyRunner:
         )
 
         mean_std = self.alg.policy.action_std.mean().item()
-        fps = int(collection_size / iteration_time)
+        fps = (collection_size + learn_size) // iteration_time
 
         # -- Losses
         loss_string = self._get_infos_str(
@@ -358,6 +361,7 @@ class OffPolicyRunner:
         log_string += (
             f"""{"-" * width}\n"""
             f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
+            f"""{"Total updates:":>{pad}} {self.tot_updates}\n"""
             f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
             f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
             f"""{"ETA:":>{pad}} {
@@ -430,8 +434,36 @@ class OffPolicyRunner:
             self.multi_gpu_cfg = None
             return
 
-        # TODO: multi-GPU training
-        raise NotImplementedError
+        # get rank and world size
+        self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        self.gpu_global_rank = int(os.getenv("RANK", "0"))
+
+        # make a configuration dictionary
+        self.multi_gpu_cfg = {
+            "global_rank": self.gpu_global_rank,  # rank of the main process
+            "local_rank": self.gpu_local_rank,  # rank of the current process
+            "world_size": self.gpu_world_size,  # total number of processes
+        }
+
+        # check if user has a device specified for local rank
+        if self.device != f"cuda:{self.gpu_local_rank}":
+            raise ValueError(
+                f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
+            )
+        # validate multi-gpu configuration
+        if self.gpu_local_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+        if self.gpu_global_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
+
+        # initialize torch distributed
+        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        # set device to the local rank
+        torch.cuda.set_device(self.gpu_local_rank)
 
     def _construct_algorithm(self, obs: TensorDict) -> FbCpr:
         """Construct the forward-backward algorithm."""

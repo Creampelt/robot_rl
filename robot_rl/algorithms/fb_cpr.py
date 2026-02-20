@@ -58,8 +58,13 @@ class FbCpr:
     ) -> None:
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
-
-        # TODO: multi-gpu compatibility
+        # Multi-GPU parameters
+        if multi_gpu_cfg is not None:
+            self.gpu_global_rank = multi_gpu_cfg["global_rank"]
+            self.gpu_world_size = multi_gpu_cfg["world_size"]
+        else:
+            self.gpu_global_rank = 0
+            self.gpu_world_size = 1
 
         self.policy = policy
         self.policy.to(self.device)
@@ -397,10 +402,39 @@ class FbCpr:
     """
 
     def broadcast_parameters(self) -> None:
-        pass
+        """Broadcast model parameters to all GPUs."""
+        # obtain the model parameters on current GPU
+        model_params = [self.policy.state_dict()]
+        # broadcast the model parameters
+        torch.distributed.broadcast_object_list(model_params, src=0)
+        # load the model parameters on all GPUs from source GPU
+        self.policy.load_state_dict(model_params[0])
 
-    def reduce_parameters(self) -> None:
-        pass
+    def reduce_parameters(self, m: nn.Module) -> None:
+        """Collect gradients from all GPUs and average them.
+
+        This function is called after the backward pass to synchronize the gradients across all GPUs.
+        """
+        # Create a tensor to store the gradients
+        grads = [param.grad.view(-1) for param in m.parameters() if param.grad is not None]
+        all_grads = torch.cat(grads)
+
+        # Average the gradients across all GPUs
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        # Get all parameters
+        all_params = m.parameters()
+
+        # Update the gradients for all parameters with the reduced gradients
+        offset = 0
+        for param in all_params:
+            if param.grad is not None:
+                numel = param.numel()
+                # copy data back from shared buffer
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                # update the offset for the next parameter
+                offset += numel
 
     def _sample_random_z(self, size: int) -> torch.Tensor:
         z = torch.randn((size, self.z_dim), dtype=torch.float32, device=self.device)
@@ -417,17 +451,24 @@ class FbCpr:
     ) -> tuple[dict[str, torch.Tensor], dict]:
         expert_logits = self.policy.D(expert_obs, expert_z)
         unlabeled_logits = self.policy.D(obs, z)
-        # binary cross entropy
+        # Compute loss with binary cross entropy
         expert_loss = -nn.functional.logsigmoid(expert_logits)
         unlabeled_loss = nn.functional.softplus(unlabeled_logits)
         loss = torch.mean(expert_loss + unlabeled_loss)
 
-        # compute gradient penalty loss
+        # Compute gradient penalty loss
         grad_loss = self.grad_loss_coef * self._gradient_wgan_penalty(obs, z, expert_obs, expert_z)
         loss += grad_loss
 
+        # Compute the gradients
         self.discriminator_optimizer.zero_grad()
         loss.backward()
+
+        # Collect gradients from all GPUs
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.policy.discriminator)
+
+        # Apply the gradients
         self.discriminator_optimizer.step()
 
         with torch.no_grad():
@@ -488,13 +529,22 @@ class FbCpr:
 
         loss = fb_loss + orth_loss + q_loss
 
-        # optimize FB
+        # Compute the gradients
         self.forward_optimizer.zero_grad()
         self.backward_optimizer.zero_grad()
         loss.backward()
+
+        # Collect gradients from all GPUs
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.policy.forward_map)
+            self.reduce_parameters(self.policy.backward_map)
+
+        # Clip gradients if enabled
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.policy.forward_map.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.policy.backward_map.parameters(), self.max_grad_norm)
+
+        # Apply the gradients
         self.forward_optimizer.step()
         self.backward_optimizer.step()
 
@@ -539,8 +589,15 @@ class FbCpr:
         Qs = self.policy.evaluate_discriminator(obs, z, actions)
         loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
+        # Compute the gradients
         self.disc_critic_optimizer.zero_grad()
         loss.backward()
+
+        # Collect gradients from all GPUs
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.policy.disc_critic)
+
+        # Apply the gradients
         self.disc_critic_optimizer.step()
 
         with torch.no_grad():
@@ -572,12 +629,19 @@ class FbCpr:
             next_Qs = self.policy.evaluate_aux(next_obs, z, next_actions)
             target_Q = rewards.unsqueeze(1) + gammas * compute_td_targets(next_Qs, self.aux_critic_pessimism)
             target_Q = target_Q.expand(num_parallel, -1, -1)
-        # compute critic loss
+        # Compute critic loss
         Qs = self.policy.evaluate_aux(obs, z, actions)
         loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
+        # Compute the gradients
         self.aux_critic_optimizer.zero_grad()
         loss.backward()
+
+        # Collect gradients from all GPUs
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.policy.aux_critic)
+
+        # Apply the gradients
         self.aux_critic_optimizer.step()
 
         with torch.no_grad():
@@ -619,11 +683,19 @@ class FbCpr:
 
         actor_loss = Q_fb + Q_discriminator * reg_weight + Q_aux * reg_weight
 
-        # optimize actor
+        # Compute the gradients
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+
+        # Collect gradients from all GPUs
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.policy.actor)
+
+        # Clip gradients if enabled
         if self.max_grad_norm is not None:
             nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+
+        # Apply the gradients
         self.actor_optimizer.step()
 
         with torch.no_grad():
