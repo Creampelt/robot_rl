@@ -384,6 +384,10 @@ class OffPolicyRunner:
             "actor_optimizer_state_dict": self.alg.actor_optimizer.state_dict(),
             "forward_optimizer_state_dict": self.alg.forward_optimizer.state_dict(),
             "backward_optimizer_state_dict": self.alg.backward_optimizer.state_dict(),
+            "discriminator_optimizer_state_dict": self.alg.discriminator_optimizer.state_dict(),
+            "disc_critic_optimizer_state_dict": self.alg.disc_critic_optimizer.state_dict(),
+            "aux_critic_optimizer_state_dict": self.alg.aux_critic_optimizer.state_dict(),
+            "aux_reward_normalizer_state_dict": self.alg.aux_reward_normalizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -403,9 +407,14 @@ class OffPolicyRunner:
             self.alg.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
             self.alg.forward_optimizer.load_state_dict(loaded_dict["forward_optimizer_state_dict"])
             self.alg.backward_optimizer.load_state_dict(loaded_dict["backward_optimizer_state_dict"])
+            self.alg.discriminator_optimizer.load_state_dict(loaded_dict["discriminator_optimizer_state_dict"])
+            self.alg.disc_critic_optimizer.load_state_dict(loaded_dict["disc_critic_optimizer_state_dict"])
+            self.alg.aux_critic_optimizer.load_state_dict(loaded_dict["aux_critic_optimizer_state_dict"])
+            self.alg.aux_reward_normalizer.load_state_dict(loaded_dict["aux_reward_normalizer_state_dict"])
         # -- load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
+            self.env.unwrapped.common_step_counter = loaded_dict["iter"] * self.num_steps_per_env  # type: ignore
         return loaded_dict["infos"]
 
     def train_mode(self) -> None:
