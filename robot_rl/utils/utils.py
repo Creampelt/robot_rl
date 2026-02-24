@@ -12,9 +12,12 @@ import pathlib
 import torch
 import warnings
 from tensordict import TensorDict
-from typing import Callable, TypeVar, Any
+from typing import TypeVar, Any
+from collections.abc import Callable
+from string import Template
 import numpy as np
 import ot
+from datetime import timedelta
 
 
 T = TypeVar("T")
@@ -423,3 +426,16 @@ class eval_mode:
     def __exit__(self, *args) -> None:
         for model, state in zip(self.models, self.prev_states):
             model.train(state)
+
+
+class _TimeDeltaTemplate(Template):
+    delimeter = "%"
+
+
+def format_date(fmt: str, time_s: float) -> str:
+    tdelta = timedelta(seconds=time_s)
+    d = {"D": tdelta.days}
+    d["H"], rem = divmod(tdelta.seconds, 3600)
+    d["M"], d["S"] = divmod(rem, 60)
+    t = _TimeDeltaTemplate(fmt)
+    return t.substitute(**d)

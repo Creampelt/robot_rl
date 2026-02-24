@@ -278,21 +278,22 @@ class FbCpr:
     @torch.compile(mode="reduce-overhead", fullgraph=True)
     @torch.no_grad()
     def sample_mixed_z(self, goal_obs: TensorDict, expert_z: torch.Tensor) -> torch.Tensor:
-        z = self._sample_random_z(self.batch_size)
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            z = self._sample_random_z(self.batch_size)
 
-        mix_probs = torch.tensor(
-            [self.train_goal_ratio, self.expert_asm_ratio, 1 - self.train_goal_ratio - self.expert_asm_ratio],
-            device=self.device,
-        )
-        mix_indices = torch.multinomial(mix_probs, self.batch_size, replacement=True).view(-1, 1)
+            mix_probs = torch.tensor(
+                [self.train_goal_ratio, self.expert_asm_ratio, 1 - self.train_goal_ratio - self.expert_asm_ratio],
+                device=self.device,
+            )
+            mix_indices = torch.multinomial(mix_probs, self.batch_size, replacement=True).view(-1, 1)
 
-        # zs for encoded train goals
-        perm = torch.randperm(self.batch_size, device=self.device)
-        goal_z = self.policy.goal_inference(goal_obs)
-        z = torch.where(mix_indices == 0, goal_z[perm], z)
+            # zs for encoded train goals
+            perm = torch.randperm(self.batch_size, device=self.device)
+            goal_z = self.policy.goal_inference(goal_obs)
+            z = torch.where(mix_indices == 0, goal_z[perm], z)
 
-        # zs from expert trajectories
-        perm = torch.randperm(self.batch_size, device=self.device)
+            # zs from expert trajectories
+            perm = torch.randperm(self.batch_size, device=self.device)
         z = torch.where(mix_indices == 1, expert_z[perm], z)
 
         return z
@@ -449,16 +450,17 @@ class FbCpr:
         expert_obs: TensorDict,
         expert_z: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        expert_logits = self.policy.D(expert_obs, expert_z)
-        unlabeled_logits = self.policy.D(obs, z)
-        # Compute loss with binary cross entropy
-        expert_loss = -nn.functional.logsigmoid(expert_logits)
-        unlabeled_loss = nn.functional.softplus(unlabeled_logits)
-        loss = torch.mean(expert_loss + unlabeled_loss)
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            expert_logits = self.policy.D(expert_obs, expert_z)
+            unlabeled_logits = self.policy.D(obs, z)
+            # Compute loss with binary cross entropy
+            expert_loss = -nn.functional.logsigmoid(expert_logits)
+            unlabeled_loss = nn.functional.softplus(unlabeled_logits)
+            loss = torch.mean(expert_loss + unlabeled_loss)
 
-        # Compute gradient penalty loss
-        grad_loss = self.grad_loss_coef * self._gradient_wgan_penalty(obs, z, expert_obs, expert_z)
-        loss += grad_loss
+            # Compute gradient penalty loss
+            grad_loss = self.grad_loss_coef * self._gradient_wgan_penalty(obs, z, expert_obs, expert_z)
+            loss += grad_loss
 
         # Compute the gradients
         self.discriminator_optimizer.zero_grad()
@@ -490,44 +492,47 @@ class FbCpr:
         gammas: torch.Tensor,
         z: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        # Forward-Backward loss
-        with torch.no_grad():
-            next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
-            target_Fs = self.policy.F(next_obs, z, next_actions, use_target=True)
-            target_B = self.policy.B(next_obs, use_target=True)
-            target_Ms = torch.matmul(target_Fs, target_B.T)
-            target_M = compute_td_targets(target_Ms, self.forward_backward_pessimism)
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            # Forward-Backward loss
+            with torch.no_grad():
+                next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
+                target_Fs = self.policy.F(next_obs, z, next_actions, use_target=True)
+                target_B = self.policy.B(next_obs, use_target=True)
+                target_Ms = torch.matmul(target_Fs, target_B.T)
+                target_M = compute_td_targets(target_Ms, self.forward_backward_pessimism)
 
-        Fs = self.policy.F(obs, z, actions)  # num_parallel x batch_size x z_dim
-        B = self.policy.B(next_obs)  # batch_size x z_dim
-        Ms = torch.matmul(Fs, B.T)  # num_parallel x batch_size x batch_size
+            Fs = self.policy.F(obs, z, actions)  # num_parallel x batch_size x z_dim
+            B = self.policy.B(next_obs)  # batch_size x z_dim
+            Ms = torch.matmul(Fs, B.T)  # num_parallel x batch_size x batch_size
 
-        # FB loss
-        diff = Ms - gammas * target_M
-        fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
-        fb_diag = -torch.diagonal(Ms, dim1=1, dim2=2).mean() * Ms.shape[0]
-        fb_loss = fb_offdiag + fb_diag
+            # FB loss
+            diff = Ms - gammas * target_M
+            fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
+            fb_diag = -torch.diagonal(Ms, dim1=1, dim2=2).mean() * Ms.shape[0]
+            fb_loss = fb_offdiag + fb_diag
 
-        # Orthonormality loss
-        Cov = torch.matmul(B, B.T)
-        orth_offdiag = 0.5 * (Cov * self._off_diag).pow(2).sum() / self._off_diag_sum
-        orth_diag = -Cov.diag().mean()
-        orth_loss = self.ortho_loss_coef * (orth_offdiag + orth_diag)
+            # Orthonormality loss
+            Cov = torch.matmul(B, B.T)
+            orth_offdiag = 0.5 * (Cov * self._off_diag).pow(2).sum() / self._off_diag_sum
+            orth_diag = -Cov.diag().mean()
+            orth_loss = self.ortho_loss_coef * (orth_offdiag + orth_diag)
 
-        # Fz regularization loss
-        q_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
-        with torch.no_grad():
-            next_Qs = (target_Fs * z).sum(dim=-1)  # batch_size
-            next_Q = compute_td_targets(next_Qs, self.forward_backward_pessimism)
-            cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
-            B_inv_cov = torch.linalg.solve(cov, B, left=False)
-            implicit_reward = (B_inv_cov * z).sum(dim=-1)  # batch_size
-            target_Q = implicit_reward.detach() + gammas.squeeze() * next_Q  # batch_size
-            target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
-        Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch_size
-        q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * nn.functional.mse_loss(Qs, target_Q)
+            # Fz regularization loss
+            q_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
+            with torch.no_grad():
+                next_Qs = (target_Fs * z).sum(dim=-1)  # batch_size
+                next_Q = compute_td_targets(next_Qs, self.forward_backward_pessimism)
+                # disable autocast to ensure that cov and B have the same type
+                with torch.autocast(device_type=self.device, dtype=torch.bfloat16, enabled=False):
+                    cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
+                B_inv_cov = torch.linalg.solve(cov, B, left=False)
+                implicit_reward = (B_inv_cov * z).sum(dim=-1)  # batch_size
+                target_Q = implicit_reward.detach() + gammas.squeeze() * next_Q  # batch_size
+                target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
+            Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch_size
+            q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * nn.functional.mse_loss(Qs, target_Q)
 
-        loss = fb_loss + orth_loss + q_loss
+            loss = fb_loss + orth_loss + q_loss
 
         # Compute the gradients
         self.forward_optimizer.zero_grad()
@@ -575,19 +580,20 @@ class FbCpr:
         next_obs: TensorDict,
         gammas: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        num_parallel = self.policy.disc_critic.num_parallel
-        with torch.no_grad():
-            # compute discriminator reward
-            logits = self.policy.D(obs, z).clamp(self.discriminator_reward_eps, 1 - self.discriminator_reward_eps)
-            discriminator_reward = torch.log(logits / (1 - logits))
-            # compute target value
-            next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
-            next_Qs = self.policy.evaluate_discriminator(next_obs, z, next_actions, use_target=True)
-            target_Q = discriminator_reward + gammas * compute_td_targets(next_Qs, self.disc_critic_pessimism)
-            target_Q = target_Q.expand(num_parallel, -1, -1)
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            num_parallel = self.policy.disc_critic.num_parallel
+            with torch.no_grad():
+                # compute discriminator reward
+                logits = self.policy.D(obs, z).clamp(self.discriminator_reward_eps, 1 - self.discriminator_reward_eps)
+                discriminator_reward = torch.log(logits / (1 - logits))
+                # compute target value
+                next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
+                next_Qs = self.policy.evaluate_discriminator(next_obs, z, next_actions, use_target=True)
+                target_Q = discriminator_reward + gammas * compute_td_targets(next_Qs, self.disc_critic_pessimism)
+                target_Q = target_Q.expand(num_parallel, -1, -1)
 
-        Qs = self.policy.evaluate_discriminator(obs, z, actions)
-        loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
+            Qs = self.policy.evaluate_discriminator(obs, z, actions)
+            loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
         self.disc_critic_optimizer.zero_grad()
@@ -623,15 +629,16 @@ class FbCpr:
         gammas: torch.Tensor,
         rewards: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        num_parallel = self.policy.aux_critic.num_parallel
-        with torch.no_grad():
-            next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
-            next_Qs = self.policy.evaluate_aux(next_obs, z, next_actions)
-            target_Q = rewards.unsqueeze(1) + gammas * compute_td_targets(next_Qs, self.aux_critic_pessimism)
-            target_Q = target_Q.expand(num_parallel, -1, -1)
-        # Compute critic loss
-        Qs = self.policy.evaluate_aux(obs, z, actions)
-        loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            num_parallel = self.policy.aux_critic.num_parallel
+            with torch.no_grad():
+                next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
+                next_Qs = self.policy.evaluate_aux(next_obs, z, next_actions)
+                target_Q = rewards.unsqueeze(1) + gammas * compute_td_targets(next_Qs, self.aux_critic_pessimism)
+                target_Q = target_Q.expand(num_parallel, -1, -1)
+            # Compute critic loss
+            Qs = self.policy.evaluate_aux(obs, z, actions)
+            loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
         self.aux_critic_optimizer.zero_grad()
@@ -663,25 +670,26 @@ class FbCpr:
         z: torch.Tensor,
         actions: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        actions = self.policy.act(obs, z, clip=self.clip_actions)
+        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+            actions = self.policy.act(obs, z, clip=self.clip_actions)
 
-        # compute discriminator reward loss
-        Qs_discriminator = self.policy.evaluate_discriminator(obs, z, actions)
-        Q_discriminator = (
-            -self.discriminator_reg_coef * compute_td_targets(Qs_discriminator, self.actor_pessimism).mean()
-        )
+            # compute discriminator reward loss
+            Qs_discriminator = self.policy.evaluate_discriminator(obs, z, actions)
+            Q_discriminator = (
+                -self.discriminator_reg_coef * compute_td_targets(Qs_discriminator, self.actor_pessimism).mean()
+            )
 
-        # compute auxiliary reward loss
-        Qs_aux = self.policy.evaluate_aux(obs, z, actions)
-        Q_aux = -self.aux_reg_coef * compute_td_targets(Qs_aux, self.actor_pessimism).mean()
+            # compute auxiliary reward loss
+            Qs_aux = self.policy.evaluate_aux(obs, z, actions)
+            Q_aux = -self.aux_reg_coef * compute_td_targets(Qs_aux, self.actor_pessimism).mean()
 
-        Fs = self.policy.F(obs, z, actions)
-        Qs_fb = (Fs * z).sum(-1)
-        Q_fb = compute_td_targets(Qs_fb, self.actor_pessimism)
-        reg_weight = Q_fb.abs().mean().detach()
-        Q_fb = -Q_fb.mean()
+            Fs = self.policy.F(obs, z, actions)
+            Qs_fb = (Fs * z).sum(-1)
+            Q_fb = compute_td_targets(Qs_fb, self.actor_pessimism)
+            reg_weight = Q_fb.abs().mean().detach()
+            Q_fb = -Q_fb.mean()
 
-        actor_loss = Q_fb + Q_discriminator * reg_weight + Q_aux * reg_weight
+            actor_loss = Q_fb + Q_discriminator * reg_weight + Q_aux * reg_weight
 
         # Compute the gradients
         self.actor_optimizer.zero_grad()

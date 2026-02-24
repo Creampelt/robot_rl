@@ -13,7 +13,7 @@ import robot_rl
 from robot_rl.algorithms import FbCpr
 from robot_rl.env import URLVecEnv
 from robot_rl.modules import ForwardBackward
-from robot_rl.utils import resolve_obs_groups, store_code_state, pad_to_size
+from robot_rl.utils import resolve_obs_groups, store_code_state, pad_to_size, format_date
 
 
 class OffPolicyRunner:
@@ -363,15 +363,13 @@ class OffPolicyRunner:
             f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
             f"""{"Total updates:":>{pad}} {self.tot_updates}\n"""
             f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-            f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
+            f"""{"Time elapsed:":>{pad}} {format_date("%Dd %H:%M:%S", self.tot_time)}\n"""
             f"""{"ETA:":>{pad}} {
-                time.strftime(
-                    "%H:%M:%S",
-                    time.gmtime(
-                        self.tot_time
-                        / (locs["it"] - locs["start_iter"] + 1)
-                        * (locs["start_iter"] + locs["num_learning_iterations"] - locs["it"])
-                    ),
+                format_date(
+                    "%Dd %H:%M:%S",
+                    self.tot_time
+                    / (locs["it"] - locs["start_iter"] + 1)
+                    * (locs["start_iter"] + locs["num_learning_iterations"] - locs["it"]),
                 )
             }\n"""
         )
