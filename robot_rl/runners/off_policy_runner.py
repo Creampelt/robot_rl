@@ -170,12 +170,14 @@ class OffPolicyRunner:
             learn_time += stop - start
             self.current_learning_iteration = it
             # log info
-            if self.log_dir is not None and not self.disable_logs and it % self.log_interval == 0:
-                # Log information
-                self.log(locals())
-                # Save model
-                if (it - start_iter) % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            if it % self.log_interval == 0:
+                if self.log_dir is not None and not self.disable_logs:
+                    # Log information
+                    self.log(locals())
+                    # Save model
+                    if (it - start_iter) % self.save_interval == 0:
+                        self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                # Clear logging infos even if not logging on this device
                 eval_time = 0.0
                 collection_time = 0.0
                 learn_time = 0.0
@@ -185,10 +187,6 @@ class OffPolicyRunner:
                 ep_infos.clear()
                 algo_infos.clear()
                 loss_infos.clear()
-
-            # callback for video logging
-            if self.logger_type in ["wandb"]:
-                self.writer.callback(it)
 
             # Save code state
             if it == start_iter and not self.disable_logs:
@@ -327,6 +325,10 @@ class OffPolicyRunner:
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
 
+        # callback for video logging
+        if self.logger_type in ["wandb"]:
+            self.writer.callback(it)
+
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
         time_string = f"""collection: {locs["collection_time"]:.3f}s, learning: {locs["learn_time"]:.3f}s"""
@@ -363,10 +365,10 @@ class OffPolicyRunner:
             f"""{"Total timesteps:":>{pad}} {self.tot_timesteps}\n"""
             f"""{"Total updates:":>{pad}} {self.tot_updates}\n"""
             f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-            f"""{"Time elapsed:":>{pad}} {format_date("%Dd %H:%M:%S", self.tot_time)}\n"""
+            f"""{"Time elapsed:":>{pad}} {format_date("%D days %H:%M:%S", self.tot_time)}\n"""
             f"""{"ETA:":>{pad}} {
                 format_date(
-                    "%Dd %H:%M:%S",
+                    "%D days %H:%M:%S",
                     self.tot_time
                     / (locs["it"] - locs["start_iter"] + 1)
                     * (locs["start_iter"] + locs["num_learning_iterations"] - locs["it"]),
