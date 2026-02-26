@@ -1,18 +1,18 @@
-from typing import Sequence
 import copy
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
 from robot_rl.networks import (
+    MLP,
+    EmbeddedNet,
+    EmbeddedResNet,
     ScaledNormalization,
     TruncatedNormal,
-    EmbeddedResNet,
-    EmbeddedNet,
-    MLP,
 )
-from robot_rl.utils import get_obs_dimensions, get_obs, eval_mode
+from robot_rl.utils import eval_mode, get_obs, get_obs_dimensions
 
 
 class ForwardBackward(nn.Module):

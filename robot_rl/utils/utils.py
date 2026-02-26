@@ -5,20 +5,20 @@
 
 from __future__ import annotations
 
-import git
 import importlib
 import os
 import pathlib
-import torch
 import warnings
-from tensordict import TensorDict
-from typing import TypeVar, Any
 from collections.abc import Callable
+from datetime import timedelta
 from string import Template
+from typing import Any, TypeVar
+
+import git
 import numpy as np
 import ot
-from datetime import timedelta
-
+import torch
+from tensordict import TensorDict
 
 T = TypeVar("T")
 
@@ -349,7 +349,7 @@ def compute_td_targets(data: torch.Tensor, lam: float) -> torch.Tensor:
 
     .. math::
 
-        mean(x) - \frac{lam}{n^2 - n} \sum_{i, j} |x_i - x_j|
+        mean(x) - \\frac{lam}{n^2 - n} \\sum_{i, j} |x_i - x_j|
     """
     N = data.shape[0]
     mean = data.mean(dim=0)
@@ -429,7 +429,7 @@ class eval_mode:
 
 
 class _TimeDeltaTemplate(Template):
-    delimeter = "%"
+    delimiter = "%"
 
 
 def format_date(fmt: str, time_s: float) -> str:

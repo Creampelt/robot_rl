@@ -1,19 +1,20 @@
 from __future__ import annotations
-from typing import Any
 
-import os
 import gc
+import os
 import statistics
 import time
-import torch
 from collections import deque
+from typing import Any
+
+import torch
 from tensordict import TensorDict
 
 import robot_rl
 from robot_rl.algorithms import FbCpr
 from robot_rl.env import URLVecEnv
 from robot_rl.modules import ForwardBackward
-from robot_rl.utils import resolve_obs_groups, store_code_state, pad_to_size, format_date
+from robot_rl.utils import format_date, pad_to_size, resolve_obs_groups, store_code_state
 
 
 class OffPolicyRunner:
@@ -327,7 +328,7 @@ class OffPolicyRunner:
 
         # callback for video logging
         if self.logger_type in ["wandb"]:
-            self.writer.callback(it)
+            self.writer.callback(locs["it"])
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
