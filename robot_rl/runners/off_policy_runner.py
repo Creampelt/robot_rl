@@ -423,9 +423,11 @@ class OffPolicyRunner:
 
     def train_mode(self) -> None:
         self.alg.train_mode()
+        self.env.train(True)
 
     def eval_mode(self) -> None:
         self.alg.test_mode()
+        self.env.train(False)
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
