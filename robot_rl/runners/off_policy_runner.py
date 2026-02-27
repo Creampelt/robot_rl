@@ -205,6 +205,7 @@ class OffPolicyRunner:
 
     def eval(self) -> list[dict[str, torch.Tensor]]:
         assert self.alg.expert_buffer is not None
+        print("[INFO] Evaluating motions...")
 
         # switch to eval mode
         self.eval_mode()
@@ -253,6 +254,7 @@ class OffPolicyRunner:
 
         # revert to train mode
         self.train_mode()
+        print("[INFO] Finished evaluating motions.")
         return eval_infos
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:

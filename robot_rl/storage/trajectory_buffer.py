@@ -1,9 +1,10 @@
-from typing import Iterator
+from collections.abc import Iterator
 
 import torch
 from tensordict import TensorDict
 
 from robot_rl.utils import get_obs
+
 from .expert_buffer import ExpertBuffer
 
 
@@ -23,6 +24,8 @@ class TrajectoryBuffer(ExpertBuffer):
         self.num_motions, self.bucket_size = self.motions.shape
         self.priorities = torch.ones((self.motions.shape[0],), device=device)
 
+        self._eval_order = torch.arange(0, self.num_motions, device=self.device)
+
         print(f"[INFO] Successfully loaded {self.num_motions} motions with length {self.bucket_size}.")
 
     def sample(self, batch_size: int, device: str | None = None) -> tuple[TensorDict, TensorDict]:
@@ -39,7 +42,7 @@ class TrajectoryBuffer(ExpertBuffer):
         """
         # sample episodes according to priorities
         ep_indices = torch.multinomial(self.priorities, batch_size, replacement=True)
-        # uniformly sample from sequence
+        # uniformly sample from sequence (exclude last so there will always be a next obs)
         seq_indices = torch.randint(0, self.bucket_size - 1, (batch_size,), device=self.device)
         return (
             self.motions[ep_indices, seq_indices].to(device),
@@ -61,12 +64,16 @@ class TrajectoryBuffer(ExpertBuffer):
     ) -> Iterator[TensorDict]:
         """Sample entire motion trajectories in mini batches. Returns iterator containing batched observations as
         TensorDict with shape (mini_batch_size, bucket_size, *obs_size). Note that the final batch may be truncated."""
+        # randomize order since rigid body DR is fixed per-environment
+        self._eval_order = torch.randperm(self.num_motions, device=self.device)
         for idx in range(0, self.num_motions, mini_batch_size):
-            motions = self.motions[idx : idx + mini_batch_size].to(device)
+            eval_idxs = self._eval_order[idx : idx + mini_batch_size]
+            motions = self.motions[eval_idxs].to(device)
             yield motions
 
     def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:
-        self.priorities[indices] = priorities.to(self.device)
+        actual_indices = self._eval_order[indices]
+        self.priorities[actual_indices] = priorities.to(self.device)
 
     def normalize_priorities(self) -> None:
         self.priorities /= self.priorities.sum()
