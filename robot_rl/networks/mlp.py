@@ -4,13 +4,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
-from typing import Sequence
+
+from collections.abc import Sequence
+from functools import reduce
 
 import torch
 import torch.nn as nn
-from functools import reduce
 
-from rsl_rl.utils import resolve_nn_activation
+from robot_rl.utils import resolve_nn_activation
 
 
 class MLP(nn.Sequential):
@@ -50,6 +51,8 @@ class MLP(nn.Sequential):
         """
         super().__init__()
 
+        self.activation = activation
+
         # resolve activation functions
         activation_mod = resolve_nn_activation(activation)
         if isinstance(last_activation, str):
@@ -88,7 +91,7 @@ class MLP(nn.Sequential):
         for idx, layer in enumerate(layers):
             self.add_module(f"{idx}", layer)
 
-    def init_weights(self, scales: float | tuple[float]):
+    def init_weights(self, scales: float | tuple[float] | None = None):
         """Initialize the weights of the MLP.
 
         Args:
@@ -101,7 +104,12 @@ class MLP(nn.Sequential):
             Args:
                 idx: Index of the layer.
             """
-            return scales[idx] if isinstance(scales, (list, tuple)) else scales
+            if isinstance(scales, (list, tuple)):
+                return scales[idx]
+            elif isinstance(scales, float):
+                return scales
+            else:
+                return nn.init.calculate_gain(self.activation)
 
         # initialize the weights
         for idx, module in enumerate(self):

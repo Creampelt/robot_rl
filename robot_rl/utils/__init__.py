@@ -9,3 +9,4 @@ from .utils import *
 
 from .wrappers import *
 from .exporter import export_estimator_policy_as_onnx, export_policy_as_onnx, export_policy_as_jit
+from .dict_utils import DictModule

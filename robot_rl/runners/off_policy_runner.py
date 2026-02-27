@@ -31,6 +31,7 @@ class OffPolicyRunner:
         self._configure_multi_gpu()
 
         # store training configuration
+        self.clip_actions: float | None = self.cfg["clip_actions"]
         self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
         self.num_agent_updates: int = self.cfg["num_agent_updates"]
         self.num_seed_steps_per_env: int = self.cfg["num_seed_steps_per_env"]
@@ -125,7 +126,7 @@ class OffPolicyRunner:
                 # Rollout
                 z = self.alg.update_rollout_z(z, cur_episode_length, self.env.num_envs)
                 # Sample actions
-                actions = self.alg.act(obs, z, last_dones, random_sample=is_seed)
+                actions = self.alg.act(obs, z, last_dones, random_sample=is_seed, clip_actions=self.clip_actions)
                 # Step the environment
                 obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                 # Move to device

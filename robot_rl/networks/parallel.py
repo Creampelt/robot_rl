@@ -1,5 +1,3 @@
-from typing import Sequence
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,7 +34,7 @@ class ParallelLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-    def reset_parameters(self) -> None:
+    def init_weights(self) -> None:
         gain = nn.init.calculate_gain("relu")
         if self.use_linear:
             nn.init.orthogonal_(self.weight.data, gain=gain)
@@ -99,7 +97,7 @@ class ParallelLayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.empty(param_dim, **factory_kwargs))
         self.bias = nn.Parameter(torch.empty(param_dim, **factory_kwargs))
 
-    def reset_parameters(self) -> None:
+    def init_weights(self) -> None:
         nn.init.ones_(self.weight)
         nn.init.zeros_(self.bias)
 

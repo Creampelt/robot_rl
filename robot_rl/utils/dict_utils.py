@@ -1,6 +1,9 @@
-from typing import Any
 from collections.abc import Iterable, Mapping
 from dataclasses import MISSING
+from typing import Any
+
+import torch.nn as nn
+from tensordict import TensorDict
 
 
 def update_class_from_dict(obj, data: dict[str, Any], _ns: str = "", ignore_extra_keys: bool = False) -> None:
@@ -77,3 +80,12 @@ def update_class_from_dict(obj, data: dict[str, Any], _ns: str = "", ignore_extr
                 print(f"\033[91m[WARN] Key not found under namespace: {key_ns}.\033[0m")
             else:
                 raise KeyError(f"[Config]: Key not found under namespace: {key_ns}.")
+
+
+class DictModule(nn.Module):
+    def __init__(self, m: dict[str, nn.Module]) -> None:
+        super().__init__()
+        self.mod_dict = nn.ModuleDict(m)
+
+    def forward(self, x: TensorDict) -> TensorDict:
+        return TensorDict({k: self.mod_dict[k](v) for k, v in x.items()}, batch_size=x.batch_size, device=x.device)

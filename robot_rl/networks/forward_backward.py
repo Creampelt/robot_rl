@@ -1,9 +1,11 @@
-from typing import Sequence
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 
 from robot_rl.utils import resolve_nn_activation
-from .parallel import ParallelLinear, ParallelLayerNorm
+
+from .parallel import ParallelLayerNorm, ParallelLinear
 from .residual import Block, ResidualBlock
 
 

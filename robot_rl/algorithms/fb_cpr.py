@@ -1,16 +1,18 @@
 from __future__ import annotations
-from typing import cast
 
 import os
+from typing import cast
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from tensordict import TensorDict
 
-from robot_rl.networks import EMANormalization
 from robot_rl.modules import ForwardBackward
+from robot_rl.networks import EMANormalization
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
-from robot_rl.utils import compute_td_targets, reset_parameters, compute_emd, forward_sliding_mean
+from robot_rl.utils import compute_emd, compute_td_targets, forward_sliding_mean, reset_parameters
 
 
 class FbCpr:
@@ -33,7 +35,7 @@ class FbCpr:
         aux_critic_learning_rate: float = 1e-4,
         weight_decay: float = 0.0,
         max_grad_norm: float | None = None,
-        clip_actions: float = 0.2,
+        clip_actor_std: float = 0.2,
         gamma: float = 0.99,
         train_goal_ratio: float = 0.5,
         expert_asm_ratio: float = 0.0,
@@ -129,7 +131,7 @@ class FbCpr:
         self.grad_loss_coef = grad_loss_coef
         self.discriminator_reward_eps = discriminator_reward_eps
         self.batch_size = batch_size
-        self.clip_actions = clip_actions
+        self.clip_actor_std = clip_actor_std
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
         self.z_dim = self.policy.z_dim
@@ -201,12 +203,15 @@ class FbCpr:
         z: torch.Tensor,
         dones: torch.Tensor | None,
         random_sample: bool = False,
+        clip_actions: float | None = None,
     ) -> torch.Tensor:
         # compute the actions and values
         self.transition.actions = self.policy.act(obs, z).detach()
         # uniformly sample from action space if specified
         if random_sample:
-            self.transition.actions.uniform_(-1.0, 1.0).detach()
+            if clip_actions is None:
+                clip_actions = 1.0
+            self.transition.actions.uniform_(-clip_actions, clip_actions).detach()
         # record obs and dones before env.step()
         self.transition.observations = obs
         # dones is None if this is the first step
@@ -268,7 +273,7 @@ class FbCpr:
             )  # num_expert_updates, expert_rollout_length, z_dim
             expert_z = forward_sliding_mean(expert_z, self.expert_sequence_length, dim=1)
             self.expert_rollout_z = cast(
-                torch.Tensor, self.policy.z_normalizer(expert_z)
+                torch.Tensor, self.policy.project_z(expert_z)
             )  # num_expert_updates, expert_rollout_length, z_dim
         env_idxs = torch.arange(self.expert_rollout_envs.shape[0])
         z[self.expert_rollout_envs] = self.expert_rollout_z[env_idxs, rollout_idx[self.expert_rollout_envs]]
@@ -289,12 +294,12 @@ class FbCpr:
 
             # zs for encoded train goals
             perm = torch.randperm(self.batch_size, device=self.device)
-            goal_z = self.policy.goal_inference(goal_obs)
-            z = torch.where(mix_indices == 0, goal_z[perm], z)
+            goal_z = self.policy.goal_inference(goal_obs[perm])
+            z = torch.where(mix_indices == 0, goal_z, z)
 
             # zs from expert trajectories
             perm = torch.randperm(self.batch_size, device=self.device)
-        z = torch.where(mix_indices == 1, expert_z[perm], z)
+            z = torch.where(mix_indices == 1, expert_z[perm], z)
 
         return z
 
@@ -308,7 +313,7 @@ class FbCpr:
             *expert_B.shape[1:],
         )
         expert_z = expert_B.mean(dim=1)  # batch_size // seq_length, z_dim
-        expert_z = self.policy.z_normalizer(expert_z)
+        expert_z = self.policy.project_z(expert_z)
         return torch.repeat_interleave(expert_z, self.expert_sequence_length, dim=0)  # batch_size, z_dim
 
     def update_priorities(
@@ -343,6 +348,11 @@ class FbCpr:
         # update parameters for all normalizers
         self.policy.update_normalization(obs)
         self.policy.update_normalization(next_obs)
+
+        obs = self.policy.normalize_obs(obs)
+        next_obs = self.policy.normalize_obs(next_obs)
+        expert_obs = self.policy.normalize_obs(obs)
+        expert_next_obs = self.policy.normalize_obs(obs)
 
         torch.compiler.cudagraph_mark_step_begin()
 
@@ -439,7 +449,7 @@ class FbCpr:
 
     def _sample_random_z(self, size: int) -> torch.Tensor:
         z = torch.randn((size, self.z_dim), dtype=torch.float32, device=self.device)
-        z = self.policy.z_normalizer(z)
+        z = self.policy.project_z(z)
         return z
 
     @torch.compile(mode="reduce-overhead")
@@ -451,11 +461,11 @@ class FbCpr:
         expert_z: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-            expert_logits = self.policy.D(expert_obs, expert_z)
-            unlabeled_logits = self.policy.D(obs, z)
+            expert_logits = self.policy.D(expert_obs, expert_z, raw_logits=True)
+            unlabeled_logits = self.policy.D(obs, z, raw_logits=True)
             # Compute loss with binary cross entropy
-            expert_loss = -nn.functional.logsigmoid(expert_logits)
-            unlabeled_loss = nn.functional.softplus(unlabeled_logits)
+            expert_loss = -F.logsigmoid(expert_logits)
+            unlabeled_loss = F.softplus(unlabeled_logits)
             loss = torch.mean(expert_loss + unlabeled_loss)
 
             # Compute gradient penalty loss
@@ -495,7 +505,7 @@ class FbCpr:
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
             # Forward-Backward loss
             with torch.no_grad():
-                next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
+                next_actions = self.policy.act(next_obs, z, clip=self.clip_actor_std)
                 target_Fs = self.policy.F(next_obs, z, next_actions, use_target=True)
                 target_B = self.policy.B(next_obs, use_target=True)
                 target_Ms = torch.matmul(target_Fs, target_B.T)
@@ -530,7 +540,7 @@ class FbCpr:
                 target_Q = implicit_reward.detach() + gammas.squeeze() * next_Q  # batch_size
                 target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
             Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch_size
-            q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * nn.functional.mse_loss(Qs, target_Q)
+            q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * F.mse_loss(Qs, target_Q)
 
             loss = fb_loss + orth_loss + q_loss
 
@@ -585,15 +595,15 @@ class FbCpr:
             with torch.no_grad():
                 # compute discriminator reward
                 logits = self.policy.D(obs, z).clamp(self.discriminator_reward_eps, 1 - self.discriminator_reward_eps)
-                discriminator_reward = torch.log(logits / (1 - logits))
+                discriminator_reward = torch.log(logits) - torch.log(1 - logits)
                 # compute target value
-                next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
+                next_actions = self.policy.act(next_obs, z, clip=self.clip_actor_std)
                 next_Qs = self.policy.evaluate_discriminator(next_obs, z, next_actions, use_target=True)
                 target_Q = discriminator_reward + gammas * compute_td_targets(next_Qs, self.disc_critic_pessimism)
                 target_Q = target_Q.expand(num_parallel, -1, -1)
 
             Qs = self.policy.evaluate_discriminator(obs, z, actions)
-            loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
+            loss = 0.5 * num_parallel * F.mse_loss(Qs, target_Q)
 
         # Compute the gradients
         self.disc_critic_optimizer.zero_grad()
@@ -632,13 +642,13 @@ class FbCpr:
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
             num_parallel = self.policy.aux_critic.num_parallel
             with torch.no_grad():
-                next_actions = self.policy.act(next_obs, z, clip=self.clip_actions)
+                next_actions = self.policy.act(next_obs, z, clip=self.clip_actor_std)
                 next_Qs = self.policy.evaluate_aux(next_obs, z, next_actions)
                 target_Q = rewards.unsqueeze(1) + gammas * compute_td_targets(next_Qs, self.aux_critic_pessimism)
                 target_Q = target_Q.expand(num_parallel, -1, -1)
             # Compute critic loss
             Qs = self.policy.evaluate_aux(obs, z, actions)
-            loss = 0.5 * num_parallel * nn.functional.mse_loss(Qs, target_Q)
+            loss = 0.5 * num_parallel * F.mse_loss(Qs, target_Q)
 
         # Compute the gradients
         self.aux_critic_optimizer.zero_grad()
@@ -671,7 +681,7 @@ class FbCpr:
         actions: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-            actions = self.policy.act(obs, z, clip=self.clip_actions)
+            actions = self.policy.act(obs, z, clip=self.clip_actor_std)
 
             # compute discriminator reward loss
             Qs_discriminator = self.policy.evaluate_discriminator(obs, z, actions)

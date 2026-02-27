@@ -3,7 +3,7 @@ from typing import TypeVar
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg, RslRlBaseRunnerCfg
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
 
 RunnerCfg = TypeVar("RunnerCfg", bound=RslRlOnPolicyRunnerCfg)
 
@@ -143,18 +143,6 @@ class RobotRlForwardBackwardCfg:
     init_noise_std: float = MISSING
     """The initial noise standard deviation for the policy."""
 
-    actor_obs_normalization: bool = MISSING
-    """Whether to normalize the observation for the actor network."""
-
-    critic_obs_normalization: bool = MISSING
-    """Whether to normalize the observation for the critic network."""
-
-    z_normalization: bool = MISSING
-    """Whether to normalize the latent task."""
-
-    backward_out_normalization: bool = MISSING
-    """Whether to normalize the output of the backward network."""
-
     actor_num_parallel: int = MISSING
     """The number of parallel networks for the actor."""
 
@@ -221,8 +209,8 @@ class RobotRlFbCprAlgorithmCfg:
     max_grad_norm: float | None = MISSING
     """The maximum gradient norm, or None to disable gradient clipping."""
 
-    clip_actions: float = MISSING
-    """The clip to apply to the actor distribution."""
+    clip_actor_std: float = MISSING
+    """The clip to apply to the actor distribution stddev."""
 
     gamma: float = MISSING
     """The discount factor."""

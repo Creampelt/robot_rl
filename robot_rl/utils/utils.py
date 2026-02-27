@@ -358,8 +358,8 @@ def compute_td_targets(data: torch.Tensor, lam: float) -> torch.Tensor:
 
 
 def reset_parameters(m: torch.nn.Module) -> None:
-    if hasattr(m, "reset_parameters"):
-        m.reset_parameters()  # type: ignore
+    if hasattr(m, "init_weights"):
+        m.init_weights()  # type: ignore
 
 
 def compute_distance_matrix(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -437,5 +437,7 @@ def format_date(fmt: str, time_s: float) -> str:
     d = {"D": tdelta.days}
     d["H"], rem = divmod(tdelta.seconds, 3600)
     d["M"], d["S"] = divmod(rem, 60)
+    # Zero-pad H, M, S
+    d = {k: f"{v:02}" if k in ["H", "M", "S"] else str(v) for k, v in d.items()}
     t = _TimeDeltaTemplate(fmt)
     return t.substitute(**d)
