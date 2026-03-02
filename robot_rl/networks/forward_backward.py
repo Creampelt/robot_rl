@@ -198,6 +198,6 @@ class EmbeddedResNet(EmbeddedNet):
         layers: list[nn.Module] = []
         for in_dim, out_dim in zip(hidden_dims[:-1], hidden_dims[1:]):
             layers.append(ResidualBlock(in_dim, out_dim, num_parallel, activation))
-        layers.append(Block(hidden_dims[-1], output_dim, num_parallel))
+        layers.append(Block(hidden_dims[-1], output_dim, num_parallel, activation="identity"))
 
         return embedding_layers, layers

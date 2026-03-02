@@ -257,11 +257,11 @@ class RobotRlFbCprAlgorithmCfg:
     grad_loss_coef: float = MISSING
     """The coefficient for gradient loss."""
 
-    discriminator_reward_eps: float = MISSING
-    """The epsilon value to clamp the discriminator output. Clamps to [eps, 1 - eps]."""
-
     batch_size: int = MISSING
     """The batch size for updating the policy."""
+
+    dtype: str = "float32"
+    """The dtype to use during training. Defaults to float32."""
 
 
 @configclass

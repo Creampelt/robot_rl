@@ -97,6 +97,11 @@ class OffPolicyRunner:
         z: torch.Tensor | None = None
         last_dones: torch.Tensor | None = None
 
+        # Ensure all parameters are in-synced
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
+
         # Start training
         for it in range(start_iter, tot_iter):
             with torch.inference_mode():

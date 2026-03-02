@@ -12,7 +12,7 @@ from robot_rl.networks import (
     EmbeddedResNet,
     TruncatedNormal,
 )
-from robot_rl.utils import DictModule, eval_mode, get_obs, get_obs_dimensions
+from robot_rl.utils import DictModule, eval_mode, get_obs, get_obs_dimensions, soft_update_params
 
 
 class ForwardBackward(nn.Module):
@@ -70,6 +70,7 @@ class ForwardBackward(nn.Module):
             z_dim,
             backward_hidden_dims,
             activation="relu",
+            first_activation=[nn.LayerNorm(backward_hidden_dims[0]), "tanh"],
         )
 
         # discriminator
@@ -78,6 +79,7 @@ class ForwardBackward(nn.Module):
             1,
             discriminator_hidden_dims,
             activation="relu",
+            first_activation=[nn.LayerNorm(discriminator_hidden_dims[0]), "tanh"],
         )
 
         # critics (forward, discriminator, auxiliary)
@@ -126,7 +128,7 @@ class ForwardBackward(nn.Module):
         self._target_disc_critic_paramlist: tuple[torch.Tensor, ...] | None = None
         self._target_aux_critic_paramlist: tuple[torch.Tensor, ...] | None = None
 
-    def init_targets(self, device: str | None = None):
+    def init_targets(self, device: str | None = None) -> None:
         self.target_forward_map = copy.deepcopy(self.forward_map).to(device)
         self.target_backward_map = copy.deepcopy(self.backward_map).to(device)
         self.target_disc_critic = copy.deepcopy(self.disc_critic).to(device)
@@ -140,7 +142,6 @@ class ForwardBackward(nn.Module):
         self._target_backward_paramlist = tuple(x.data for x in self.target_backward_map.parameters())
         self._target_disc_critic_paramlist = tuple(x.data for x in self.target_disc_critic.parameters())
         self._target_aux_critic_paramlist = tuple(x.data for x in self.target_aux_critic.parameters())
-        return self
 
     def reset(self, dones=None):
         pass
@@ -280,10 +281,10 @@ class ForwardBackward(nn.Module):
         return True  # training resumes
 
     def soft_update_targets(self) -> None:
-        self._soft_update_params(self._forward_paramlist, self._target_forward_paramlist, self.fb_tau)
-        self._soft_update_params(self._backward_paramlist, self._target_backward_paramlist, self.fb_tau)
-        self._soft_update_params(self._disc_critic_paramlist, self._target_disc_critic_paramlist, self.critic_tau)
-        self._soft_update_params(self._aux_critic_paramlist, self._target_aux_critic_paramlist, self.critic_tau)
+        soft_update_params(self._forward_paramlist, self._target_forward_paramlist, self.fb_tau)
+        soft_update_params(self._backward_paramlist, self._target_backward_paramlist, self.fb_tau)
+        soft_update_params(self._disc_critic_paramlist, self._target_disc_critic_paramlist, self.critic_tau)
+        soft_update_params(self._aux_critic_paramlist, self._target_aux_critic_paramlist, self.critic_tau)
 
     def project_z(self, z: torch.Tensor) -> torch.Tensor:
         return math.sqrt(z.shape[-1]) * nn.functional.normalize(z, dim=-1)

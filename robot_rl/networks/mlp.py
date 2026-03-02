@@ -37,6 +37,7 @@ class MLP(nn.Sequential):
         hidden_dims: Sequence[int],
         activation: str = "elu",
         last_activation: str | nn.Module | None = None,
+        first_activation: str | nn.Module | list[str | nn.Module] | None = None,
     ):
         """Initialize the MLP.
 
@@ -48,6 +49,9 @@ class MLP(nn.Sequential):
             activation: Activation function. Defaults to "elu".
             last_activation: Activation function of the last layer. Defaults to None,
                 in which case the last layer is linear.
+            first_activation: Activation function of the first layer. Defaults to None,
+                in which case `activation` is used. Can pass an activation name, nn.Module, or
+                list of names/nn.Modules (which will be applied in order).
         """
         super().__init__()
 
@@ -61,13 +65,22 @@ class MLP(nn.Sequential):
             last_activation_mod = last_activation
         else:
             last_activation_mod = None
+        # resolve first activation(s)
+        if first_activation is None:
+            first_activation = activation
+        if not isinstance(first_activation, list):
+            first_activation = [first_activation]
+        first_activation_mod: list[nn.Module] = [
+            resolve_nn_activation(act) if isinstance(act, str) else act for act in first_activation
+        ]
+
         # resolve number of hidden dims if they are -1
         hidden_dims_processed = [input_dim if dim == -1 else dim for dim in hidden_dims]
 
         # create layers sequentially
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
-        layers.append(activation_mod)
+        layers.extend(first_activation_mod)
 
         for layer_index in range(len(hidden_dims_processed) - 1):
             layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))

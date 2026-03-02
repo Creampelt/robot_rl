@@ -12,7 +12,7 @@ from tensordict import TensorDict
 from robot_rl.modules import ForwardBackward
 from robot_rl.networks import EMANormalization
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
-from robot_rl.utils import compute_emd, compute_td_targets, forward_sliding_mean, reset_parameters
+from robot_rl.utils import compute_emd, compute_td_targets, forward_sliding_mean, reset_parameters, resolve_dtype
 
 
 class FbCpr:
@@ -51,14 +51,15 @@ class FbCpr:
         value_loss_coef: float = 1.0,
         ortho_loss_coef: float = 1.0,
         grad_loss_coef: float = 1.0,
-        discriminator_reward_eps: float = 1e-7,
         batch_size: int = 1024,
         device: str = "cpu",
+        dtype: str = "float32",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs,
     ) -> None:
         self.device = device
+        self.dtype = resolve_dtype(dtype)
         self.is_multi_gpu = multi_gpu_cfg is not None
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
@@ -129,7 +130,6 @@ class FbCpr:
         self.value_loss_coef = value_loss_coef
         self.ortho_loss_coef = ortho_loss_coef
         self.grad_loss_coef = grad_loss_coef
-        self.discriminator_reward_eps = discriminator_reward_eps
         self.batch_size = batch_size
         self.clip_actor_std = clip_actor_std
         self.max_grad_norm = max_grad_norm
@@ -140,6 +140,7 @@ class FbCpr:
         self.expert_sequence_length = expert_sequence_length
 
         # Precompute useful variables
+        self.discriminator_reward_eps = torch.finfo(self.dtype).resolution
         self._off_diag = 1 - torch.eye(batch_size, batch_size, device=self.device)
         self._off_diag_sum = self._off_diag.sum()
 
@@ -283,7 +284,7 @@ class FbCpr:
     @torch.compile(mode="reduce-overhead", fullgraph=True)
     @torch.no_grad()
     def sample_mixed_z(self, goal_obs: TensorDict, expert_z: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
             z = self._sample_random_z(self.batch_size)
 
             mix_probs = torch.tensor(
@@ -351,8 +352,8 @@ class FbCpr:
 
         obs = self.policy.normalize_obs(obs)
         next_obs = self.policy.normalize_obs(next_obs)
-        expert_obs = self.policy.normalize_obs(obs)
-        expert_next_obs = self.policy.normalize_obs(obs)
+        expert_obs = self.policy.normalize_obs(expert_obs)
+        expert_next_obs = self.policy.normalize_obs(expert_next_obs)
 
         torch.compiler.cudagraph_mark_step_begin()
 
@@ -460,7 +461,7 @@ class FbCpr:
         expert_obs: TensorDict,
         expert_z: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
             expert_logits = self.policy.D(expert_obs, expert_z, raw_logits=True)
             unlabeled_logits = self.policy.D(obs, z, raw_logits=True)
             # Compute loss with binary cross entropy
@@ -502,7 +503,7 @@ class FbCpr:
         gammas: torch.Tensor,
         z: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
             # Forward-Backward loss
             with torch.no_grad():
                 next_actions = self.policy.act(next_obs, z, clip=self.clip_actor_std)
@@ -518,7 +519,7 @@ class FbCpr:
             # FB loss
             diff = Ms - gammas * target_M
             fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
-            fb_diag = -torch.diagonal(Ms, dim1=1, dim2=2).mean() * Ms.shape[0]
+            fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
             fb_loss = fb_offdiag + fb_diag
 
             # Orthonormality loss
@@ -529,18 +530,19 @@ class FbCpr:
 
             # Fz regularization loss
             q_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
-            with torch.no_grad():
-                next_Qs = (target_Fs * z).sum(dim=-1)  # batch_size
-                next_Q = compute_td_targets(next_Qs, self.forward_backward_pessimism)
-                # disable autocast to ensure that cov and B have the same type
-                with torch.autocast(device_type=self.device, dtype=torch.bfloat16, enabled=False):
-                    cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
-                B_inv_cov = torch.linalg.solve(cov, B, left=False)
-                implicit_reward = (B_inv_cov * z).sum(dim=-1)  # batch_size
-                target_Q = implicit_reward.detach() + gammas.squeeze() * next_Q  # batch_size
-                target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
-            Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch_size
-            q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * F.mse_loss(Qs, target_Q)
+            if self.value_loss_coef > 0.0:
+                with torch.no_grad():
+                    next_Qs = (target_Fs * z).sum(dim=-1)  # batch_size
+                    next_Q = compute_td_targets(next_Qs, self.forward_backward_pessimism)
+                    # disable autocast to ensure that cov and B have the same type
+                    with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=False):
+                        cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
+                    B_inv_cov = torch.linalg.solve(cov, B, left=False)
+                    implicit_reward = (B_inv_cov * z).sum(dim=-1)  # batch_size
+                    target_Q = implicit_reward.detach() + gammas.squeeze() * next_Q  # batch_size
+                    target_Q = target_Q.expand(Fs.shape[0], -1)  # num_parallel x batch_size
+                Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch_size
+                q_loss = self.value_loss_coef * 0.5 * Fs.shape[0] * F.mse_loss(Qs, target_Q)
 
             loss = fb_loss + orth_loss + q_loss
 
@@ -590,7 +592,7 @@ class FbCpr:
         next_obs: TensorDict,
         gammas: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
             num_parallel = self.policy.disc_critic.num_parallel
             with torch.no_grad():
                 # compute discriminator reward
@@ -639,7 +641,7 @@ class FbCpr:
         gammas: torch.Tensor,
         rewards: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
             num_parallel = self.policy.aux_critic.num_parallel
             with torch.no_grad():
                 next_actions = self.policy.act(next_obs, z, clip=self.clip_actor_std)
@@ -680,7 +682,7 @@ class FbCpr:
         z: torch.Tensor,
         actions: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict]:
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
             actions = self.policy.act(obs, z, clip=self.clip_actor_std)
 
             # compute discriminator reward loss

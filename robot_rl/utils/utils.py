@@ -83,6 +83,20 @@ def resolve_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
         raise ValueError(f"Invalid optimizer '{optimizer_name}'. Valid optimizers are: {list(optimizer_dict.keys())}")
 
 
+def resolve_dtype(dtype_name: str) -> torch.dtype:
+    dtype_dict = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    dtype_name = dtype_name.lower()
+    if dtype_name in dtype_dict:
+        return dtype_dict[dtype_name]
+    else:
+        raise ValueError(f"Invalid dtype '{dtype_name}'. Valid optimizers are: {list(dtype_dict.keys())}")
+
+
 def split_and_pad_trajectories(
     tensor: torch.Tensor | TensorDict, dones: torch.Tensor
 ) -> tuple[torch.Tensor | TensorDict, torch.Tensor]:
@@ -441,3 +455,13 @@ def format_date(fmt: str, time_s: float) -> str:
     d = {k: f"{v:02}" if k in ["H", "M", "S"] else str(v) for k, v in d.items()}
     t = _TimeDeltaTemplate(fmt)
     return t.substitute(**d)
+
+
+def soft_update_params(
+    params: tuple[torch.Tensor, ...] | None,
+    target_params: tuple[torch.Tensor, ...] | None,
+    tau: float,
+) -> None:
+    assert params is not None and target_params is not None
+    torch._foreach_mul_(target_params, tau)  # type: ignore
+    torch._foreach_add_(target_params, params, alpha=(1 - tau))  # type: ignore
