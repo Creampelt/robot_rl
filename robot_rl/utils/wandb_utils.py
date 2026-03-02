@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+
 from torch.utils.tensorboard import SummaryWriter
 
 try:
@@ -53,7 +54,8 @@ class WandbSummaryWriter(SummaryWriter):
         self.run.define_metric("*", step_metric="local_step")  # global step (custom defined for async video logging)
         self.run.define_metric("*", step_metric="env_step")  # env step (step * num_envs)
 
-        self.saved_videos = {}
+        self.saved_videos: dict[str, dict] = {}
+        self.saved_images: list[str] = []
         self.num_envs = num_envs  # save num_envs to use for recording env_step
 
     def store_config(self, env_cfg: dict, runner_cfg: dict, alg_cfg: dict, policy_cfg: dict):
@@ -117,7 +119,7 @@ class WandbSummaryWriter(SummaryWriter):
                 video_info = self.saved_videos[video_name]
                 if video_info["recorded"]:
                     continue
-                elif video_info["size"] == video_size_kb and video_size_kb > 100:
+                if video_info["size"] == video_size_kb and video_size_kb > 100:
                     # wait 10 steps after recording has been completed
                     if video_info["steps"] > 10:
                         self.add_video(video_name, global_step, log_name=log_name)
@@ -128,6 +130,18 @@ class WandbSummaryWriter(SummaryWriter):
                     self.saved_videos[video_name]["size"] = video_size_kb
                     self.saved_videos[video_name]["steps"] = 0
 
+    def log_image_files(self, global_step: int, image_subdir: str | None = None):
+        if image_subdir is not None:
+            image_dir = pathlib.Path(os.path.join(self.log_dir, image_subdir))
+        else:
+            image_dir = pathlib.Path(self.log_dir)
+        images = list(image_dir.rglob("*.png"))
+        for img in images:
+            img_name = str(img)
+            if img_name not in self.saved_images:
+                self.saved_images.append(img_name)
+                self.add_image(img_name, global_step)
+
     def add_video(self, video_path: str, global_step: int, log_name: str = "Video"):
         self.run.log(
             {
@@ -137,5 +151,16 @@ class WandbSummaryWriter(SummaryWriter):
             }
         )
 
+    def add_image(self, image_path: str, global_step: int) -> None:
+        log_name = os.path.splitext(image_path.rsplit("/")[-1])[0]
+        self.run.log(
+            {
+                log_name: wandb.Image(image_path),
+                "local_step": global_step,
+                "env_step": global_step * self.num_envs,
+            }
+        )
+
     def callback(self, step):
         self.log_video_files(step)
+        self.log_image_files(step)
