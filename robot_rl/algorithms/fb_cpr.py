@@ -645,7 +645,7 @@ class FbCpr:
             num_parallel = self.policy.aux_critic.num_parallel
             with torch.no_grad():
                 next_actions = self.policy.act(next_obs, z, clip=self.clip_actor_std)
-                next_Qs = self.policy.evaluate_aux(next_obs, z, next_actions)
+                next_Qs = self.policy.evaluate_aux(next_obs, z, next_actions, use_target=True)
                 target_Q = rewards.unsqueeze(1) + gammas * compute_td_targets(next_Qs, self.aux_critic_pessimism)
                 target_Q = target_Q.expand(num_parallel, -1, -1)
             # Compute critic loss
