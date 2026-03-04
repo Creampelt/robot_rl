@@ -60,18 +60,12 @@ class OffPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [robot_rl.__file__]
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+    def learn(self, num_learning_iterations: int, **kwargs):  # noqa: C901
         # initialize writer
         self._prepare_logging_writer()
 
         # add expert buffer to environment
         self.env.set_expert_buffer(self.alg.expert_buffer)
-
-        # randomize initial episode lengths (for exploration)
-        if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
 
         # start learning
         obs = self.env.get_observations().to(self.device)
