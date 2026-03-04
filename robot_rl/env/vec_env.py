@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
-import torch
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
+
+import torch
 from tensordict import TensorDict
 
 
@@ -95,4 +97,8 @@ class VecEnv(ABC):
                The key should be a string and start with "/" for namespacing. The value can be a scalar or a
                tensor. If it is a tensor, the mean of the tensor is used for logging.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply(self, mode: str, env_ids: Sequence[int] | None = None) -> None:
         raise NotImplementedError

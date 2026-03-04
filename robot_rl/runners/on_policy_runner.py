@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Callable
-
 import os
 import statistics
 import time
-import torch
 import warnings
 from collections import deque
+from collections.abc import Callable
+
+import torch
 from tensordict import TensorDict
 
 import robot_rl
@@ -15,10 +15,12 @@ from robot_rl.algorithms import PPO
 from robot_rl.env import VecEnv
 from robot_rl.modules import (
     ActorCritic,
-    ActorCriticRecurrent,
     ActorCriticEstimator,
+    ActorCriticExploreExploit,
     ActorCriticMHA,
+    ActorCriticRecurrent,
     resolve_estimator_config,
+    resolve_meta_rl_config,
     resolve_rnd_config,
     resolve_symmetry_config,
 )
@@ -39,8 +41,8 @@ class OnPolicyRunner:
         self._configure_multi_gpu()
 
         # store training configuration
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.save_interval = self.cfg["save_interval"]
+        self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
+        self.save_interval: int = self.cfg["save_interval"]
 
         # query observations from environment for algorithm construction
         obs = self.env.get_observations()
@@ -90,6 +92,9 @@ class OnPolicyRunner:
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        # number of episodes per environment
+        ep_counter = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
+        new_ids: torch.Tensor | None = None
 
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
@@ -120,8 +125,24 @@ class OnPolicyRunner:
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # get ids of all finished episodes
+                    new_ids = (dones > 0).nonzero(as_tuple=False)
+                    # increment ep_counter
+                    ep_counter[new_ids] += 1
                     # process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras, last_obs)
+                    end_rollout, new_trial_ids = self.alg.process_env_step(
+                        obs,
+                        rewards,
+                        dones,
+                        extras,
+                        ep_counter=ep_counter,
+                        last_obs=last_obs,
+                    )
+                    # reset the environment for new trials if necessary
+                    if self.alg_cfg["meta_rl"]:
+                        assert new_trial_ids is not None
+                        if len(new_trial_ids):
+                            self.env.apply("trial", new_trial_ids)
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     # book keeping
@@ -141,7 +162,6 @@ class OnPolicyRunner:
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         # -- common
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -159,6 +179,10 @@ class OnPolicyRunner:
 
                 # compute returns
                 self.alg.compute_returns(obs)
+
+                # -- stop meta RL rollout if trial has been completed on all environments
+                if end_rollout:
+                    break
 
             # update policy
             loss_dict, error_dict = self.alg.update()
@@ -442,6 +466,20 @@ class OnPolicyRunner:
         # resolve symmetry config
         self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
 
+        # resolve meta-RL config
+        self.alg_cfg = resolve_meta_rl_config(self.alg_cfg)
+
+        # override num_steps_per_env for meta RL -- rollouts assumed to be maximum length and masked out later
+        if self.alg_cfg["meta_rl"]:
+            max_episode_length: int | torch.Tensor = self.env.max_episode_length
+            if isinstance(max_episode_length, torch.Tensor):
+                max_episode_length = int(max_episode_length.max().item())
+            self.num_steps_per_env = (
+                max_episode_length
+                * self.alg_cfg["meta_rl_cfg"]["num_episodes_per_trial"]
+                * self.alg_cfg["meta_rl_cfg"]["num_trials_per_rollout"]
+            )
+
         # resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
             warnings.warn(
@@ -456,9 +494,9 @@ class OnPolicyRunner:
 
         # initialize the actor-critic
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMHA | ActorCriticEstimator = actor_critic_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        actor_critic: (
+            ActorCritic | ActorCriticRecurrent | ActorCriticMHA | ActorCriticEstimator | ActorCriticExploreExploit
+        ) = actor_critic_class(obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg).to(self.device)
 
         # initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))

@@ -92,7 +92,7 @@ class RobotRlProbeRunner(RslRlOnPolicyRunnerCfg):
 
     policy_module: str = "actor"
     """ActorCritic attribute to probe.
-    
+
     e.g. policy.policy_module[i]
     """
 
@@ -119,9 +119,24 @@ class EstimatorCfg:
 
 
 @configclass
+class MetaRlCfg:
+    num_episodes_per_trial: int = MISSING
+    """The number of episodes per trial."""
+
+    num_trials_per_rollout: int = MISSING
+    """The number of trials per rollout."""
+
+    storage_device: str | None = None
+    """The device on which to store the rollout buffer. Defaults to None, in which case the runner device is used."""
+
+
+@configclass
 class RobotRlPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     estimator_cfg: EstimatorCfg | None = None
     """The estimator configuration. Default is None, in which case it is not used."""
+
+    meta_rl_cfg: MetaRlCfg | None = None
+    """The meta RL configuration. Default is None, in which case it is not used."""
 
 
 @configclass

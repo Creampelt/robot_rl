@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from itertools import chain
 from typing import Literal
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
-from itertools import chain
 
-from robot_rl.modules import ActorCritic, ActorCriticEstimator, ActorCriticRecurrent, ActorCriticMHA
+from robot_rl.modules import ActorCritic, ActorCriticEstimator, ActorCriticMHA, ActorCriticRecurrent
 from robot_rl.modules.rnd import RandomNetworkDistillation
 from robot_rl.storage import RolloutStorage
 from robot_rl.utils import string_to_callable
@@ -44,6 +45,8 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Estimation parameters
         estimation_cfg: dict | None = None,
+        # Meta-RL parameters
+        meta_rl_cfg: dict | None = None,
         **kwargs,
     ):
         # device-related parameters
@@ -92,11 +95,18 @@ class PPO:
             self.symmetry = None
 
         # Estimation components
-        self.estimation: dict | None = estimation_cfg
+        self.estimation = estimation_cfg is not None
         if estimation_cfg is not None:
             self.estimate_loss_coef = estimation_cfg["estimate_loss_coef"]
             self.estimate_loss_ramp = max(estimation_cfg["estimate_loss_ramp"], 1)
             self.counter = 0
+
+        # Explore-Exploit components
+        self.meta_rl = meta_rl_cfg is not None
+        if meta_rl_cfg is not None:
+            self.num_episodes_per_trial = meta_rl_cfg["num_episodes_per_trial"]
+            self.num_trials_per_rollout = meta_rl_cfg["num_trials_per_rollout"]
+            self.storage_device = meta_rl_cfg["storage_device"]
 
         # PPO components
         self.policy = policy
@@ -131,6 +141,7 @@ class PPO:
         actions_shape: tuple[int, ...] | list[int],
         use_last_obs: bool,
     ) -> None:
+        device = self.storage_device if self.meta_rl and self.storage_device else self.device
         # create rollout storage
         self.storage = RolloutStorage(
             training_type,
@@ -138,7 +149,7 @@ class PPO:
             num_transitions_per_env,
             obs,
             actions_shape,
-            self.device,
+            device,
             use_last_obs,
         )
 
@@ -162,7 +173,16 @@ class PPO:
         self.transition.last_observations = last_obs
         return self.transition.actions
 
-    def process_env_step(self, obs, rewards, dones, extras, last_obs: TensorDict | None = None):
+    def process_env_step(
+        self,
+        obs: TensorDict,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        extras: dict[str, torch.Tensor],
+        *,
+        ep_counter: torch.Tensor,
+        last_obs: TensorDict | None = None,
+    ) -> tuple[bool, None | torch.Tensor]:
         # update the normalizers
         self.policy.update_normalization(obs, last_obs=last_obs)
         if self.rnd:
@@ -189,7 +209,20 @@ class PPO:
         # record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
-        self.policy.reset(dones)
+
+        # for meta-RL environments, we only want to reset hidden states at end of trial
+        # otherwise we reset at end of episode
+        if self.meta_rl:
+            trial_dones = (dones.bool() & (ep_counter % self.num_episodes_per_trial == 0)).byte()
+            self.policy.reset(trial_dones)
+            # end rollout early if all envs have exceeded desired episode count
+            return bool(
+                torch.all(ep_counter > self.num_trials_per_rollout * self.num_episodes_per_trial).item()
+            ), trial_dones.nonzero(as_tuple=False).squeeze(1)
+        else:
+            self.policy.reset(dones)
+            # no need to end rollout early in regular RL
+            return False, None
 
     def compute_returns(self, obs):
         # compute value for the last step
@@ -228,9 +261,17 @@ class PPO:
 
         # generator for mini batches
         if self.policy.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches,
+                self.num_learning_epochs,
+                device=self.device,
+            )
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches,
+                self.num_learning_epochs,
+                device=self.device,
+            )
 
         # iterate over batches
         for (

@@ -20,7 +20,7 @@ import ot
 import torch
 from tensordict import TensorDict
 
-T = TypeVar("T")
+T = TypeVar("T", TensorDict, torch.Tensor)
 
 
 def resolve_nn_activation(act_name: str) -> torch.nn.Module:
@@ -97,9 +97,7 @@ def resolve_dtype(dtype_name: str) -> torch.dtype:
         raise ValueError(f"Invalid dtype '{dtype_name}'. Valid optimizers are: {list(dtype_dict.keys())}")
 
 
-def split_and_pad_trajectories(
-    tensor: torch.Tensor | TensorDict, dones: torch.Tensor
-) -> tuple[torch.Tensor | TensorDict, torch.Tensor]:
+def split_and_pad_trajectories(tensor: T, dones: torch.Tensor) -> tuple[T, torch.Tensor]:
     """Splits trajectories at done indices. Then concatenates them and pads with zeros up to the length of the longest
     trajectory. Returns masks corresponding to valid parts of the trajectories.
 
