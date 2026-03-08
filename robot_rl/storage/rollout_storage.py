@@ -30,13 +30,14 @@ class RolloutStorage:
         hidden_states: tuple | None = None
         next_observations: TensorDict | None = None
         last_observations: TensorDict | None = None
+        meta_dones: torch.Tensor | None = None
 
         def clear(self):
             self.__init__()
 
     def __init__(
         self,
-        training_type: Literal["rl", "distillation"],
+        training_type: Literal["rl", "distillation", "meta_rl"],
         num_envs: int,
         num_transitions_per_env: int,
         obs: TensorDict,
@@ -65,13 +66,16 @@ class RolloutStorage:
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         # for reinforcement learning
-        elif training_type == "rl":
+        elif training_type in ["meta_rl", "rl"]:
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+
+            if training_type == "meta_rl":
+                self.meta_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # For last observation (for estimation)
         self.last_obs = self.observations.clone() if use_last_obs else None
@@ -89,24 +93,27 @@ class RolloutStorage:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
         # Core
-        self.observations[self.step].copy_(transition.observations.to(self.device))
-        self.actions[self.step].copy_(transition.actions.to(self.device))
-        self.rewards[self.step].copy_(transition.rewards.to(self.device).view(-1, 1))
-        self.dones[self.step].copy_(transition.dones.to(self.device).view(-1, 1))
+        self.observations[self.step].copy_(transition.observations)
+        self.actions[self.step].copy_(transition.actions)
+        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # for distillation
         if self.training_type == "distillation":
-            self.privileged_actions[self.step].copy_(transition.privileged_actions.to(self.device))
+            self.privileged_actions[self.step].copy_(transition.privileged_actions)
         # for reinforcement learning
-        elif self.training_type == "rl":
-            self.values[self.step].copy_(transition.values.to(self.device))
-            self.actions_log_prob[self.step].copy_(transition.actions_log_prob.to(self.device).view(-1, 1))
-            self.mu[self.step].copy_(transition.action_mean.to(self.device))
-            self.sigma[self.step].copy_(transition.action_sigma.to(self.device))
+        elif self.training_type in ["meta_rl", "rl"]:
+            self.values[self.step].copy_(transition.values)
+            self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
+            self.mu[self.step].copy_(transition.action_mean)
+            self.sigma[self.step].copy_(transition.action_sigma)
+
+            if self.training_type == "meta_rl":
+                self.meta_dones[self.step].copy_(transition.meta_dones.view(-1, 1))
 
         # For last observation (for estimation)
         if self.last_obs is not None:
-            self.last_obs[self.step].copy_(transition.last_observations.to(self.device))
+            self.last_obs[self.step].copy_(transition.last_observations)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -134,8 +141,8 @@ class RolloutStorage:
             ]
         # copy the states
         for i in range(len(hid_a)):
-            self.saved_hidden_states_a[i][self.step].copy_(hid_a[i].to(self.device))
-            self.saved_hidden_states_c[i][self.step].copy_(hid_c[i].to(self.device))
+            self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
+            self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
 
     def clear(self) -> None:
         self.step = 0
@@ -280,14 +287,18 @@ class RolloutStorage:
             TensorDict | None,
         ]
     ]:
-        if self.training_type != "rl":
-            raise ValueError("This function is only available for reinforcement learning training.")
+        if self.training_type not in ["meta_rl", "rl"]:
+            raise ValueError(
+                "This function is only available for reinforcement learning and meta-reinforcement learning training."
+            )
         assert self.saved_hidden_states_a is not None and self.saved_hidden_states_c is not None
 
-        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        # reset memory at episode boundary if in regular RL, otherwise reset at trial boundary
+        mem_bounds = self.meta_dones if self.training_type == "meta_rl" else self.dones
+        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, mem_bounds)
 
         if self.last_obs is not None:
-            padded_last_obs_trajectories, _ = split_and_pad_trajectories(self.last_obs, self.dones)
+            padded_last_obs_trajectories, _ = split_and_pad_trajectories(self.last_obs, mem_bounds)
         else:
             padded_last_obs_trajectories = None
 
@@ -298,9 +309,9 @@ class RolloutStorage:
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
 
-                dones = self.dones.squeeze(-1)
-                last_was_done = torch.zeros_like(dones, dtype=torch.bool)
-                last_was_done[1:] = dones[:-1]
+                mem_bounds = mem_bounds.squeeze(-1)
+                last_was_done = torch.zeros_like(mem_bounds, dtype=torch.bool)
+                last_was_done[1:] = mem_bounds[:-1]
                 last_was_done[0] = True
                 trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
                 last_traj = first_traj + trajectories_batch_size

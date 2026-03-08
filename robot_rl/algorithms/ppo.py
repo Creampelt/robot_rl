@@ -134,7 +134,7 @@ class PPO:
 
     def init_storage(
         self,
-        training_type: Literal["rl", "distillation"],
+        training_type: Literal["rl", "distillation", "meta_rl"],
         num_envs: int,
         num_transitions_per_env: int,
         obs: TensorDict,
@@ -192,6 +192,9 @@ class PPO:
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        if self.meta_rl:
+            trial_dones = (dones.bool() & (ep_counter % self.num_episodes_per_trial == 0)).byte()
+            self.transition.meta_dones = trial_dones
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -213,12 +216,10 @@ class PPO:
         # for meta-RL environments, we only want to reset hidden states at end of trial
         # otherwise we reset at end of episode
         if self.meta_rl:
-            trial_dones = (dones.bool() & (ep_counter % self.num_episodes_per_trial == 0)).byte()
             self.policy.reset(trial_dones)
             # end rollout early if all envs have exceeded desired episode count
-            return bool(
-                torch.all(ep_counter > self.num_trials_per_rollout * self.num_episodes_per_trial).item()
-            ), trial_dones.nonzero(as_tuple=False).squeeze(1)
+            end_rollout = bool(torch.all(ep_counter > self.num_trials_per_rollout * self.num_episodes_per_trial).item())
+            return end_rollout, trial_dones.nonzero(as_tuple=False).squeeze(1)
         else:
             self.policy.reset(dones)
             # no need to end rollout early in regular RL

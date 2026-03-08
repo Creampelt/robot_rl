@@ -173,16 +173,16 @@ class OnPolicyRunner:
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
 
+                    # -- stop meta RL rollout if trial has been completed on all environments
+                    if end_rollout:
+                        break
+
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
 
                 # compute returns
                 self.alg.compute_returns(obs)
-
-                # -- stop meta RL rollout if trial has been completed on all environments
-                if end_rollout:
-                    break
 
             # update policy
             loss_dict, error_dict = self.alg.update()
@@ -469,6 +469,7 @@ class OnPolicyRunner:
         # resolve meta-RL config
         self.alg_cfg = resolve_meta_rl_config(self.alg_cfg)
 
+        training_type = "rl"
         # override num_steps_per_env for meta RL -- rollouts assumed to be maximum length and masked out later
         if self.alg_cfg["meta_rl"]:
             max_episode_length: int | torch.Tensor = self.env.max_episode_length
@@ -479,6 +480,7 @@ class OnPolicyRunner:
                 * self.alg_cfg["meta_rl_cfg"]["num_episodes_per_trial"]
                 * self.alg_cfg["meta_rl_cfg"]["num_trials_per_rollout"]
             )
+            training_type = "meta_rl"
 
         # resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
@@ -504,7 +506,7 @@ class OnPolicyRunner:
 
         # initialize the storage
         alg.init_storage(
-            "rl",
+            training_type,
             self.env.num_envs,
             self.num_steps_per_env,
             obs,
