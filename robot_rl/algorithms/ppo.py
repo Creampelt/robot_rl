@@ -139,9 +139,11 @@ class PPO:
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
+        storage_device: str | None,
         use_last_obs: bool,
     ) -> None:
-        device = self.storage_device if self.meta_rl and self.storage_device else self.device
+        if storage_device is None:
+            storage_device = self.device
         # create rollout storage
         self.storage = RolloutStorage(
             training_type,
@@ -149,7 +151,7 @@ class PPO:
             num_transitions_per_env,
             obs,
             actions_shape,
-            device,
+            storage_device,
             use_last_obs,
         )
 

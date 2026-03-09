@@ -511,6 +511,7 @@ class OnPolicyRunner:
             self.num_steps_per_env,
             obs,
             [self.env.num_actions],
+            self.cfg.get("storage_device", None),
             self.use_last_obs,
         )
 

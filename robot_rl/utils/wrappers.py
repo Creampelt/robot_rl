@@ -78,6 +78,14 @@ class ProbeAlgorithmCfg:
 
 
 @configclass
+class RobotRlOnPolicyRunnerCfg(RslRlOnPolicyRunnerCfg):
+    """Configuration of the runner for on-policy algorithms."""
+
+    storage_device: str | None = None
+    """The device on which to store the rollout buffer. Defaults to None, in which case the runner device is used."""
+
+
+@configclass
 class RobotRlProbeRunner(RslRlOnPolicyRunnerCfg):
     """Configuration of the runner for probe algorithms."""
 
@@ -125,9 +133,6 @@ class MetaRlCfg:
 
     num_trials_per_rollout: int = MISSING
     """The number of trials per rollout."""
-
-    storage_device: str | None = None
-    """The device on which to store the rollout buffer. Defaults to None, in which case the runner device is used."""
 
 
 @configclass
@@ -284,7 +289,7 @@ class RobotRlOffPolicyRunnerCfg(RslRlBaseRunnerCfg):
     """Configuration of the runner for on-policy algorithms."""
 
     class_name: str = "OffPolicyRunner"
-    """The runner class name. Default is OnPolicyRunner."""
+    """The runner class name. Default is OffPolicyRunner."""
 
     num_steps_per_env = MISSING
     """The number of steps per environment per update."""
