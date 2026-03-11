@@ -129,10 +129,7 @@ class EstimatorCfg:
 @configclass
 class MetaRlCfg:
     num_episodes_per_trial: int = MISSING
-    """The number of episodes per trial."""
-
-    num_trials_per_rollout: int = MISSING
-    """The number of trials per rollout."""
+    """The number of episodes per trial (i.e. number of episodes between memory resets)."""
 
 
 @configclass

@@ -105,8 +105,6 @@ class PPO:
         self.meta_rl = meta_rl_cfg is not None
         if meta_rl_cfg is not None:
             self.num_episodes_per_trial = meta_rl_cfg["num_episodes_per_trial"]
-            self.num_trials_per_rollout = meta_rl_cfg["num_trials_per_rollout"]
-            self.storage_device = meta_rl_cfg["storage_device"]
 
         # PPO components
         self.policy = policy
@@ -184,7 +182,7 @@ class PPO:
         *,
         ep_counter: torch.Tensor,
         last_obs: TensorDict | None = None,
-    ) -> tuple[bool, None | torch.Tensor]:
+    ) -> torch.Tensor | None:
         # update the normalizers
         self.policy.update_normalization(obs, last_obs=last_obs)
         if self.rnd:
@@ -219,13 +217,10 @@ class PPO:
         # otherwise we reset at end of episode
         if self.meta_rl:
             self.policy.reset(trial_dones)
-            # end rollout early if all envs have exceeded desired episode count
-            end_rollout = bool(torch.all(ep_counter > self.num_trials_per_rollout * self.num_episodes_per_trial).item())
-            return end_rollout, trial_dones.nonzero(as_tuple=False).squeeze(1)
+            return trial_dones.nonzero(as_tuple=False).squeeze(1)
         else:
             self.policy.reset(dones)
-            # no need to end rollout early in regular RL
-            return False, None
+            return None
 
     def compute_returns(self, obs):
         # compute value for the last step

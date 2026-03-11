@@ -130,7 +130,7 @@ class OnPolicyRunner:
                     # increment ep_counter
                     ep_counter[new_ids] += 1
                     # process the step
-                    end_rollout, new_trial_ids = self.alg.process_env_step(
+                    new_trial_ids = self.alg.process_env_step(
                         obs,
                         rewards,
                         dones,
@@ -172,10 +172,6 @@ class OnPolicyRunner:
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
-
-                    # -- stop meta RL rollout if trial has been completed on all environments
-                    if end_rollout:
-                        break
 
                 stop = time.time()
                 collection_time = stop - start
@@ -469,19 +465,6 @@ class OnPolicyRunner:
         # resolve meta-RL config
         self.alg_cfg = resolve_meta_rl_config(self.alg_cfg)
 
-        training_type = "rl"
-        # override num_steps_per_env for meta RL -- rollouts assumed to be maximum length and masked out later
-        if self.alg_cfg["meta_rl"]:
-            max_episode_length: int | torch.Tensor = self.env.max_episode_length
-            if isinstance(max_episode_length, torch.Tensor):
-                max_episode_length = int(max_episode_length.max().item())
-            self.num_steps_per_env = (
-                max_episode_length
-                * self.alg_cfg["meta_rl_cfg"]["num_episodes_per_trial"]
-                * self.alg_cfg["meta_rl_cfg"]["num_trials_per_rollout"]
-            )
-            training_type = "meta_rl"
-
         # resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
             warnings.warn(
@@ -506,7 +489,7 @@ class OnPolicyRunner:
 
         # initialize the storage
         alg.init_storage(
-            training_type,
+            "meta_rl" if self.alg_cfg["meta_rl"] else "rl",
             self.env.num_envs,
             self.num_steps_per_env,
             obs,
