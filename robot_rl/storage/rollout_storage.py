@@ -12,6 +12,7 @@ from typing import Literal
 import torch
 from tensordict import TensorDict
 
+from robot_rl.networks.memory import HiddenStates
 from robot_rl.utils import split_and_pad_trajectories
 
 
@@ -81,8 +82,8 @@ class RolloutStorage:
         self.last_obs = self.observations.clone() if use_last_obs else None
 
         # For RNN networks
-        self.saved_hidden_states_a = None
-        self.saved_hidden_states_c = None
+        self.saved_hidden_states_a: list[torch.Tensor] | None = None
+        self.saved_hidden_states_c: list[torch.Tensor] | None = None
 
         # counter for the number of transitions stored
         self.step = 0
@@ -123,7 +124,7 @@ class RolloutStorage:
 
     def _save_hidden_states(
         self,
-        hidden_states: tuple[torch.Tensor, torch.Tensor] | torch.Tensor | None | tuple[None, None],
+        hidden_states: HiddenStates | None | tuple[None, None],
     ) -> None:
         if hidden_states is None or hidden_states == (None, None):
             return
@@ -210,8 +211,10 @@ class RolloutStorage:
             TensorDict | None,
         ]
     ]:
-        if self.training_type != "rl":
-            raise ValueError("This function is only available for reinforcement learning training.")
+        if self.training_type not in ["meta_rl", "rl"]:
+            raise ValueError(
+                "This function is only available for reinforcement learning and meta-reinforcement learning training."
+            )
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
@@ -271,7 +274,10 @@ class RolloutStorage:
 
     # for reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(
-        self, num_mini_batches: int, num_epochs: int = 8, device: str | None = None
+        self,
+        num_mini_batches: int,
+        num_epochs: int = 8,
+        device: str | None = None,
     ) -> Iterator[
         tuple[
             TensorDict,
@@ -282,7 +288,7 @@ class RolloutStorage:
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
-            tuple[torch.Tensor | list[torch.Tensor], torch.Tensor | list[torch.Tensor]],
+            tuple[HiddenStates, HiddenStates],
             torch.Tensor,
             TensorDict | None,
         ]
@@ -303,13 +309,13 @@ class RolloutStorage:
             padded_last_obs_trajectories = None
 
         mini_batch_size = self.num_envs // num_mini_batches
+        mem_bounds = mem_bounds.squeeze(-1)
         for ep in range(num_epochs):
             first_traj = 0
             for i in range(num_mini_batches):
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
 
-                mem_bounds = mem_bounds.squeeze(-1)
                 last_was_done = torch.zeros_like(mem_bounds, dtype=torch.bool)
                 last_was_done[1:] = mem_bounds[:-1]
                 last_was_done[0] = True
@@ -351,9 +357,15 @@ class RolloutStorage:
                     .to(device)
                     for saved_hidden_states in self.saved_hidden_states_c
                 ]
-                # remove the tuple for GRU
-                hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
-                hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
+                # remove the tuple for GRU, check typing for LSTU
+                if len(hid_a_batch) == 1:
+                    assert len(hid_c_batch) == 1
+                    hid_a_batch = hid_a_batch[0]
+                    hid_c_batch = hid_c_batch[0]
+                else:
+                    assert len(hid_a_batch) == 2 and len(hid_c_batch) == 2
+                    hid_a_batch = (hid_a_batch[0], hid_a_batch[1])
+                    hid_c_batch = (hid_c_batch[0], hid_c_batch[1])
 
                 yield (
                     obs_batch.to(device),

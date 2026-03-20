@@ -101,10 +101,10 @@ class PPO:
             self.estimate_loss_ramp = max(estimation_cfg["estimate_loss_ramp"], 1)
             self.counter = 0
 
-        # Explore-Exploit components
+        # Meta RL components
         self.meta_rl = meta_rl_cfg is not None
         if meta_rl_cfg is not None:
-            self.num_episodes_per_trial = meta_rl_cfg["num_episodes_per_trial"]
+            self.num_episodes_per_trial: int = meta_rl_cfg["num_episodes_per_trial"]
 
         # PPO components
         self.policy = policy
@@ -354,7 +354,7 @@ class PPO:
                         / (2.0 * torch.square(sigma_batch))
                         - 0.5,
                         axis=-1,
-                    )
+                    )  # type: ignore
                     kl_mean = torch.mean(kl)
 
                     # Reduce the KL divergence across all GPUs

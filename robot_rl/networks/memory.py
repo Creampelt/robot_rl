@@ -5,9 +5,14 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
+import torch
 import torch.nn as nn
 
 from robot_rl.utils import unpad_trajectories
+
+HiddenStates = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 class Memory(nn.Module):
@@ -17,17 +22,29 @@ class Memory(nn.Module):
     Currently only supports GRU and LSTM.
     """
 
-    def __init__(self, input_size, type="lstm", num_layers=1, hidden_size=256):
+    def __init__(
+        self,
+        input_size: int,
+        type: Literal["lstm", "gru"] = "lstm",
+        num_layers: int = 1,
+        hidden_size: int = 256,
+    ) -> None:
         super().__init__()
         # RNN
         rnn_cls = nn.GRU if type.lower() == "gru" else nn.LSTM
         self.rnn = rnn_cls(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers)
-        self.hidden_states = None
+        self.hidden_states: HiddenStates | None = None
+        self.hidden_states_inference: HiddenStates | None = None
 
-    def forward(self, input, masks=None, hidden_states=None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        masks: torch.Tensor | None = None,
+        hidden_states: HiddenStates | None = None,
+    ) -> torch.Tensor:
         batch_mode = masks is not None
         if batch_mode:
-            # batch mode: needs saved hidden states
+            # batch mode: use provided states if present, otherwise use saved inference states
             if hidden_states is None:
                 raise ValueError("Hidden states not passed to memory module during policy update")
             out, _ = self.rnn(input, hidden_states)
@@ -37,7 +54,7 @@ class Memory(nn.Module):
             out, self.hidden_states = self.rnn(input.unsqueeze(0), self.hidden_states)
         return out
 
-    def reset(self, dones=None, hidden_states=None):
+    def reset(self, dones: torch.Tensor | None = None, hidden_states: HiddenStates | None = None):
         if dones is None:  # reset all hidden states
             if hidden_states is None:
                 self.hidden_states = None
@@ -55,11 +72,11 @@ class Memory(nn.Module):
                     "Resetting hidden states of done environments with custom hidden states is not implemented"
                 )
 
-    def detach_hidden_states(self, dones=None):
+    def detach_hidden_states(self, dones: torch.Tensor | None = None) -> None:
         if self.hidden_states is not None:
             if dones is None:  # detach all hidden states
                 if isinstance(self.hidden_states, tuple):  # tuple in case of LSTM
-                    self.hidden_states = tuple(hidden_state.detach() for hidden_state in self.hidden_states)
+                    self.hidden_states = (self.hidden_states[0].detach(), self.hidden_states[1].detach())
                 else:
                     self.hidden_states = self.hidden_states.detach()
             else:  # detach hidden states of done environments

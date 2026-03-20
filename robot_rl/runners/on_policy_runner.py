@@ -139,7 +139,7 @@ class OnPolicyRunner:
                         last_obs=last_obs,
                     )
                     # reset the environment for new trials if necessary
-                    if self.alg_cfg["meta_rl"]:
+                    if self.alg.meta_rl:
                         assert new_trial_ids is not None
                         if len(new_trial_ids):
                             self.env.apply("trial", new_trial_ids)
