@@ -14,7 +14,7 @@ import time
 import torch
 from collections import deque
 
-import rsl_rl
+import robot_rl
 
 
 class Logger:
@@ -38,7 +38,7 @@ class Logger:
         self.num_envs = num_envs
         self.gpu_world_size = gpu_world_size
         self.device = device
-        self.git_status_repos = [rsl_rl.__file__]
+        self.git_status_repos = [robot_rl.__file__]
         self.tot_timesteps = 0
         self.tot_time = 0
 
@@ -69,11 +69,11 @@ class Logger:
             self.logger_type = self.cfg.get("logger", "tensorboard")
             self.logger_type = self.logger_type.lower()
             if self.logger_type == "neptune":
-                from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
+                from robot_rl.utils.neptune_utils import NeptuneSummaryWriter
 
                 self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
             elif self.logger_type == "wandb":
-                from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+                from robot_rl.utils.wandb_utils import WandbSummaryWriter
 
                 self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
             elif self.logger_type == "tensorboard":

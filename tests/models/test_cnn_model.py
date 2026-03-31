@@ -14,8 +14,8 @@ from tensordict import TensorDict
 import onnx
 import pytest
 
-from rsl_rl.models import CNNModel
-from rsl_rl.modules.cnn import _compute_output_dim, _compute_padding
+from robot_rl.models import CNNModel
+from robot_rl.modules.cnn import _compute_output_dim, _compute_padding
 
 NUM_ENVS = 2
 OBS_DIM_1D = 6

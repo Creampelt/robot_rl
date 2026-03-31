@@ -7,7 +7,7 @@
 
 import pytest
 
-from rsl_rl.utils import resolve_callable
+from robot_rl.utils import resolve_callable
 
 
 # Test fixtures - nested class for testing nested attribute resolution
@@ -35,7 +35,7 @@ class TestResolveCallableDirect:
 
     def test_direct_class(self) -> None:
         """Passing a class directly should return it unchanged."""
-        from rsl_rl.algorithms import PPO
+        from robot_rl.algorithms import PPO
 
         result = resolve_callable(PPO)
         assert result is PPO
@@ -57,7 +57,7 @@ class TestResolveCallableColonFormat:
     def test_colon_format_class(self) -> None:
         """Should resolve 'module:Class' format."""
         result = resolve_callable("rsl_rl.algorithms:PPO")
-        from rsl_rl.algorithms import PPO
+        from robot_rl.algorithms import PPO
 
         assert result is PPO
 
@@ -88,7 +88,7 @@ class TestResolveCallableDotFormat:
     def test_dot_format_class(self) -> None:
         """Should resolve 'module.Class' format."""
         result = resolve_callable("rsl_rl.algorithms.PPO")
-        from rsl_rl.algorithms import PPO
+        from robot_rl.algorithms import PPO
 
         assert result is PPO
 
@@ -118,9 +118,9 @@ class TestResolveCallableSimpleName:
     """Tests for simple name resolution via rsl_rl packages."""
 
     def test_simple_name(self) -> None:
-        """Should resolve 'PPO' from rsl_rl.algorithms."""
+        """Should resolve 'PPO' from robot_rl.algorithms."""
         result = resolve_callable("PPO")
-        from rsl_rl.algorithms import PPO
+        from robot_rl.algorithms import PPO
 
         assert result is PPO
 

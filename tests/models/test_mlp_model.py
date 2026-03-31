@@ -14,7 +14,7 @@ from tensordict import TensorDict
 import onnx
 import pytest
 
-from rsl_rl.models import MLPModel
+from robot_rl.models import MLPModel
 from tests.conftest import make_obs
 
 NUM_ENVS = 4

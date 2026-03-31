@@ -11,8 +11,8 @@ import torch.nn as nn
 from tensordict import TensorDict
 from typing import Any, NoReturn
 
-from rsl_rl.env import VecEnv
-from rsl_rl.modules import MLP, EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from robot_rl.env import VecEnv
+from robot_rl.modules import MLP, EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 
 
 class RandomNetworkDistillation(nn.Module):

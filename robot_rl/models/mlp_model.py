@@ -11,9 +11,9 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
-from rsl_rl.modules.distribution import Distribution
-from rsl_rl.utils import resolve_callable, unpad_trajectories
+from robot_rl.modules import MLP, EmpiricalNormalization, HiddenState
+from robot_rl.modules.distribution import Distribution
+from robot_rl.utils import resolve_callable, unpad_trajectories
 
 
 class MLPModel(nn.Module):

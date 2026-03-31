@@ -11,7 +11,7 @@ import torch
 import torch.optim as optim
 from tensordict import TensorDict
 
-from rsl_rl.extensions.rnd import RandomNetworkDistillation
+from robot_rl.extensions.rnd import RandomNetworkDistillation
 from tests.conftest import make_obs
 
 NUM_ENVS = 8

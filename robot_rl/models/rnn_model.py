@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.models.mlp_model import MLPModel
-from rsl_rl.modules import RNN, HiddenState
+from robot_rl.models.mlp_model import MLPModel
+from robot_rl.modules import RNN, HiddenState
 
 
 class RNNModel(MLPModel):

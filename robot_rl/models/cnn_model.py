@@ -12,8 +12,8 @@ import torch.nn as nn
 from tensordict import TensorDict
 from typing import Any
 
-from rsl_rl.models.mlp_model import MLPModel
-from rsl_rl.modules import CNN, HiddenState
+from robot_rl.models.mlp_model import MLPModel
+from robot_rl.modules import CNN, HiddenState
 
 
 class CNNModel(MLPModel):

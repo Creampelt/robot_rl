@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from typing import Union
 
-from rsl_rl.utils import unpad_trajectories
+from robot_rl.utils import unpad_trajectories
 
 HiddenState = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor], None]  # Using Union due to Python <3.10
 """Type alias for the hidden state of RNNs (GRU/LSTM).

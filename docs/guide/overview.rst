@@ -210,7 +210,7 @@ trained policy for deployment. The environment is defined by the user and must i
 
    import yaml
 
-   from rsl_rl.runners import OnPolicyRunner
+   from robot_rl.runners import OnPolicyRunner
 
    # 1) Create your environment (usually provided by environment libraries such as Isaac Lab)
    env = make_env()
@@ -243,7 +243,7 @@ following replay script:
 
    import yaml
 
-   from rsl_rl.runners import OnPolicyRunner
+   from robot_rl.runners import OnPolicyRunner
 
    # 1) Create your environment (usually provided by environment libraries such as Isaac Lab)
    env = make_env()

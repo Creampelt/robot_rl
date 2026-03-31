@@ -7,7 +7,7 @@
 
 import torch
 
-from rsl_rl.modules.normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from robot_rl.modules.normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 
 
 class TestEmpiricalNormalization:

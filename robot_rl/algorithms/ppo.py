@@ -12,11 +12,11 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.env import VecEnv
-from rsl_rl.extensions import RandomNetworkDistillation, resolve_rnd_config, resolve_symmetry_config
-from rsl_rl.models import MLPModel
-from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
+from robot_rl.env import VecEnv
+from robot_rl.extensions import RandomNetworkDistillation, resolve_rnd_config, resolve_symmetry_config
+from robot_rl.models import MLPModel
+from robot_rl.storage import RolloutStorage
+from robot_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 
 
 class PPO:

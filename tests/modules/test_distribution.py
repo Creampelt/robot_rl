@@ -8,7 +8,7 @@
 import math
 import torch
 
-from rsl_rl.modules.distribution import GaussianDistribution, HeteroscedasticGaussianDistribution
+from robot_rl.modules.distribution import GaussianDistribution, HeteroscedasticGaussianDistribution
 
 
 class TestGaussianDistribution:

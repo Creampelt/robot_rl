@@ -10,9 +10,9 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from rsl_rl.algorithms.ppo import PPO
-from rsl_rl.models import MLPModel
-from rsl_rl.storage import RolloutStorage
+from robot_rl.algorithms.ppo import PPO
+from robot_rl.models import MLPModel
+from robot_rl.storage import RolloutStorage
 from tests.conftest import make_obs
 
 NUM_ENVS = 4

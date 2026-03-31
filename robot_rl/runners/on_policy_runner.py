@@ -10,11 +10,11 @@ import os
 import time
 import torch
 
-from rsl_rl.algorithms import PPO
-from rsl_rl.env import VecEnv
-from rsl_rl.models import MLPModel
-from rsl_rl.utils import check_nan, resolve_callable
-from rsl_rl.utils.logger import Logger
+from robot_rl.algorithms import PPO
+from robot_rl.env import VecEnv
+from robot_rl.models import MLPModel
+from robot_rl.utils import check_nan, resolve_callable
+from robot_rl.utils.logger import Logger
 
 
 class OnPolicyRunner:
@@ -158,6 +158,7 @@ class OnPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
+            self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.num_steps_per_env  # type: ignore
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device: str | None = None) -> MLPModel:
