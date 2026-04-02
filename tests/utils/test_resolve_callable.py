@@ -56,7 +56,7 @@ class TestResolveCallableColonFormat:
 
     def test_colon_format_class(self) -> None:
         """Should resolve 'module:Class' format."""
-        result = resolve_callable("rsl_rl.algorithms:PPO")
+        result = resolve_callable("robot_rl.algorithms:PPO")
         from robot_rl.algorithms import PPO
 
         assert result is PPO
@@ -79,7 +79,7 @@ class TestResolveCallableColonFormat:
     def test_colon_format_invalid_attr(self) -> None:
         """Should raise AttributeError for invalid attribute."""
         with pytest.raises(AttributeError):
-            resolve_callable("rsl_rl.algorithms:NonexistentClass")
+            resolve_callable("robot_rl.algorithms:NonexistentClass")
 
 
 class TestResolveCallableDotFormat:
@@ -87,7 +87,7 @@ class TestResolveCallableDotFormat:
 
     def test_dot_format_class(self) -> None:
         """Should resolve 'module.Class' format."""
-        result = resolve_callable("rsl_rl.algorithms.PPO")
+        result = resolve_callable("robot_rl.algorithms.PPO")
         from robot_rl.algorithms import PPO
 
         assert result is PPO
@@ -111,11 +111,11 @@ class TestResolveCallableDotFormat:
     def test_dot_format_invalid_attr(self) -> None:
         """Should raise AttributeError for invalid attribute."""
         with pytest.raises(AttributeError):
-            resolve_callable("rsl_rl.algorithms.NonexistentClass")
+            resolve_callable("robot_rl.algorithms.NonexistentClass")
 
 
 class TestResolveCallableSimpleName:
-    """Tests for simple name resolution via rsl_rl packages."""
+    """Tests for simple name resolution via robot_rl packages."""
 
     def test_simple_name(self) -> None:
         """Should resolve 'PPO' from robot_rl.algorithms."""

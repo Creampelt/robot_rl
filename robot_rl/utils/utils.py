@@ -14,7 +14,7 @@ from collections.abc import Callable
 from tensordict import TensorDict
 from typing import Any
 
-import rsl_rl
+import robot_rl
 
 
 def get_param(param: Any, idx: int) -> Any:
@@ -103,7 +103,7 @@ def resolve_callable(callable_or_name: type | Callable | str) -> Callable:
     - Direct callable: pass a type or function directly (for example, ``MyClass`` or ``my_func``).
     - Qualified name with colon: ``"module.path:Attr.Nested"`` (explicit, recommended).
     - Qualified name with dot: ``"module.path.ClassName"`` (implicit).
-    - Simple name: for example ``"PPO"`` or ``"ActorCritic"`` (searched within ``rsl_rl``).
+    - Simple name: for example ``"PPO"`` or ``"ActorCritic"`` (searched within ``robot_rl``).
 
     Args:
         callable_or_name: A callable (type/function) or string name.
@@ -115,7 +115,7 @@ def resolve_callable(callable_or_name: type | Callable | str) -> Callable:
         TypeError: If input is neither a callable nor a string.
         ImportError: If the module cannot be imported.
         AttributeError: If the attribute cannot be found in the module.
-        ValueError: If a simple name cannot be found in rsl_rl packages.
+        ValueError: If a simple name cannot be found in robot_rl packages.
     """
     # Already a callable - return directly
     if callable(callable_or_name):
@@ -159,11 +159,10 @@ def resolve_callable(callable_or_name: type | Callable | str) -> Callable:
                 continue
         if module_found:
             raise AttributeError(f"Could not resolve '{callable_or_name}': attribute not found in module")
-        else:
-            raise ImportError(f"Could not resolve '{callable_or_name}': no valid module.attr split found")
+        raise ImportError(f"Could not resolve '{callable_or_name}': no valid module.attr split found")
 
-    # Simple name - look for it in rsl_rl
-    for _, module_name, _ in pkgutil.iter_modules(rsl_rl.__path__, "rsl_rl."):
+    # Simple name - look for it in robot_rl
+    for _, module_name, _ in pkgutil.iter_modules(robot_rl.__path__, "robot_rl."):
         module = importlib.import_module(module_name)
         if hasattr(module, callable_or_name):
             return getattr(module, callable_or_name)
@@ -259,7 +258,7 @@ def resolve_obs_groups(
                 raise ValueError(
                     f"The observation configuration dictionary 'obs_groups' does not contain the '{default_set_name}'"
                     f" key and no suitable observation could be found in the observations from the environment."
-                    f" Please refer to `rsl_rl.utils.resolve_obs_groups()` for information on how to configure the"
+                    f" Please refer to `robot_rl.utils.resolve_obs_groups()` for information on how to configure the"
                     f" 'obs_groups' dictionary correctly."
                 )
 

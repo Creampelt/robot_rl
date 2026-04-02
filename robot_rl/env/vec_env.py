@@ -67,7 +67,7 @@ class VecEnv(ABC):
             The observations TensorDict usually contains multiple observation groups. The `obs_groups`
             dictionary of the runner configuration specifies which observation groups are used for which
             purpose, i.e., it maps from required observation sets (e.g. actor) to lists of observation groups.
-            The observation sets (keys of the `obs_groups` dictionary) currently used by rsl_rl are:
+            The observation sets (keys of the `obs_groups` dictionary) currently used by robot_rl are:
 
             - "actor": Specified observation groups are used as input to the actor model.
             - "critic": Specified observation groups are used as input to the critic model.
@@ -76,11 +76,11 @@ class VecEnv(ABC):
             - "rnd_state": Specified observation groups are used as input to the RND extension.
 
             Incomplete or incorrect configurations are handled in the `resolve_obs_groups()` function in
-            `rsl_rl/utils/utils.py`, which provides detailed information on the expected configuration.
+            `robot_rl/utils/utils.py`, which provides detailed information on the expected configuration.
 
         Extras:
             The extras dictionary includes metrics such as the episode reward, episode length, etc. The following
-            dictionary keys are used by rsl_rl:
+            dictionary keys are used by robot_rl:
 
             - "time_outs" (torch.Tensor): Timeouts for the environments. These correspond to terminations that
                happen due to time limits and not due to the environment reaching a terminal state. This is useful

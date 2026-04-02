@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from rsl_rl.env import VecEnv
+from robot_rl.env import VecEnv
 
 
 def resolve_symmetry_config(alg_cfg: dict, env: VecEnv) -> dict:
