@@ -20,7 +20,7 @@ except ModuleNotFoundError:
 class WandbSummaryWriter(SummaryWriter):
     """Summary writer for W&B."""
 
-    def __init__(self, log_dir: str, flush_secs: int, cfg: dict) -> None:
+    def __init__(self, log_dir: str, flush_secs: int, num_envs: int, cfg: dict) -> None:
         """Initialize a W&B run for logging."""
         super().__init__(log_dir, flush_secs=flush_secs)
 
@@ -37,31 +37,47 @@ class WandbSummaryWriter(SummaryWriter):
         except KeyError:
             entity = None
 
+        self.shared = cfg.get("shared", False)
+        self.num_envs = num_envs
+
+        settings = wandb.Settings(start_method="thread")
+        tags = []
+        if self.shared:
+            settings.x_label = "main"
+            settings.mode = "shared"
+            settings.x_primary = True
+            tags.append("log_videos_async")
+
         # Initialize wandb
-        wandb.init(
+        self.run = wandb.init(
             project=project,
             entity=entity,
             name=run_name,
             config={"log_dir": log_dir},
-            settings=wandb.Settings(start_method="thread"),
+            settings=settings,
+            tags=tags,
         )
+
+        # Define custom metrics
+        self.run.define_metric("*", step_metric="local_step")  # global step (custom defined for async video logging)
+        self.run.define_metric("*", step_metric="env_step")  # env step (step * num_envs)
 
         # Initialize set to keep track of logged videos
         self.logged_videos: set[str] = set()
 
     def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
         """Upload environment and training configuration to W&B."""
-        wandb.config.update({"train_cfg": train_cfg})
+        self.run.config.update({"train_cfg": train_cfg})
         try:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})  # type: ignore
+            self.run.config.update({"env_cfg": env_cfg.to_dict()})  # type: ignore
         except Exception:
-            wandb.config.update({"env_cfg": asdict(env_cfg)})  # type: ignore
+            self.run.config.update({"env_cfg": asdict(env_cfg)})  # type: ignore
 
     def add_scalar(
         self,
         tag: str,
         scalar_value: float,
-        global_step: int | None = None,
+        global_step: int,
         walltime: float | None = None,
         new_style: bool = False,
     ) -> None:
@@ -73,22 +89,28 @@ class WandbSummaryWriter(SummaryWriter):
             walltime=walltime,
             new_style=new_style,
         )
-        wandb.log({tag: scalar_value}, step=global_step)
+        self.run.log(
+            {tag: scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs},
+            step=global_step if not self.shared else None,
+        )
 
     def stop(self) -> None:
         """Finish the active W&B run."""
-        wandb.finish()
+        self.run.finish()
 
     def save_model(self, model_path: str, it: int) -> None:
         """Upload a model checkpoint artifact to W&B."""
-        wandb.save(model_path, base_path=os.path.dirname(model_path))
+        self.run.save(model_path, base_path=os.path.dirname(model_path))
 
     def save_file(self, path: str) -> None:
         """Upload an arbitrary file artifact to W&B."""
-        wandb.save(path, base_path=os.path.dirname(path))
+        self.run.save(path, base_path=os.path.dirname(path))
 
     def save_video(self, video: pathlib.Path, it: int) -> None:
         """Upload a video artifact once per filename to W&B."""
         if video.name not in self.logged_videos:
-            wandb.log({"video": wandb.Video(str(video), format="mp4")}, step=it)
+            self.run.log(
+                {"video": wandb.Video(str(video), format="mp4"), "local_step": it, "env_step": it * self.num_envs},
+                step=it if not self.shared else None,
+            )
             self.logged_videos.add(video.name)

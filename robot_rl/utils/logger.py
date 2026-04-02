@@ -75,7 +75,9 @@ class Logger:
             elif self.logger_type == "wandb":
                 from robot_rl.utils.wandb_utils import WandbSummaryWriter
 
-                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer = WandbSummaryWriter(
+                    log_dir=self.log_dir, flush_secs=10, num_envs=self.num_envs, cfg=self.cfg
+                )
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
 
