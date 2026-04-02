@@ -1,9 +1,9 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Submodule defining the environment definitions."""
+"""Environment definition."""
 
 from .vec_env import VecEnv
 

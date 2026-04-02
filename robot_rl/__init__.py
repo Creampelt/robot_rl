@@ -1,7 +1,8 @@
-#  Copyright 2021 ETH Zurich, NVIDIA CORPORATION
-#  SPDX-License-Identifier: BSD-3-Clause
-
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
 """Main module for the robot_rl package."""
 
-__version__ = "2.0.1"
+__version__ = "5.0.1"
 __license__ = "BSD-3"
