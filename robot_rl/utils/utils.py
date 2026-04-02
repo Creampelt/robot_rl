@@ -10,8 +10,9 @@ import importlib
 import pkgutil
 import torch
 import warnings
+from collections.abc import Callable
 from tensordict import TensorDict
-from typing import Any, Callable
+from typing import Any
 
 import rsl_rl
 

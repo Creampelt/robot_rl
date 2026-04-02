@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from typing import Union
 
 from robot_rl.utils import unpad_trajectories
 
-HiddenState = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor], None]  # Using Union due to Python <3.10
+HiddenState = torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None
 """Type alias for the hidden state of RNNs (GRU/LSTM).
 
 For GRUs, this is a single tensor while for LSTMs, this is a tuple of two tensors (hidden state and cell state).
