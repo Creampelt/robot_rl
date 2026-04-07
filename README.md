@@ -1,38 +1,39 @@
-# RSL RL
+# RSL-RL
 
-A fast and simple implementation of RL algorithms, designed to run fully on GPU.
-This code is an evolution of `rl-pytorch` provided with NVIDIA's Isaac Gym.
+**RSL-RL** is a GPU-accelerated, lightweight learning library for robotics research. Its compact design allows
+researchers to prototype and test new ideas without the overhead of modifying large, complex libraries. RSL-RL can also
+be used out-of-the-box by installing it via [PyPI](https://pypi.org/project/rsl-rl-lib/), supports multi-GPU training,
+and features common algorithms for robot learning.
 
-Environment repositories using the framework:
+## Key Features
 
-* **`Isaac Lab`** (built on top of NVIDIA Isaac Sim): https://github.com/isaac-sim/IsaacLab
-* **`Legged-Gym`** (built on top of NVIDIA Isaac Gym): https://leggedrobotics.github.io/legged_gym/
+- **Minimal, readable codebase** with clear extension points for rapid prototyping.
+- **Robotics-first methods** including PPO and Student-Teacher Distillation.
+- **High-throughput training** with native Multi-GPU support.
+- **Proven performance** in numerous research publications.
 
-The main branch supports **PPO** and **Student-Teacher Distillation** with additional features from our research. These include:
+## Learning Environments
 
-* [Random Network Distillation (RND)](https://proceedings.mlr.press/v229/schwarke23a.html) - Encourages exploration by adding
-  a curiosity driven intrinsic reward.
-* [Symmetry-based Augmentation](https://arxiv.org/abs/2403.04359) - Makes the learned behaviors more symmetrical.
+RSL-RL is currently used by the following robot learning libraries:
 
-We welcome contributions from the community. Please check our contribution guidelines for more
-information.
+- [Isaac Lab](https://github.com/isaac-sim/IsaacLab) (built on top of NVIDIA Isaac Sim)
+- [Legged Gym](https://github.com/leggedrobotics/legged_gym) (built on top of NVIDIA Isaac Gym)
+- [mjlab](https://github.com/mujocolab/mjlab) (built on top of MuJoCo Warp)
+- [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) (built on top of MuJoCo MJX and Warp)
 
-**Maintainer**: Mayank Mittal and Clemens Schwarke <br/>
-**Affiliation**: Robotic Systems Lab, ETH Zurich & NVIDIA <br/>
-**Contact**: cschwarke@ethz.ch
+## Installation
 
-> **Note:** The `algorithms` branch supports additional algorithms (SAC, DDPG, DSAC, and more). However, it isn't currently actively maintained.
+Before installing RSL-RL, ensure that Python `3.9+` is available. It is recommended to install the library in a virtual
+environment (e.g. using `venv` or `conda`), which is often already created by the used environment library (e.g.
+Isaac Lab). If so, make sure to activate it before installing RSL-RL.
 
-
-## Setup
-
-The package can be installed via PyPI with:
+### Installing RSL-RL as a dependency
 
 ```bash
 pip install rsl-rl-lib
 ```
 
-or by cloning this repository and installing it with:
+### Installing RSL-RL for development
 
 ```bash
 git clone https://github.com/leggedrobotics/rsl_rl
@@ -40,78 +41,15 @@ cd rsl_rl
 pip install -e .
 ```
 
-The package supports the following logging frameworks which can be configured through `logger`:
+## Citation
 
-* Tensorboard: https://www.tensorflow.org/tensorboard/
-* Weights & Biases: https://wandb.ai/site
-* Neptune: https://docs.neptune.ai/
-
-For a demo configuration of PPO, please check the [example_config.yaml](config/example_config.yaml) file.
-
-
-## Contribution Guidelines
-
-For documentation, we adopt the [Google Style Guide](https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html) for docstrings. Please make sure that your code is well-documented and follows the guidelines.
-
-We use the following tools for maintaining code quality:
-
-- [pre-commit](https://pre-commit.com/): Runs a list of formatters and linters over the codebase.
-- [black](https://black.readthedocs.io/en/stable/): The uncompromising code formatter.
-- [flake8](https://flake8.pycqa.org/en/latest/): A wrapper around PyFlakes, pycodestyle, and McCabe complexity checker.
-
-Please check [here](https://pre-commit.com/#install) for instructions to set these up. To run over the entire repository, please execute the following command in the terminal:
-
-```bash
-# for installation (only once)
-pre-commit install
-# for running
-pre-commit run --all-files
-```
-
-## Citing
-
-**We are working on writing a white paper for this library.** Until then, please cite the following work
-if you use this library for your research:
+If you use RSL-RL in your research, please cite the [paper](https://arxiv.org/abs/2509.10771):
 
 ```text
-@InProceedings{rudin2022learning,
-  title = 	 {Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning},
-  author =       {Rudin, Nikita and Hoeller, David and Reist, Philipp and Hutter, Marco},
-  booktitle = 	 {Proceedings of the 5th Conference on Robot Learning},
-  pages = 	 {91--100},
-  year = 	 {2022},
-  volume = 	 {164},
-  series = 	 {Proceedings of Machine Learning Research},
-  publisher =    {PMLR},
-  url = 	 {https://proceedings.mlr.press/v164/rudin22a.html},
-}
-```
-
-If you use the library with curiosity-driven exploration (random network distillation), please cite:
-
-```text
-@InProceedings{schwarke2023curiosity,
-  title = 	 {Curiosity-Driven Learning of Joint Locomotion and Manipulation Tasks},
-  author =       {Schwarke, Clemens and Klemm, Victor and Boon, Matthijs van der and Bjelonic, Marko and Hutter, Marco},
-  booktitle = 	 {Proceedings of The 7th Conference on Robot Learning},
-  pages = 	 {2594--2610},
-  year = 	 {2023},
-  volume = 	 {229},
-  series = 	 {Proceedings of Machine Learning Research},
-  publisher =    {PMLR},
-  url = 	 {https://proceedings.mlr.press/v229/schwarke23a.html},
-}
-```
-
-If you use the library with symmetry augmentation, please cite:
-
-```text
-@InProceedings{mittal2024symmetry,
-  author={Mittal, Mayank and Rudin, Nikita and Klemm, Victor and Allshire, Arthur and Hutter, Marco},
-  booktitle={2024 IEEE International Conference on Robotics and Automation (ICRA)},
-  title={Symmetry Considerations for Learning Task Symmetric Robot Policies},
-  year={2024},
-  pages={7433-7439},
-  doi={10.1109/ICRA57147.2024.10611493}
+@article{schwarke2025rslrl,
+  title={RSL-RL: A Learning Library for Robotics Research},
+  author={Schwarke, Clemens and Mittal, Mayank and Rudin, Nikita and Hoeller, David and Hutter, Marco},
+  journal={arXiv preprint arXiv:2509.10771},
+  year={2025}
 }
 ```

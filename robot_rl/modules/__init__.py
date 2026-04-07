@@ -1,29 +1,34 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Definitions for neural-network components for RL-agents."""
+"""Building blocks for neural models."""
 
-from .actor_critic import *
-from .forward_backward import *
-from .rnd import *
-from .student_teacher import StudentTeacher
-from .student_teacher_recurrent import StudentTeacherRecurrent
-from .probe import Probe
-from .sae import SAE
-from .symmetry import *
+from .cnn import CNN
+from .distribution import Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+from .mlp import MLP
+from .normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+    ExponentialMovingAverageNormalization,
+)
+from .parallel import ParallelLayerNorm, ParallelLinear
+from .residual import ResMLP
+from .rnn import RNN, HiddenState
 
 __all__ = [
-    "ActorCritic",
-    "ActorCriticRecurrent",
-    "ActorCriticEstimator",
-    "ActorCriticMHA",
-    "ForwardBackward",
-    "StudentTeacher",
-    "StudentTeacherRecurrent",
-    "Probe",
-    "SAE",
-    "resolve_estimator_config",
-    "resolve_rnd_config",
+    "CNN",
+    "MLP",
+    "RNN",
+    "Distribution",
+    "EmpiricalDiscountedVariationNormalization",
+    "EmpiricalNormalization",
+    "ExponentialMovingAverageNormalization",
+    "GaussianDistribution",
+    "HeteroscedasticGaussianDistribution",
+    "HiddenState",
+    "ParallelLayerNorm",
+    "ParallelLinear",
+    "ResMLP",
 ]

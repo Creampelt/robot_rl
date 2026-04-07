@@ -2,12 +2,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import MISSING
 from typing import Any
 
-import torch.nn as nn
-from tensordict import TensorDict
 
-
-def update_class_from_dict(obj, data: dict[str, Any], _ns: str = "", ignore_extra_keys: bool = False) -> None:
-    """Reads a dictionary and sets object variables recursively.
+def update_class_from_dict(obj: Any, data: dict[str, Any], ignore_extra_keys: bool = False, _ns: str = "") -> None:
+    """Read a dictionary and set object variables recursively.
 
     This function performs in-place update of the class member attributes.
 
@@ -16,6 +13,8 @@ def update_class_from_dict(obj, data: dict[str, Any], _ns: str = "", ignore_extr
         data: Input dictionary to update from.
         _ns: Namespace of the current object. This is useful for nested configuration
             classes or dictionaries. Defaults to "".
+        ignore_extra_keys: Whether to ignore keys present in the input dictionary that are not present in the
+            destination class
 
     Raises:
         TypeError: When input is not a dictionary.
@@ -42,7 +41,7 @@ def update_class_from_dict(obj, data: dict[str, Any], _ns: str = "", ignore_extr
                         f" Expected: {len(obj_mem)}, Received: {len(value)}."
                     )
                 if isinstance(obj_mem, tuple):
-                    for i, (v, o) in enumerate(zip(value, obj_mem)):
+                    for i, (v, o) in enumerate(zip(value, obj_mem, strict=True)):
                         if isinstance(v, int) and isinstance(o, float):
                             value[i] = float(value[i])
                     value = tuple(value)
@@ -80,12 +79,3 @@ def update_class_from_dict(obj, data: dict[str, Any], _ns: str = "", ignore_extr
                 print(f"\033[91m[WARN] Key not found under namespace: {key_ns}.\033[0m")
             else:
                 raise KeyError(f"[Config]: Key not found under namespace: {key_ns}.")
-
-
-class DictModule(nn.Module):
-    def __init__(self, m: dict[str, nn.Module]) -> None:
-        super().__init__()
-        self.mod_dict = nn.ModuleDict(m)
-
-    def forward(self, x: TensorDict) -> TensorDict:
-        return TensorDict({k: self.mod_dict[k](v) for k, v in x.items()}, batch_size=x.batch_size, device=x.device)

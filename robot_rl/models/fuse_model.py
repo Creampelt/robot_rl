@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import numpy as np
+import torch
+import torch.nn as nn
+import warnings
+from collections.abc import Sequence
+from tensordict import TensorDict
+from typing import Any
+
+from robot_rl.models import MLPModel
+from robot_rl.modules import MLP, Distribution, EmpiricalNormalization, ResMLP
+from robot_rl.utils import resolve_callable
+
+
+class FuseModel(MLPModel):
+    """Early fusion MLP-based neural model."""
+
+    def __init__(
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        obs_set: str,
+        input_dims: Sequence[int],
+        output_dim: int,
+        embedding_dims: Sequence[int] = (256, 256, 256),
+        hidden_dims: Sequence[int] = (256, 256, 256),
+        num_parallel: int = 1,
+        activation: str = "relu",
+        first_activation: str | None = "tanh",
+        last_activation: str | None = None,
+        obs_normalization: bool = False,
+        distribution_cfg: dict | None = None,
+    ) -> None:
+        """Initialize the fusion model.
+
+        Args:
+            obs: Observation dictionary.
+            obs_groups: Dictionary mapping observation sets to list of observation groups.
+            obs_set: Observation set to use for this model (e.g. "actor" or "critic").
+            input_dims: A sequence of input dimensions, where each input is concatenated with observations.
+            action_dim: Dimension of the action.
+            z_dim: Dimension of the latent task vector.
+            output_dim: Dimension of the output.
+            embedding_dims: Hidden dimensions of the input embeddings.
+            hidden_dims: Hidden dimension of the model trunk.
+            num_parallel: Number of parallel networks.
+            activation: Activation function of the model.
+            first_activation: Activation function of the first layer of the model.
+            last_activation: Activation function of the model output.
+            obs_normalization: Whether to normalize the observations before feeding them to the model.
+            distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
+                stochastic values sampled from the distribution.
+        """
+        nn.Module.__init__(self)
+
+        # Resolve observation groups and dimensions
+        self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
+
+        # Observation normalization
+        self.obs_normalization = obs_normalization
+        if obs_normalization:
+            self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
+        else:
+            self.obs_normalizer = torch.nn.Identity()
+
+        # Distribution
+        if distribution_cfg is not None:
+            dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
+            self.distribution: Distribution | None = dist_class(output_dim, **distribution_cfg)
+            model_output_dim = self.distribution.input_dim
+        else:
+            self.distribution = None
+            model_output_dim = output_dim
+
+        assert hidden_dims and embedding_dims, "hidden_dims and embedding_dims must both have at least one layer."
+        self.num_parallel = num_parallel
+
+        trunk_input_dim = hidden_dims[0] if hidden_dims else output_dim
+        embedding_output_dim = trunk_input_dim // len(input_dims)
+
+        # construct modules for each embedding term
+        self.embeddings = nn.ModuleList([
+            self._make_embedding(
+                self.obs_dim + dim, embedding_output_dim, embedding_dims, num_parallel, activation, first_activation
+            )
+            for dim in input_dims
+        ])
+        self.input_dims = input_dims
+        self.num_inputs = int(np.sum(np.greater(self.input_dims, 0)))
+
+        # construct layers for main model
+        self.trunk = self._make_trunk(
+            trunk_input_dim, model_output_dim, hidden_dims, num_parallel, activation, last_activation
+        )
+
+        # Initialize distribution-specific weights
+        if self.distribution is not None:
+            self.distribution.init_mlp_weights(self.trunk)
+
+    def forward(self, obs: TensorDict, *args: torch.Tensor, stochastic_output: bool = False) -> torch.Tensor:
+        """Forward pass of the fuse model.
+
+        ..note::
+            The `stochastic_output` flag only has an effect if the model has a distribution (i.e., ``distribution_cfg``
+            was provided) and defaults to ``False``, meaning that even stochastic models will return deterministic
+            outputs by default.
+        """
+        if len(args) != self.num_inputs:
+            raise ValueError(
+                f"Invalid number of inputs received. Expected {self.num_inputs}, but received {len(args)}."
+            )
+        # Get model input latent
+        latent = self.get_latent(obs, *args)
+        # Embed each input
+        embed_output = [e(x) for e, x in zip(self.embeddings, latent, strict=True)]
+        # Trunk forward pass
+        trunk_output = self.trunk(torch.cat(embed_output, dim=-1))
+        # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
+        if self.distribution is not None:
+            if stochastic_output:
+                self.distribution.update(trunk_output)
+                return self.distribution.sample()
+            return self.distribution.deterministic_output(trunk_output)
+        return trunk_output
+
+    def get_latent(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> tuple[torch.Tensor, ...]:
+        """Build the model latent.
+
+        Latent is constructed by concatenating and normalizing selected observation groups, then concatenating with
+        each provided embedding input. If using parallel networks, each latent is expanded to (num_parallel, ...).
+        """
+        obs_list = [obs[obs_group] for obs_group in self.obs_groups]
+        latent = torch.cat(obs_list, dim=-1)
+        # Normalize observations
+        latent = self.obs_normalizer(latent)
+        # Concatenate with provided embedding inputs
+        latents: list[torch.Tensor] = []
+        arg_idx = 0
+        for dim in self.input_dims:
+            new_latent: torch.Tensor = latent
+            # Only concatenate if additional input dimension is nonzero
+            if dim > 0:
+                new_latent = torch.cat([latent, args[arg_idx]], dim=-1)
+                arg_idx += 1
+            # Reshape for parallel models
+            if self.num_parallel > 1:
+                new_latent.expand(self.num_parallel, -1, -1)
+            latents.append(new_latent)
+        return tuple(latents)
+
+    def _make_embedding(
+        self,
+        input_dim: int,
+        output_dim: int,
+        embedding_dims: Sequence[int],
+        num_parallel: int,
+        activation: str,
+        first_activation: str | None,
+    ) -> nn.Module:
+        return MLP(
+            input_dim,
+            output_dim,
+            embedding_dims,
+            num_parallel,
+            activation,
+            first_activation=first_activation,
+            last_activation=activation,
+            normalize_input=True,
+        )
+
+    def _make_trunk(
+        self,
+        input_dim: int,
+        output_dim: int | Sequence[int],
+        hidden_dims: Sequence[int],
+        num_parallel: int,
+        activation: str,
+        last_activation: str | None,
+    ) -> nn.Module:
+        return MLP(input_dim, output_dim, hidden_dims, num_parallel, activation, last_activation=last_activation)
+
+
+class ResidualFuseModel(FuseModel):
+    """Early fusion residual neural model."""
+
+    def __init__(
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        obs_set: str,
+        input_dims: Sequence[int],
+        output_dim: int,
+        embedding_dims: Sequence[int] = (256, 256, 256),
+        hidden_dims: Sequence[int] = (256, 256, 256),
+        num_parallel: int = 1,
+        activation: str = "mish",
+        first_activation: str | None = None,
+        last_activation: str | None = None,
+        obs_normalization: bool = False,
+        distribution_cfg: dict | None = None,
+    ) -> None:
+        """Initialize the residual fusion model.
+
+        Args:
+            obs: Observation dictionary.
+            obs_groups: Dictionary mapping observation sets to list of observation groups.
+            obs_set: Observation set to use for this model (e.g. "actor" or "critic").
+            input_dims: A sequence of input dimensions, where each input is concatenated with observations.
+            action_dim: Dimension of the action.
+            z_dim: Dimension of the latent task vector.
+            output_dim: Dimension of the output.
+            embedding_dims: Hidden dimensions of the input embeddings.
+            hidden_dims: Hidden dimension of the model trunk.
+            num_parallel: Number of parallel networks.
+            activation: Activation function of the model.
+            first_activation: Activation function of the first layer of the model.
+            last_activation: Activation function of the model output.
+            obs_normalization: Whether to normalize the observations before feeding them to the model.
+            distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
+                stochastic values sampled from the distribution.
+        """
+        # We redefine init here to change defaults (e.g. default activation is Mish for residual networks)
+        super().__init__(
+            obs,
+            obs_groups,
+            obs_set,
+            input_dims,
+            output_dim,
+            embedding_dims,
+            hidden_dims,
+            num_parallel,
+            activation,
+            first_activation,
+            last_activation,
+            obs_normalization,
+            distribution_cfg,
+        )
+
+    def _make_embedding(
+        self,
+        input_dim: int,
+        output_dim: int,
+        embedding_dims: Sequence[int],
+        num_parallel: int,
+        activation: str,
+        first_activation: str | None,
+    ) -> nn.Module:
+        if first_activation is not None:
+            warnings.warn(f"First activation '{first_activation}' will be ignored for residual embedding.")
+        return ResMLP(
+            input_dim,
+            output_dim,
+            embedding_dims,
+            num_parallel,
+            activation,
+            last_activation=activation,
+            first_residual=False,
+        )
+
+    def _make_trunk(
+        self,
+        input_dim: int,
+        output_dim: int | Sequence[int],
+        hidden_dims: Sequence[int],
+        num_parallel: int,
+        activation: str,
+        last_activation: str | None,
+    ) -> nn.Module:
+        return ResMLP(
+            input_dim, output_dim, hidden_dims, num_parallel, activation, last_activation, first_residual=True
+        )

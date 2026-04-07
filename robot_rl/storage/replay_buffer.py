@@ -5,59 +5,83 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from tensordict import TensorDict
 
 
 class ReplayBuffer:
-    @dataclass
+    """Storage for the data collected across rollouts (for off-policy RL).
+
+    The replay storage is populated by adding transitions during the rollout phase.
+    """
+
     class Transition:
-        observations: TensorDict | None = None
-        actions: torch.Tensor | None = None
-        rewards: torch.Tensor | None = None
-        dones: torch.Tensor | None = None
-        context: torch.Tensor | None = None
-        next_observations: TensorDict | None = None
-        next_terminated: torch.Tensor | None = None
+        """Storage for a single state transition.
+
+        This class is populated incrementally during the rollout phase and then passed to
+        :meth:`ReplayBuffer.add_transition` to record the data.
+        """
+
+        def __init__(self) -> None:
+            """Initialize an empty transition container."""
+            self.observations: TensorDict | None = None
+            """Observations at the current step."""
+
+            self.actions: torch.Tensor | None = None
+            """Actions taken at the current step."""
+
+            self.rewards: torch.Tensor | None = None
+            """Rewards received after the action."""
+
+            self.dones: torch.Tensor | None = None
+            """Done flags indicating episode termination at the current step."""
+
+            self.context: torch.Tensor | None = None
+            """Latent context (z) vectors at the current step."""
+
+            self.next_observations: TensorDict | None = None
+            """Observations after the current step."""
+
+            self.next_dones: torch.Tensor | None = None
+            """Done flags indicating episode termination after the current step."""
 
         def clear(self) -> None:
+            """Reset all transition fields to None."""
             self.__init__()
 
-        def to_full(self) -> ReplayBuffer.FullTransition:
-            # Note: dones may still be None (if obs is first obs)
-            assert (
-                self.observations is not None
-                and self.actions is not None
-                and self.rewards is not None
-                and self.context is not None
-                and self.next_observations is not None
-                and self.next_terminated is not None
-            ), "All transition values must be filled."
-            if self.dones is not None:
-                dones = self.dones.view(-1, 1)
-            else:
-                dones = None
-            return ReplayBuffer.FullTransition(
-                self.observations,
-                self.actions,
-                self.rewards,
-                dones,
-                self.context,
-                self.next_observations,
-                self.next_terminated.view(-1, 1),
-            )
+    class Batch:
+        """A batch of data yielded by the replay buffer.
 
-    @dataclass(frozen=True)
-    class FullTransition:
-        observations: TensorDict
-        actions: torch.Tensor
-        rewards: torch.Tensor
-        dones: torch.Tensor | None
-        context: torch.Tensor
-        next_observations: TensorDict
-        next_terminated: torch.Tensor
+        This class provides named access to mini-batch fields.
+        """
+
+        def __init__(
+            self,
+            observations: TensorDict,
+            next_observations: TensorDict,
+            actions: torch.Tensor,
+            rewards: torch.Tensor,
+            gammas: torch.Tensor,
+            context: torch.Tensor,
+        ) -> None:
+            """Initialize a batch container over rollout data."""
+            self.observations: TensorDict = observations
+            """Batch of observations."""
+
+            self.next_observations: TensorDict = next_observations
+            """Batch of next observations."""
+
+            self.actions: torch.Tensor = actions
+            """Batch of actions."""
+
+            self.rewards: torch.Tensor = rewards
+            """Batch of rewards."""
+
+            self.gammas: torch.Tensor = gammas
+            """Batch of gammas."""
+
+            self.context: torch.Tensor = context
+            """Batch of latent context (z) vectors."""
 
     def __init__(
         self,
@@ -68,7 +92,8 @@ class ReplayBuffer:
         z_dim: int,
         batch_size: int,
         device: str = "cpu",
-    ):
+    ) -> None:
+        """Initialize the buffer storage."""
         # store inputs
         self.num_envs = num_envs
         self.capacity = capacity_per_env * num_envs
@@ -96,50 +121,48 @@ class ReplayBuffer:
         self._indices = torch.zeros(batch_size, device=self.device, dtype=torch.long)
 
     def __len__(self) -> int:
+        """Get the total number of transitions currently stored in the buffer."""
         return self.capacity if self._is_full else self._curr_idx
 
     def add_transitions(self, transition: Transition) -> None:
-        # ensure all fields are full
-        full_transition = transition.to_full()
-        # only include transitions that haven't terminated (otherwise next_obs is state after reset)
+        """Add a transition to the buffer."""
+        # Only include transitions that haven't terminated (otherwise next_obs is state after reset)
         # if dones is None, all are valid
-        if full_transition.dones is None:
+        if transition.dones is None:
             valid_idxs = torch.arange(self.num_envs, device=self.device)
         else:
-            valid_idxs = torch.argwhere(~full_transition.dones.view(-1)).flatten()
-        n_valid = len(valid_idxs)
-        if n_valid == 0:
+            valid_idxs = torch.argwhere(~transition.dones.view(-1)).flatten()
+        num_valid = len(valid_idxs)
+        # Exit if no transitions are valid to store
+        if num_valid == 0:
             return
-        buf_idxs = (torch.arange(0, n_valid, device=self.device) + self._curr_idx) % self.capacity
+        # Raise error if buffer is too small to store transitions
+        if num_valid >= self.capacity:
+            raise RuntimeError(
+                f"Cannot store {num_valid} transitions in replay buffer of size {self.capacity}. "
+                "You may need to increase buffer capacity or decrease num_envs."
+            )
 
-        assert n_valid < self.capacity, (
-            f"Cannot store {valid_idxs.shape[0]} transitions in replay buffer of size {self.capacity}. "
-            "You may need to increase buffer capacity or decrease num_envs."
-        )
-
-        self.observations.update_at_(full_transition.observations[valid_idxs].to(self.device), buf_idxs)
-        self.next_observations.update_at_(full_transition.next_observations[valid_idxs].to(self.device), buf_idxs)
-        self.actions.index_copy_(0, buf_idxs, full_transition.actions[valid_idxs].to(self.device))
-        self.rewards.index_copy_(0, buf_idxs, full_transition.rewards[valid_idxs].to(self.device))
-        self.context.index_copy_(0, buf_idxs, full_transition.context[valid_idxs].to(self.device))
-        self.next_terminated.index_copy_(0, buf_idxs, full_transition.next_terminated[valid_idxs].to(self.device))
+        buf_idxs = (torch.arange(0, num_valid, device=self.device) + self._curr_idx) % self.capacity
+        self.observations.update_at_(transition.observations[valid_idxs].to(self.device), buf_idxs)  # type: ignore
+        self.next_observations.update_at_(transition.next_observations[valid_idxs].to(self.device), buf_idxs)  # type: ignore
+        self.actions.index_copy_(0, buf_idxs, transition.actions[valid_idxs].to(self.device))  # type: ignore
+        self.rewards.index_copy_(0, buf_idxs, transition.rewards[valid_idxs].to(self.device))  # type: ignore
+        self.context.index_copy_(0, buf_idxs, transition.context[valid_idxs].to(self.device))  # type: ignore
+        self.next_terminated.index_copy_(0, buf_idxs, transition.next_terminated[valid_idxs].to(self.device))  # type: ignore
 
         # increment the counter
-        self._curr_idx += n_valid
+        self._curr_idx += num_valid
         if self._curr_idx >= self.capacity:
             self._is_full = True
             self._curr_idx -= self.capacity
 
-    def compute_gammas(self, gamma: float) -> None:
-        self.gammas = gamma * (1 - self.next_terminated).float()
-
-    def sample_mini_batch(
-        self, device: str | None = None
-    ) -> tuple[TensorDict, TensorDict, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # sample indices from uniform distribution
+    def sample_mini_batch(self, device: str | None = None) -> Batch:
+        """Randomly sample a mini-batch from the replay buffer."""
+        # Sample indices from uniform distribution
         self._indices.random_(0, len(self))
 
-        return (
+        return ReplayBuffer.Batch(
             self.observations[self._indices].to(device),
             self.next_observations[self._indices].to(device),
             self.actions[self._indices].to(device),

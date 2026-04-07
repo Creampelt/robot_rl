@@ -1,18 +1,16 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Implementation of runners for environment-agent interaction."""
+"""Runners for environment-agent interaction."""
 
-from .on_policy_runner import OnPolicyRunner  # isort:skip
+from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .off_policy_runner import OffPolicyRunner
 from .distillation_runner import DistillationRunner
-from .probe_runner import ProbeRunner
 
 __all__ = [
-    "OnPolicyRunner",
-    "OffPolicyRunner",
     "DistillationRunner",
-    "ProbeRunner",
+    "OffPolicyRunner",
+    "OnPolicyRunner",
 ]

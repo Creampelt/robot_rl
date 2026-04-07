@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import torch
 from abc import abstractmethod
 from collections.abc import Sequence
-
-import torch
 from tensordict import TensorDict
 
 from robot_rl.storage import ExpertBuffer
@@ -99,10 +98,11 @@ class URLVecEnv(VecEnv):
         raise NotImplementedError
 
     @abstractmethod
-    def train(self, is_train: bool = True) -> None:
-        """Set environment to training or evaluation mode, which can affect env events.
+    def train_mode(self) -> None:
+        """Set environment to training mode, which can affect env events."""
+        raise NotImplementedError
 
-        Args:
-            is_train (bool): Whether to set to train mode (True) or evaluation mode (False).
-        """
+    @abstractmethod
+    def eval_mode(self) -> None:
+        """Set environment to eval mode, which can affect env events."""
         raise NotImplementedError

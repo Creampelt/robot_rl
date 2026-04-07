@@ -1,6 +1,6 @@
 [package]
 name="robot_rl"
-version = "2.3.3"
+version = "5.0.1"
 description="HCRL fork of rsl_rl"
 
 [build-system]
@@ -12,10 +12,10 @@ keywords = ["reinforcement-learning", "isaac", "rl-pytorch"]
 readme  = "README.md"
 title = "HCRL fork of rsl_rl"
 author = "Kyle Morgenstein"
-maintainer = "Kyle Morgenstein"
-maintainer_email = "kylem@utexas.edu"
+maintainer = "Emily Sturman"
+maintainer_email = "sturman@utexas.edu"
 license = { text = "BSD-3-Clause" }
-repository = "https://github.com/KyleM73/robot_rl.git"
+repository = "https://github.com/Creampelt/robot_rl.git"
 category = "robotics"
 
 requires-python = ">=3.8"
@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/KyleM73/robot_rl"
+Homepage = "https://github.com/Creampelt/robot_rl"
 
 [tool.setuptools.packages.find]
 where = ["."]
