@@ -478,8 +478,8 @@ def _compute_distance_matrix(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     x_norm = torch.sum(x**2, dim=-1, keepdim=True)
     y_norm = torch.sum(y**2, dim=-1, keepdim=True).transpose(-2, -1)
     mat = x_norm + y_norm - 2 * (x @ y.transpose(-2, -1))
-    # ensure no negative values from numerical imprecision
-    return mat.clamp_(min=0.0)
+    # ensure no negative values from numerical imprecision, then take sqrt for Euclidean distance
+    return mat.clamp_(min=0.0).sqrt_()
 
 
 def compute_emd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

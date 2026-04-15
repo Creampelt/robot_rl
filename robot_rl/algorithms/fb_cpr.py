@@ -288,7 +288,7 @@ class FbCpr:
         # Update from expert buffer
         rollout_idx = step % self.expert_rollout_length
         if rollout_idx == 0 or self.expert_rollout_envs is None or self.expert_rollout_z is None:
-            expert_env_mask = torch.rand(num_envs, device=self.device) > self.expert_rollout_ratio
+            expert_env_mask = torch.rand(num_envs, device=self.device) < self.expert_rollout_ratio
             self.expert_rollout_envs = torch.argwhere(expert_env_mask).flatten()
             num_expert_updates = self.expert_rollout_envs.shape[0]
 
@@ -391,15 +391,18 @@ class FbCpr:
             mini_batch_size = eval_obs.shape[0]
             eval_motions = self.expert_buffer.get_expert_state(eval_obs)
             norm_eval_obs = self.obs_normalizer(eval_obs.view(-1))
-            eval_zs = self.backward_map(norm_eval_obs).view(mini_batch_size, bucket_size, -1)
+            # z at rollout step t encodes the next desired state (frame t+1), matching how the actor is
+            # trained on (obs_t, z=encode(next_obs)) pairs.
+            eval_zs = self.backward_map(norm_eval_obs).view(mini_batch_size, bucket_size, -1)[:, 1:, :]
+            rollout_steps = bucket_size - 1
             eval_zs = pad_to_size(eval_zs, env.num_envs, dim=0)
             # Zero-pad motions to full number of environments (in case batch is truncated)
             first_motions = {k: pad_to_size(v[:, 0, :], env.num_envs, dim=0) for k, v in eval_motions.items()}
             obs, _ = env.reset_to({"articulation": {"robot": first_motions}}, is_relative=True)
             num_joints = first_motions["joint_position"].shape[1]
-            actual_qpos = torch.zeros((mini_batch_size, bucket_size, num_joints), device=self.device)
+            actual_qpos = torch.zeros((mini_batch_size, rollout_steps, num_joints), device=self.device)
             # Run rollouts for each trajectory latent task and save qpos at each step
-            for it in range(bucket_size):
+            for it in range(rollout_steps):
                 obs = self.obs_normalizer(obs)
                 actions = self.actor(obs, eval_zs[:, it, :])
                 # Pad out remaining envs with zeros
@@ -408,12 +411,13 @@ class FbCpr:
                 actual_qpos[:, it, :] = self.expert_buffer.get_expert_state(obs)["joint_position"][:mini_batch_size].to(
                     self.device
                 )
-            # Compute priorities as 2^{4 * emd} where emd is clamped to [0.5, 2.0]
-            eval_qpos = eval_motions["joint_position"]
+            # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
+            # Compare against frames 1..bucket_size-1 since actual_qpos[:, t] is the pose after targeting frame t+1.
+            eval_qpos = eval_motions["joint_position"][:, 1:]
             emds = torch.empty((mini_batch_size,), device=self.device)
             for i in range(mini_batch_size):
                 emds[i] = compute_emd(actual_qpos[i], eval_qpos[i])
-            priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 4)
+            priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
             # Save priorities to expert buffer
             self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
             eval_infos.append({"emd": emds.detach().cpu()})
