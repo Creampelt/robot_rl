@@ -95,4 +95,5 @@ class VecEnv(ABC):
 
     @abstractmethod
     def apply(self, mode: str, env_ids: Sequence[int] | None = None) -> None:
+        """Apply a mode (e.g., ``"train"`` or ``"eval"``) to the specified environments."""
         raise NotImplementedError

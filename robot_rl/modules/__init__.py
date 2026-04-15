@@ -6,7 +6,13 @@
 """Building blocks for neural models."""
 
 from .cnn import CNN
-from .distribution import Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+from .dict_module import DictModule
+from .distribution import (
+    Distribution,
+    GaussianDistribution,
+    HeteroscedasticGaussianDistribution,
+    TruncatedGaussianDistribution,
+)
 from .mlp import MLP
 from .normalization import (
     EmpiricalDiscountedVariationNormalization,
@@ -21,6 +27,7 @@ __all__ = [
     "CNN",
     "MLP",
     "RNN",
+    "DictModule",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
@@ -31,4 +38,5 @@ __all__ = [
     "ParallelLayerNorm",
     "ParallelLinear",
     "ResMLP",
+    "TruncatedGaussianDistribution",
 ]

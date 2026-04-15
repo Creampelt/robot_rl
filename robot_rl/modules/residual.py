@@ -84,12 +84,13 @@ class ResMLP(nn.Sequential):
         Args:
             scales: Scale factor for the weights.
         """
-        for idx, module in enumerate(self):
+        idx = 0
+        for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=get_param(scales, idx))
                 nn.init.zeros_(module.bias)
+                idx += 1
             elif isinstance(module, ParallelLinear):
-                gain = nn.init.calculate_gain(self.activation)
                 weight = module.weight.data
                 n_parallel = weight.size(0)
                 rows = weight.size(1)
@@ -111,8 +112,9 @@ class ResMLP(nn.Sequential):
                 qs = torch.stack(qs, dim=0)
                 with torch.no_grad():
                     weight.view_as(qs).copy_(qs)
-                    weight.mul_(gain)
+                    weight.mul_(get_param(scales, idx))
                 module.bias.data.fill_(0.0)
+                idx += 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the residual MLP."""

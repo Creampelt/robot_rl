@@ -156,7 +156,7 @@ class Logger:
             self.lenbuffer.extend(self.cur_episode_length.cpu().numpy().tolist())
             self.cur_reward_sum[:] = 0
             self.cur_episode_length[:] = 0
-            if self.cfg["algorithm"]["rnd_cfg"]:
+            if self.cfg["algorithm"].get("rnd_cfg", None):
                 self.erewbuffer.extend(self.cur_ereward_sum.cpu().numpy().tolist())
                 self.irewbuffer.extend(self.cur_ireward_sum.cpu().numpy().tolist())
                 self.cur_ereward_sum[:] = 0
@@ -214,7 +214,7 @@ class Logger:
                 self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
 
             # Log performance
-            fps = int(collection_size / (collect_time + learn_time))
+            fps = int(collection_size / iteration_time)
             self.writer.add_scalar("Perf/total_fps", fps, it)
             self.writer.add_scalar("Perf/collection_time", collect_time, it)
             self.writer.add_scalar("Perf/learning_time", learn_time, it)
@@ -223,7 +223,7 @@ class Logger:
 
             # Log rewards and episode length
             if len(self.rewbuffer) > 0:
-                if self.cfg["algorithm"]["rnd_cfg"]:
+                if self.cfg["algorithm"].get("rnd_cfg", None):
                     self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
@@ -260,7 +260,7 @@ class Logger:
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:
-                if self.cfg["algorithm"]["rnd_cfg"]:
+                if self.cfg["algorithm"].get("rnd_cfg", None):
                     log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""

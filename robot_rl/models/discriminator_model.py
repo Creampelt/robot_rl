@@ -35,7 +35,7 @@ class DiscriminatorModel(MLPModel):
         """
         out = super().forward(obs, *args, masks=masks, hidden_state=hidden_state, stochastic_output=stochastic_output)
         if not raw_logits:
-            torch.sigmoid(out)
+            out = torch.sigmoid(out)
         return out
 
 

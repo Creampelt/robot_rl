@@ -36,7 +36,7 @@ class MLP(nn.Sequential):
         activation: str = "elu",
         first_activation: str | None = None,
         last_activation: str | None = None,
-        normalize_input: bool = False,
+        normalize_first_layer: bool = False,
     ) -> None:
         """Initialize the MLP.
 
@@ -47,9 +47,10 @@ class MLP(nn.Sequential):
                 inferred from the input dimension.
             num_parallel: Number of parallel networks. Defaults to 1.
             activation: Activation function.
-            first_activation: Activation function of the first layer. None uses the default model activation.
+            first_activation: Activation function(s) of the first layer. Can also include `"layer_norm"` for a layer
+                norm layer. None uses the default model activation.
             last_activation: Activation function of the last layer. None results in a linear last layer.
-            normalize_input: Whether to normalize the input with LayerNorm.
+            normalize_first_layer: Whether to normalize the first layer output with LayerNorm.
         """
         super().__init__()
 
@@ -66,9 +67,9 @@ class MLP(nn.Sequential):
 
         # Create layers sequentially
         layers = []
-        if normalize_input:
-            layers.append(resolve_layer_norm(input_dim, num_parallel))
         layers.append(resolve_linear(input_dim, hidden_dims_processed[0], num_parallel))
+        if normalize_first_layer:
+            layers.append(resolve_layer_norm(hidden_dims_processed[0], num_parallel))
         layers.append(first_activation_mod)
 
         for layer_index in range(len(hidden_dims_processed) - 1):
@@ -106,7 +107,6 @@ class MLP(nn.Sequential):
                 nn.init.orthogonal_(module.weight, gain=get_param(scales, idx))
                 nn.init.zeros_(module.bias)
             elif isinstance(module, ParallelLinear):
-                # gain = nn.init.calculate_gain(self.activation)
                 weight = module.weight.data
                 n_parallel = weight.size(0)
                 rows = weight.size(1)

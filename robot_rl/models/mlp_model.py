@@ -39,7 +39,10 @@ class MLPModel(nn.Module):
         other_input_dims: Sequence[int] = (),
         hidden_dims: Sequence[int] = (256, 256, 256),
         activation: str = "elu",
+        first_activation: str | None = None,
+        last_activation: str | None = None,
         obs_normalization: bool = False,
+        normalize_first_layer: bool = False,
         distribution_cfg: dict | None = None,
     ) -> None:
         """Initialize the MLP-based model.
@@ -49,9 +52,13 @@ class MLPModel(nn.Module):
             obs_groups: Dictionary mapping observation sets to lists of observation groups.
             obs_set: Observation set to use for this model (e.g., "actor" or "critic").
             output_dim: Dimension of the output.
+            other_input_dims: Dimensions of auxiliary inputs to be concatenated with the observation latent.
             hidden_dims: Hidden dimensions of the MLP.
             activation: Activation function of the MLP.
+            first_activation: Activation function of the first layer. None uses the default model activation.
+            last_activation: Activation function of the last layer. None results in a linear last layer.
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
+            normalize_first_layer: Whether to normalize the first layer output with LayerNorm.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
         """
@@ -81,10 +88,16 @@ class MLPModel(nn.Module):
             mlp_output_dim = output_dim
 
         # MLP
-        self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation=activation)
+        self.mlp = MLP(
+            self._get_latent_dim(),
+            mlp_output_dim,
+            hidden_dims,
+            activation=activation,
+            first_activation=first_activation,
+            last_activation=last_activation,
+            normalize_first_layer=normalize_first_layer,
+        )
 
-        # Initialize MLP weights
-        # self.mlp.init_weights(nn.init.calculate_gain(activation))
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
@@ -131,6 +144,12 @@ class MLPModel(nn.Module):
         if args:
             latent = torch.cat([latent, *args], dim=-1)
         return latent
+
+    def init_weights(self) -> None:
+        """Initialize all MLP weights with orthogonal initialization and re-apply distribution-specific init."""
+        self.mlp.init_weights(1.0)
+        if self.distribution is not None:
+            self.distribution.init_mlp_weights(self.mlp)
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the internal state for recurrent models (no-op)."""

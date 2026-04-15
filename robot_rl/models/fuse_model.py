@@ -8,9 +8,11 @@ from collections.abc import Sequence
 from tensordict import TensorDict
 from typing import Any
 
-from robot_rl.models import MLPModel
-from robot_rl.modules import MLP, Distribution, EmpiricalNormalization, ResMLP
+from robot_rl.modules import MLP, EmpiricalNormalization, ResMLP
+from robot_rl.modules.distribution import Distribution
 from robot_rl.utils import resolve_callable
+
+from .mlp_model import MLPModel
 
 
 class FuseModel(MLPModel):
@@ -30,6 +32,7 @@ class FuseModel(MLPModel):
         first_activation: str | None = "tanh",
         last_activation: str | None = None,
         obs_normalization: bool = False,
+        normalize_first_layer: bool = False,
         distribution_cfg: dict | None = None,
     ) -> None:
         """Initialize the fusion model.
@@ -39,8 +42,6 @@ class FuseModel(MLPModel):
             obs_groups: Dictionary mapping observation sets to list of observation groups.
             obs_set: Observation set to use for this model (e.g. "actor" or "critic").
             input_dims: A sequence of input dimensions, where each input is concatenated with observations.
-            action_dim: Dimension of the action.
-            z_dim: Dimension of the latent task vector.
             output_dim: Dimension of the output.
             embedding_dims: Hidden dimensions of the input embeddings.
             hidden_dims: Hidden dimension of the model trunk.
@@ -49,6 +50,7 @@ class FuseModel(MLPModel):
             first_activation: Activation function of the first layer of the model.
             last_activation: Activation function of the model output.
             obs_normalization: Whether to normalize the observations before feeding them to the model.
+            normalize_first_layer: Whether to normalize the output of the first layer with LayerNorm.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
         """
@@ -82,7 +84,13 @@ class FuseModel(MLPModel):
         # construct modules for each embedding term
         self.embeddings = nn.ModuleList([
             self._make_embedding(
-                self.obs_dim + dim, embedding_output_dim, embedding_dims, num_parallel, activation, first_activation
+                self.obs_dim + dim,
+                embedding_output_dim,
+                embedding_dims,
+                num_parallel,
+                activation,
+                first_activation,
+                normalize_first_layer,
             )
             for dim in input_dims
         ])
@@ -98,7 +106,21 @@ class FuseModel(MLPModel):
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.trunk)
 
-    def forward(self, obs: TensorDict, *args: torch.Tensor, stochastic_output: bool = False) -> torch.Tensor:
+    def init_weights(self) -> None:
+        """Initialize all MLP weights with orthogonal initialization and re-apply distribution-specific init."""
+        for emb in self.embeddings:
+            emb.init_weights(1.0)
+        self.trunk.init_weights(1.0)
+        if self.distribution is not None:
+            self.distribution.init_mlp_weights(self.trunk)
+
+    def forward(
+        self,
+        obs: TensorDict,
+        *args: torch.Tensor,
+        stochastic_output: bool = False,
+        std_clip: float | None = None,
+    ) -> torch.Tensor:
         """Forward pass of the fuse model.
 
         ..note::
@@ -120,7 +142,7 @@ class FuseModel(MLPModel):
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(trunk_output)
-                return self.distribution.sample()
+                return self.distribution.sample(std_clip=std_clip)
             return self.distribution.deterministic_output(trunk_output)
         return trunk_output
 
@@ -157,6 +179,7 @@ class FuseModel(MLPModel):
         num_parallel: int,
         activation: str,
         first_activation: str | None,
+        normalize_first_layer: bool,
     ) -> nn.Module:
         return MLP(
             input_dim,
@@ -166,7 +189,7 @@ class FuseModel(MLPModel):
             activation,
             first_activation=first_activation,
             last_activation=activation,
-            normalize_input=True,
+            normalize_first_layer=normalize_first_layer,
         )
 
     def _make_trunk(
@@ -198,6 +221,7 @@ class ResidualFuseModel(FuseModel):
         first_activation: str | None = None,
         last_activation: str | None = None,
         obs_normalization: bool = False,
+        normalize_first_layer: bool = False,
         distribution_cfg: dict | None = None,
     ) -> None:
         """Initialize the residual fusion model.
@@ -207,16 +231,16 @@ class ResidualFuseModel(FuseModel):
             obs_groups: Dictionary mapping observation sets to list of observation groups.
             obs_set: Observation set to use for this model (e.g. "actor" or "critic").
             input_dims: A sequence of input dimensions, where each input is concatenated with observations.
-            action_dim: Dimension of the action.
-            z_dim: Dimension of the latent task vector.
             output_dim: Dimension of the output.
             embedding_dims: Hidden dimensions of the input embeddings.
             hidden_dims: Hidden dimension of the model trunk.
             num_parallel: Number of parallel networks.
             activation: Activation function of the model.
-            first_activation: Activation function of the first layer of the model.
+            first_activation: Activation function of the first layer of the model (no-op for residual model).
             last_activation: Activation function of the model output.
             obs_normalization: Whether to normalize the observations before feeding them to the model.
+            normalize_first_layer: Whether to normalize the output of the first layer with LayerNorm (no-op for
+                residual model).
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
         """
@@ -234,6 +258,7 @@ class ResidualFuseModel(FuseModel):
             first_activation,
             last_activation,
             obs_normalization,
+            normalize_first_layer,
             distribution_cfg,
         )
 
@@ -245,9 +270,12 @@ class ResidualFuseModel(FuseModel):
         num_parallel: int,
         activation: str,
         first_activation: str | None,
+        normalize_first_layer: bool,
     ) -> nn.Module:
         if first_activation is not None:
             warnings.warn(f"First activation '{first_activation}' will be ignored for residual embedding.")
+        if normalize_first_layer:
+            warnings.warn("normalize_first_layer is True, but will be ignored for residual embedding.")
         return ResMLP(
             input_dim,
             output_dim,

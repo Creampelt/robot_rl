@@ -6,11 +6,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import math
 import pkgutil
 import torch
+import torch.nn as nn
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from datetime import timedelta
 from string import Template
 from tensordict import TensorDict
@@ -39,11 +42,27 @@ def get_param(param: Any, idx: int) -> Any:
         return param
 
 
+@contextlib.contextmanager
+def eval_mode(*modules: nn.Module) -> Generator[None, None, None]:
+    """Context manager that temporarily switches modules to eval mode.
+
+    On exit, each module is restored to its previous training state.
+    """
+    prev_states = [m.training for m in modules]
+    try:
+        for m in modules:
+            m.eval()
+        yield
+    finally:
+        for m, was_training in zip(modules, prev_states, strict=True):
+            m.train(was_training)
+
+
 def resolve_nn_activation(act_name: str) -> torch.nn.Module:
     """Resolve the activation function from the name.
 
     Valid activation function names are: ``"elu"``, ``"selu"``, ``"relu"``, ``"crelu"``, ``"lrelu"``, ``"tanh"``,
-    ``"sigmoid"``, ``"softplus"``, ``"gelu"``, ``"swish"``, ``"mish"``, ``"identity"``.
+    ``"sigmoid"``, ``"softplus"``, ``"gelu"``, ``"swish"``, ``"mish"``, ``"ball_norm"``, ``"identity"``.
 
     Args:
         act_name: Name of the activation function.
@@ -66,6 +85,7 @@ def resolve_nn_activation(act_name: str) -> torch.nn.Module:
         "gelu": torch.nn.GELU(),
         "swish": torch.nn.SiLU(),
         "mish": torch.nn.Mish(),
+        "ball_norm": _BallNorm(),
         "identity": torch.nn.Identity(),
     }
 
@@ -541,8 +561,18 @@ def soft_update_params(
 
         \theta' \leftarrow \tau \theta + (1 - \tau) \theta'
 
+    where :math:`\theta` are the online parameters and :math:`\theta'` are the target parameters. A small ``tau``
+    (e.g. 0.01) produces a slow-moving target network.
+
     Reference:
     - Lillicrap et al. "Continuous control with deep reinforcement learning." arXiv preprint arXiv:1509.02971 (2019).
     """
-    torch._foreach_mul_(target_params, tau)
-    torch._foreach_add_(target_params, params, alpha=(1 - tau))
+    torch._foreach_mul_(target_params, 1.0 - tau)
+    torch._foreach_add_(target_params, params, alpha=tau)
+
+
+class _BallNorm(nn.Module):
+    """Ball norm."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return math.sqrt(x.shape[-1]) * nn.functional.normalize(x, dim=-1)

@@ -104,7 +104,7 @@ class CNNModel(MLPModel):
         else:
             self.cnns = nn.ModuleDict(cnns)
 
-    def get_latent(self, obs: TensorDict, *args: torch.Tensor, **kwargs) -> torch.Tensor:
+    def get_latent(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Build the model latent by combining normalized 1D and CNN-encoded 2D observation groups."""
         # Concatenate 1D observation groups and normalize
         latent_1d = super().get_latent(obs)

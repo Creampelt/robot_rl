@@ -51,7 +51,7 @@ class TrajectoryBuffer(ExpertBuffer):
             self.motions[ep_indices, seq_indices + 1].to(device),
         )
 
-    def sample_states(self, num_envs: int) -> dict[str, torch.Tensor]:
+    def sample_states(self, num_envs: int, device: str | None = None) -> dict[str, torch.Tensor]:
         """Sample states for a vectorized environment. Returns a state dictionary.
 
         See :meth:`get_expert_state` for full state dictionary format.
@@ -59,7 +59,7 @@ class TrajectoryBuffer(ExpertBuffer):
         ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
         motion_indices = torch.randint(0, self.bucket_size, (num_envs,), device=self.device)
         motions = self.motions[ep_indices, motion_indices]
-        return self.get_expert_state(motions)
+        return self.get_expert_state(motions, device=device)
 
     def get_batch_motions(
         self,
@@ -71,12 +71,11 @@ class TrajectoryBuffer(ExpertBuffer):
         Returns iterator containing batched observations as TensorDict with shape (mini_batch_size, bucket_size,
         *obs_size). Note that the final batch may be truncated.
         """
-        # randomize order since rigid body DR is fixed per-environment
+        # Randomize order since rigid body DR is fixed per-environment
         self._eval_order = torch.randperm(self.num_motions, device=self.device)
         for idx in range(0, self.num_motions, mini_batch_size):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
-            motions = self.motions[eval_idxs].to(device)
-            yield motions
+            yield self.motions[eval_idxs].to(device)
 
     def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:
         """Update a slice of priorities. Assumes :meth:`get_batch_motions` has already been called."""
@@ -87,7 +86,7 @@ class TrajectoryBuffer(ExpertBuffer):
         """Normalize all priorities by dividing by their sum."""
         self.priorities /= self.priorities.sum()
 
-    def get_expert_state(self, obs: TensorDict) -> dict[str, torch.Tensor]:
+    def get_expert_state(self, obs: TensorDict, device: str | None = None) -> dict[str, torch.Tensor]:
         """Convert the observations TensorDict into a state dictionary of tensors.
 
         Dictionary structure and tensor shapes are:
@@ -102,7 +101,7 @@ class TrajectoryBuffer(ExpertBuffer):
             }
         """
         obs_list = [obs[obs_group] for obs_group in self.obs_groups]
-        state = torch.cat(obs_list, dim=-1)
+        state = torch.cat(obs_list, dim=-1).to(device)
         num_joints = (state.shape[-1] - 13) // 2
         return {
             "root_pose": state[..., :7],

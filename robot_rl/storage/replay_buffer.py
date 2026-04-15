@@ -34,7 +34,7 @@ class ReplayBuffer:
             """Rewards received after the action."""
 
             self.dones: torch.Tensor | None = None
-            """Done flags indicating episode termination at the current step."""
+            """Done flags indicating episode termination or timeout at the current step."""
 
             self.context: torch.Tensor | None = None
             """Latent context (z) vectors at the current step."""
@@ -42,7 +42,7 @@ class ReplayBuffer:
             self.next_observations: TensorDict | None = None
             """Observations after the current step."""
 
-            self.next_dones: torch.Tensor | None = None
+            self.next_terminated: torch.Tensor | None = None
             """Done flags indicating episode termination after the current step."""
 
         def clear(self) -> None:
@@ -149,7 +149,9 @@ class ReplayBuffer:
         self.actions.index_copy_(0, buf_idxs, transition.actions[valid_idxs].to(self.device))  # type: ignore
         self.rewards.index_copy_(0, buf_idxs, transition.rewards[valid_idxs].to(self.device))  # type: ignore
         self.context.index_copy_(0, buf_idxs, transition.context[valid_idxs].to(self.device))  # type: ignore
-        self.next_terminated.index_copy_(0, buf_idxs, transition.next_terminated[valid_idxs].to(self.device))  # type: ignore
+        self.next_terminated.index_copy_(
+            0, buf_idxs, transition.next_terminated[valid_idxs].to(self.device).unsqueeze(-1)
+        )  # type: ignore
 
         # increment the counter
         self._curr_idx += num_valid

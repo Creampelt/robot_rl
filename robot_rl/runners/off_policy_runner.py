@@ -242,34 +242,34 @@ class OffPolicyRunner:
 
     def _configure_multi_gpu(self) -> None:
         """Configure multi-gpu training."""
-        # check if distributed training is enabled
+        # Check if distributed training is enabled
         self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.is_distributed = self.gpu_world_size > 1
 
-        # if not distributed training, set local and global rank to 0 and return
+        # If not distributed training, set local and global rank to 0 and return
         if not self.is_distributed:
             self.gpu_local_rank = 0
             self.gpu_global_rank = 0
-            self.multi_gpu_cfg = None
+            self.cfg["multi_gpu"] = None
             return
 
-        # get rank and world size
+        # Get rank and world size
         self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.gpu_global_rank = int(os.getenv("RANK", "0"))
 
-        # make a configuration dictionary
-        self.multi_gpu_cfg = {
-            "global_rank": self.gpu_global_rank,  # rank of the main process
-            "local_rank": self.gpu_local_rank,  # rank of the current process
-            "world_size": self.gpu_world_size,  # total number of processes
+        # Make a configuration dictionary
+        self.cfg["multi_gpu"] = {
+            "global_rank": self.gpu_global_rank,  # Rank of the main process
+            "local_rank": self.gpu_local_rank,  # Rank of the current process
+            "world_size": self.gpu_world_size,  # Total number of processes
         }
 
-        # check if user has a device specified for local rank
+        # Check if user has device specified for local rank
         if self.device != f"cuda:{self.gpu_local_rank}":
             raise ValueError(
                 f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
             )
-        # validate multi-gpu configuration
+        # Validate multi-GPU configuration
         if self.gpu_local_rank >= self.gpu_world_size:
             raise ValueError(
                 f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
@@ -279,7 +279,7 @@ class OffPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        # initialize torch distributed
+        # Initialize torch distributed
         torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
-        # set device to the local rank
+        # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)

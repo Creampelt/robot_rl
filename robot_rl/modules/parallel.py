@@ -38,7 +38,7 @@ class ParallelLinear(nn.Module):
     def extra_repr(self) -> str:
         """Return the extra representation of the module."""
         return (
-            f"in_features={self.input_dim}, out_features={self.output_dim}, num_parallel={self.num_parallel}, "
+            f"in_features={self.in_features}, out_features={self.out_features}, num_parallel={self.num_parallel}, "
             f"bias={self.bias is not None}"
         )
 
