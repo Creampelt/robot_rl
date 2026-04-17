@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import gc
+import contextlib
 import os
 import time
 import torch
@@ -77,96 +77,148 @@ class OffPolicyRunner:
         learn_time = 0.0
         z: torch.Tensor | None = None
         last_dones: torch.Tensor | None = None
-        for it in range(start_it, total_it):
-            with torch.inference_mode():
-                # Run evaluation
-                eval_extras = None
-                if (it - start_it) % self.cfg["eval_interval"] == 0:
-                    # Save and clear all logging buffers (environments will reset after eval)
-                    self.logger.reset_all_envs()
+
+        with self._get_profile_context() as prof:
+            for it in range(start_it, total_it):
+                with torch.inference_mode(), torch.profiler.record_function("rollout"):
                     # Run evaluation
+                    eval_extras = None
+                    if (it - start_it) % self.cfg["eval_interval"] == 0:
+                        # Save and clear all logging buffers (environments will reset after eval)
+                        self.logger.reset_all_envs()
+                        # Run evaluation
+                        start = time.time()
+                        with torch.profiler.record_function("eval"):
+                            eval_extras = self.alg.eval(self.env)
+                        stop = time.time()
+                        eval_time += stop - start
+
+                        # reset env and training variables
+                        obs, _ = self.env.reset()
+                        obs = obs.to(self.device)
+                        last_dones = None
+                        cur_episode_length[:] = 0
+
+                    # Rollout
                     start = time.time()
-                    eval_extras = self.alg.eval(self.env)
+                    is_seed = it <= self.cfg["num_seed_steps_per_env"] + start_it
+                    # Update latent z
+                    z = self.alg.update_rollout_z(z, cur_episode_length, self.env.num_envs)
+                    # Sample actions
+                    actions = self.alg.act(
+                        obs, z, last_dones, random_sample=is_seed, clip_actions=self.cfg["clip_actions"]
+                    )
+                    # Step the environment
+                    with torch.profiler.record_function("env_step"):
+                        obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    # Check for NaN values from the environment
+                    if self.cfg.get("check_for_nan", True):
+                        check_nan(obs, rewards, dones)
+                    # Move to device
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Process the step
+                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    # Update episode length and last dones
+                    cur_episode_length += 1
+                    new_ids = (dones > 0).nonzero(as_tuple=False)
+                    cur_episode_length[new_ids] = 0
+                    last_dones = dones
+
+                    # Update timer
                     stop = time.time()
-                    eval_time += stop - start
+                    collect_time += stop - start
+                    start = stop
 
-                    # reset env and training variables
-                    obs, _ = self.env.reset()
-                    obs = obs.to(self.device)
-                    last_dones = None
-                    cur_episode_length[:] = 0
+                loss_extras: list[dict] = []
+                algo_extras: list[dict] = []
+                if not is_seed and it % self.cfg["num_steps_per_env"] == 0:
+                    with torch.inference_mode():
+                        self.alg.compute_gammas()
 
-                # Rollout
-                start = time.time()
-                is_seed = it <= self.cfg["num_seed_steps_per_env"] + start_it
-                # Update latent z
-                z = self.alg.update_rollout_z(z, cur_episode_length, self.env.num_envs)
-                # Sample actions
-                actions = self.alg.act(obs, z, last_dones, random_sample=is_seed, clip_actions=self.cfg["clip_actions"])
-                # Step the environment
-                obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                # Check for NaN values from the environment
-                if self.cfg.get("check_for_nan", True):
-                    check_nan(obs, rewards, dones)
-                # Move to device
-                obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                # Process the step
-                self.alg.process_env_step(obs, rewards, dones, extras)
-                # Update episode length and last dones
-                cur_episode_length += 1
-                new_ids = (dones > 0).nonzero(as_tuple=False)
-                cur_episode_length[new_ids] = 0
-                last_dones = dones
+                    # Update policy
+                    with torch.profiler.record_function("update"):
+                        for _ in range(self.cfg["num_agent_updates"]):
+                            loss_dict, algo_dict = self.alg.update()
+                            loss_extras.append(loss_dict)
+                            algo_extras.append(algo_dict)
+                    # gc.collect()
 
-                # Update timer
-                stop = time.time()
-                collect_time += stop - start
-                start = stop
-
-            loss_extras: list[dict] = []
-            algo_extras: list[dict] = []
-            if not is_seed and it % self.cfg["num_steps_per_env"] == 0:
-                with torch.inference_mode():
-                    self.alg.compute_gammas()
-
-                # Update policy
-                for _ in range(self.cfg["num_agent_updates"]):
-                    loss_dict, algo_dict = self.alg.update()
-                    loss_extras.append(loss_dict)
-                    algo_extras.append(algo_dict)
-                gc.collect()
-
-            # Book keeping
-            self.logger.process_env_step(
-                rewards, dones, extras, eval_extras=eval_extras, loss_extras=loss_extras, algo_extras=algo_extras
-            )
-
-            stop = time.time()
-            learn_time += stop - start
-            self.current_learning_iteration = it
-
-            # Log information
-            if it % self.cfg["log_interval"] == 0:
-                self.logger.log(
-                    it=it,
-                    start_it=start_it,
-                    total_it=total_it,
-                    collect_time=collect_time,
-                    learn_time=learn_time,
-                    eval_time=eval_time,
+                # Book keeping
+                self.logger.process_env_step(
+                    rewards, dones, extras, eval_extras=eval_extras, loss_extras=loss_extras, algo_extras=algo_extras
                 )
-                eval_time = 0.0
-                collect_time = 0.0
-                learn_time = 0.0
 
-            # Save model
-            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+                stop = time.time()
+                learn_time += stop - start
+                self.current_learning_iteration = it
+
+                # Log information
+                if it % self.cfg["log_interval"] == 0:
+                    self.logger.log(
+                        it=it,
+                        start_it=start_it,
+                        total_it=total_it,
+                        collect_time=collect_time,
+                        learn_time=learn_time,
+                        eval_time=eval_time,
+                    )
+                    eval_time = 0.0
+                    collect_time = 0.0
+                    learn_time = 0.0
+
+                # Save model
+                if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
+                    self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+
+                if prof is not None:
+                    prof.step()
 
         # Save the final model after training and stop the logging writer
         if self.logger.writer is not None:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
             self.logger.stop_logging_writer()
+
+    def _get_profile_context(self) -> contextlib.AbstractContextManager[torch.profiler.profile | None]:
+        """Build a profiler context manager.
+
+        Returns a :class:`contextlib.nullcontext` (yielding ``None``) if ``cfg["profile"]`` is False, otherwise a
+        :class:`torch.profiler.profile` configured from the ``profile_*`` cfg entries.
+        """
+        if not self.cfg.get("profile", False):
+            return contextlib.nullcontext()
+        profile_wait = self.cfg.get("profile_wait", 15)
+        profile_warmup = self.cfg.get("profile_warmup", 2)
+        profile_active = self.cfg.get("profile_active", 3)
+        profile_dir = os.path.join(self.logger.log_dir, "profile") if self.logger.log_dir else "profile"
+        logger = self.logger
+
+        def _on_trace_ready(prof: torch.profiler.profile) -> None:
+            os.makedirs(profile_dir, exist_ok=True)
+            trace_path = os.path.join(profile_dir, "trace.json")
+            summary_path = os.path.join(profile_dir, "summary.txt")
+            prof.export_chrome_trace(trace_path)
+            summary = prof.key_averages().table(sort_by="cuda_time_total", row_limit=40)
+            with open(summary_path, "w") as f:
+                f.write(summary)
+            print(f"[PROFILE] Trace exported to {trace_path}")
+            print(summary)
+            writer = getattr(logger, "writer", None)
+            if writer is not None and hasattr(writer, "save_file"):
+                writer.save_file(trace_path)
+                writer.save_file(summary_path)
+                print("[PROFILE] Trace and summary uploaded to logger.")
+
+        print(
+            f"[PROFILE] Will record {profile_active} iters after {profile_wait} wait + {profile_warmup} warmup."
+            f" Output dir: {profile_dir}"
+        )
+        return torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=profile_wait, warmup=profile_warmup, active=profile_active, repeat=1),
+            on_trace_ready=_on_trace_ready,
+            record_shapes=False,
+            with_stack=False,
+        )
 
     def save(self, path: str, infos: dict | None = None) -> None:
         """Save the models and training state to a given path and upload them if external logging is used."""

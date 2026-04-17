@@ -5,6 +5,21 @@ from tensordict import TensorDict
 from .expert_buffer import ExpertBuffer
 
 
+def _get_idxs(
+    priorities: torch.Tensor,
+    num_slices: int,
+    seq_length: int,
+    bucket_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate ``(episode, frame)`` indices for sampling consecutive windows from a trajectory buffer."""
+    ep_indices = torch.multinomial(priorities, num_slices, replacement=True)
+    starts = torch.randint(0, bucket_size - seq_length, (num_slices,), device=priorities.device)
+    offsets = torch.arange(seq_length, device=priorities.device)
+    seq_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+    ep_flat = ep_indices.unsqueeze(1).expand(num_slices, seq_length).reshape(-1)
+    return ep_flat, seq_indices
+
+
 class TrajectoryBuffer(ExpertBuffer):
     """Subclass of :class:`ExpertBuffer` that stores expert observations in batches of fixed-length trajectories."""
 
@@ -28,6 +43,8 @@ class TrajectoryBuffer(ExpertBuffer):
         self.num_motions, self.bucket_size = self.motions.shape
         self.priorities = torch.ones((self.num_motions,), device=device)
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
+
+        self._get_idxs = torch.compile(_get_idxs, mode="reduce-overhead")
 
         print(f"[INFO] Successfully loaded {self.num_motions} motions with length {self.bucket_size}.")
 
@@ -58,13 +75,7 @@ class TrajectoryBuffer(ExpertBuffer):
         if seq_length >= self.bucket_size:
             raise ValueError(f"seq_length ({seq_length}) must be less than bucket_size ({self.bucket_size}).")
         num_slices = batch_size // seq_length
-        # sample one motion per slice according to priorities
-        ep_indices = torch.multinomial(self.priorities, num_slices, replacement=True)
-        # sample a starting frame per slice such that start + seq_length <= bucket_size - 1
-        starts = torch.randint(0, self.bucket_size - seq_length, (num_slices,), device=self.device)
-        offsets = torch.arange(seq_length, device=self.device)
-        seq_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
-        ep_flat = ep_indices.unsqueeze(1).expand(num_slices, seq_length).reshape(-1)
+        ep_flat, seq_indices = self._get_idxs(self.priorities, num_slices, seq_length, self.bucket_size)
         return (
             self.motions[ep_flat, seq_indices].to(device),
             self.motions[ep_flat, seq_indices + 1].to(device),

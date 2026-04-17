@@ -99,6 +99,7 @@ class FbCpr:
         batch_size: int = 1024,
         device: str = "cpu",
         dtype: str = "float32",
+        compile_mode: str | None = "reduce-overhead",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs: Any,
@@ -144,23 +145,27 @@ class FbCpr:
         self._target_disc_critic_paramlist = tuple(x.data for x in self.target_disc_critic.parameters())
         self._target_aux_critic_paramlist = tuple(x.data for x in self.target_aux_critic.parameters())
 
-        # Create the optimizers
+        # Create the optimizers. Adam/AdamW support a fused CUDA kernel that collapses the per-parameter
+        # _foreach_add_/_foreach_mul_ ops into a single launch — noticeable speedup at 16 updates/iter.
         optimizer_cls = resolve_optimizer(optimizer)
-        self.actor_optimizer = optimizer_cls(self.actor.parameters(), lr=actor_learning_rate, weight_decay=weight_decay)
+        optimizer_kwargs: dict[str, Any] = {"weight_decay": weight_decay}
+        if optimizer.lower() in ("adam", "adamw"):
+            optimizer_kwargs["fused"] = True
+        self.actor_optimizer = optimizer_cls(self.actor.parameters(), lr=actor_learning_rate, **optimizer_kwargs)
         self.forward_optimizer = optimizer_cls(
-            self.forward_map.parameters(), lr=forward_learning_rate, weight_decay=weight_decay
+            self.forward_map.parameters(), lr=forward_learning_rate, **optimizer_kwargs
         )
         self.backward_optimizer = optimizer_cls(
-            self.backward_map.parameters(), lr=backward_learning_rate, weight_decay=weight_decay
+            self.backward_map.parameters(), lr=backward_learning_rate, **optimizer_kwargs
         )
         self.disc_critic_optimizer = optimizer_cls(
-            self.disc_critic.parameters(), lr=disc_critic_learning_rate, weight_decay=weight_decay
+            self.disc_critic.parameters(), lr=disc_critic_learning_rate, **optimizer_kwargs
         )
         self.aux_critic_optimizer = optimizer_cls(
-            self.aux_critic.parameters(), lr=aux_critic_learning_rate, weight_decay=weight_decay
+            self.aux_critic.parameters(), lr=aux_critic_learning_rate, **optimizer_kwargs
         )
         self.discriminator_optimizer = optimizer_cls(
-            self.discriminator.parameters(), lr=discriminator_learning_rate, weight_decay=weight_decay
+            self.discriminator.parameters(), lr=discriminator_learning_rate, **optimizer_kwargs
         )
 
         # Add storage
@@ -207,6 +212,17 @@ class FbCpr:
         # Precompute useful variables
         self._off_diag = 1 - torch.eye(batch_size, batch_size, device=self.device)
         self._off_diag_sum = self._off_diag.sum()
+
+        # Apply torch.compile to hot-path methods
+        if compile_mode is not None:
+            # _sample_mixed_z skipped: upstream Inductor joint_graph pattern-matcher bug
+            # TODO: once bug is fixed, re-enable this
+            self._encode_expert = torch.compile(self._encode_expert, mode=compile_mode, fullgraph=True)
+            self._update_discriminator = torch.compile(self._update_discriminator, mode=compile_mode)
+            self._update_forward_backward = torch.compile(self._update_forward_backward, mode=compile_mode)
+            self._update_disc_critic = torch.compile(self._update_disc_critic, mode=compile_mode)
+            self._update_aux_critic = torch.compile(self._update_aux_critic, mode=compile_mode)
+            self._update_actor = torch.compile(self._update_actor, mode=compile_mode)
 
     @property
     def models(self) -> list[MLPModel]:
@@ -288,9 +304,9 @@ class FbCpr:
         # Update from expert buffer
         rollout_idx = step % self.expert_rollout_length
         if rollout_idx == 0 or self.expert_rollout_envs is None or self.expert_rollout_z is None:
-            expert_env_mask = torch.rand(num_envs, device=self.device) < self.expert_rollout_ratio
-            self.expert_rollout_envs = torch.argwhere(expert_env_mask).flatten()
-            num_expert_updates = self.expert_rollout_envs.shape[0]
+            # Use constant num_expert_updates to avoid torch recompile
+            num_expert_updates = int(num_envs * self.expert_rollout_ratio)
+            self.expert_rollout_envs = torch.randperm(num_envs, device=self.device)[:num_expert_updates]
 
             _, expert_next_obs = self.expert_buffer.sample(
                 num_expert_updates * self.expert_rollout_length,
@@ -643,7 +659,6 @@ class FbCpr:
         """Project ``z`` onto the sphere of radius ``sqrt(z_dim)``."""
         return math.sqrt(z.shape[-1]) * nn.functional.normalize(z, dim=-1)
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True)
     @torch.no_grad()
     def _sample_mixed_z(self, goal_obs: TensorDict, expert_z: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -666,7 +681,6 @@ class FbCpr:
 
         return z
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True)
     @torch.no_grad()
     def _encode_expert(self, obs: TensorDict) -> torch.Tensor:
         expert_z = self.backward_map(obs).view(-1, self.expert_sequence_length, self.z_dim).mean(dim=1)
@@ -685,7 +699,6 @@ class FbCpr:
         soft_update_params(self._disc_critic_paramlist, self._target_disc_critic_paramlist, self.critic_tau)
         soft_update_params(self._aux_critic_paramlist, self._target_aux_critic_paramlist, self.critic_tau)
 
-    @torch.compile(mode="reduce-overhead")
     def _update_discriminator(
         self, batch: ReplayBuffer.Batch, expert_obs: TensorDict, expert_z: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], dict]:
@@ -724,7 +737,6 @@ class FbCpr:
 
         return loss_dict, {}
 
-    @torch.compile(mode="reduce-overhead")
     def _update_forward_backward(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             # Forward-Backward loss
@@ -809,7 +821,6 @@ class FbCpr:
 
         return loss_dict, extras
 
-    @torch.compile(mode="reduce-overhead")
     def _update_disc_critic(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             with torch.no_grad():
@@ -853,7 +864,6 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
-    @torch.compile(mode="reduce-overhead")
     def _update_aux_critic(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             with torch.no_grad():
@@ -893,7 +903,6 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
-    @torch.compile(mode="reduce-overhead")
     def _update_actor(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             actions = self.actor(
