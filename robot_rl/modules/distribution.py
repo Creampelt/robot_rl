@@ -358,12 +358,32 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         clamped_x = torch.clamp(x, self._low + self._eps, self._high - self._eps)
         return x - x.detach() + clamped_x.detach()
 
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Extract the mean from the MLP output, clamped to the truncation bounds."""
+        return torch.clamp(mlp_output, self._low + self._eps, self._high - self._eps)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Return an export-friendly module that returns the MLP output clamped to the truncation bounds."""
+        return _ClampedDeterministicOutput(self._low + self._eps, self._high - self._eps)
+
 
 class _IdentityDeterministicOutput(nn.Module):
     """Exportable module that returns the MLP output as is."""
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
         return mlp_output
+
+
+class _ClampedDeterministicOutput(nn.Module):
+    """Exportable module that returns the MLP output clamped to ``[low, high]``."""
+
+    def __init__(self, low: float, high: float) -> None:
+        super().__init__()
+        self.low = low
+        self.high = high
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(mlp_output, self.low, self.high)
 
 
 class _MeanSliceDeterministicOutput(nn.Module):

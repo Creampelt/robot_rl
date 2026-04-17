@@ -31,24 +31,43 @@ class TrajectoryBuffer(ExpertBuffer):
 
         print(f"[INFO] Successfully loaded {self.num_motions} motions with length {self.bucket_size}.")
 
-    def sample(self, batch_size: int, device: str | None = None) -> tuple[TensorDict, TensorDict]:
+    def sample(
+        self,
+        batch_size: int,
+        device: str | None = None,
+        seq_length: int = 1,
+    ) -> tuple[TensorDict, TensorDict]:
         """Sample current and next expert observations from multinomial distribution weighted by priorities.
 
+        When ``seq_length > 1``, samples are returned as ``batch_size // seq_length`` consecutive windows, each of
+        length ``seq_length``, drawn from a single motion starting at a random frame. The flat output is ordered so
+        that reshaping ``(batch_size, ...) -> (num_slices, seq_length, ...)`` recovers the windows row-wise. With
+        ``seq_length = 1`` behavior is equivalent to iid transition sampling.
+
         Args:
-            batch_size: The batch size to sample.
+            batch_size: The batch size to sample. Must be divisible by ``seq_length``.
             device: The device to move the output to. Defaults to None, which keeps the observations on the buffer's
                 device.
+            seq_length: Length of each consecutive window. Must be strictly less than ``bucket_size``.
 
         Returns:
             A tuple containing the expert obs and next obs as TensorDicts. Shape is (batch_size).
         """
-        # sample episodes according to priorities
-        ep_indices = torch.multinomial(self.priorities, batch_size, replacement=True)
-        # uniformly sample from sequence (exclude last so there will always be a next obs)
-        seq_indices = torch.randint(0, self.bucket_size - 1, (batch_size,), device=self.device)
+        if batch_size % seq_length != 0:
+            raise ValueError(f"batch_size ({batch_size}) must be divisible by seq_length ({seq_length}).")
+        if seq_length >= self.bucket_size:
+            raise ValueError(f"seq_length ({seq_length}) must be less than bucket_size ({self.bucket_size}).")
+        num_slices = batch_size // seq_length
+        # sample one motion per slice according to priorities
+        ep_indices = torch.multinomial(self.priorities, num_slices, replacement=True)
+        # sample a starting frame per slice such that start + seq_length <= bucket_size - 1
+        starts = torch.randint(0, self.bucket_size - seq_length, (num_slices,), device=self.device)
+        offsets = torch.arange(seq_length, device=self.device)
+        seq_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+        ep_flat = ep_indices.unsqueeze(1).expand(num_slices, seq_length).reshape(-1)
         return (
-            self.motions[ep_indices, seq_indices].to(device),
-            self.motions[ep_indices, seq_indices + 1].to(device),
+            self.motions[ep_flat, seq_indices].to(device),
+            self.motions[ep_flat, seq_indices + 1].to(device),
         )
 
     def sample_states(self, num_envs: int, device: str | None = None) -> dict[str, torch.Tensor]:

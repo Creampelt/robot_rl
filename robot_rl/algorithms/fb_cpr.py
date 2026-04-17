@@ -295,6 +295,7 @@ class FbCpr:
             _, expert_next_obs = self.expert_buffer.sample(
                 num_expert_updates * self.expert_rollout_length,
                 device=self.device,
+                seq_length=self.expert_rollout_length,
             )
             with eval_mode(self.obs_normalizer):
                 expert_next_obs = self.obs_normalizer(expert_next_obs)
@@ -308,7 +309,9 @@ class FbCpr:
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         """Run optimization epochs over stored batches and return mean losses."""
         batch = self.replay_buffer.sample_mini_batch(self.device)
-        expert_obs, expert_next_obs = self.expert_buffer.sample(self.batch_size, self.device)
+        expert_obs, expert_next_obs = self.expert_buffer.sample(
+            self.batch_size, self.device, seq_length=self.expert_sequence_length
+        )
 
         # Update normalizer running statistics from training data
         self.obs_normalizer(batch.observations)
@@ -521,6 +524,13 @@ class FbCpr:
         # Resolve observation groups
         default_sets = ["actor", "critic", "backward", "discriminator", "expert"]
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
+
+        # Match TruncatedGaussianDistribution bounds with clip_action bounds.
+        actor_dist_cfg = cfg["actor"].get("distribution_cfg")
+        if actor_dist_cfg is not None and actor_dist_cfg.get("class_name") == "TruncatedGaussianDistribution":
+            clip_actions = cfg["clip_actions"]
+            actor_dist_cfg["low"] = -clip_actions
+            actor_dist_cfg["high"] = clip_actions
 
         # Initialize the policy
         z_dim = cfg["algorithm"]["z_dim"]
