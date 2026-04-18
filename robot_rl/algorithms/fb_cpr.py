@@ -245,7 +245,7 @@ class FbCpr:
         clip_actions: float | None = None,
     ) -> torch.Tensor:
         """Sample actions and store transition data."""
-        # Normalize observations (eval mode: use running stats, don't update them)
+        # Normalize observations
         with eval_mode(self.obs_normalizer):
             norm_obs = self.obs_normalizer(obs)
         # compute the actions and values

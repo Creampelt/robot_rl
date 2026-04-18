@@ -10,6 +10,7 @@ from .discriminator_model import DiscriminatorModel
 from .fuse_model import FuseModel, ResidualFuseModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
+from .txl_model import TXLModel
 
 __all__ = [
     "CNNModel",
@@ -18,4 +19,5 @@ __all__ = [
     "MLPModel",
     "RNNModel",
     "ResidualFuseModel",
+    "TXLModel",
 ]

@@ -22,6 +22,7 @@ from .normalization import (
 from .parallel import ParallelLayerNorm, ParallelLinear
 from .residual import ResMLP
 from .rnn import RNN, HiddenState
+from .transformer_xl import TransformerXL
 
 __all__ = [
     "CNN",
@@ -38,5 +39,6 @@ __all__ = [
     "ParallelLayerNorm",
     "ParallelLinear",
     "ResMLP",
+    "TransformerXL",
     "TruncatedGaussianDistribution",
 ]
