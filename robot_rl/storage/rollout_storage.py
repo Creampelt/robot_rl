@@ -101,6 +101,7 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            device: str | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -141,6 +142,38 @@ class RolloutStorage:
 
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
+
+            self._set_device(device)
+
+        def _set_device(self, device: str | None) -> None:
+            """Move all populated batch fields to ``device`` (no-op when ``device is None``)."""
+            if device is None:
+                return
+            if self.observations is not None:
+                self.observations = self.observations.to(device)
+            if self.actions is not None:
+                self.actions = self.actions.to(device)
+            if self.values is not None:
+                self.values = self.values.to(device)
+            if self.advantages is not None:
+                self.advantages = self.advantages.to(device)
+            if self.returns is not None:
+                self.returns = self.returns.to(device)
+            if self.old_actions_log_prob is not None:
+                self.old_actions_log_prob = self.old_actions_log_prob.to(device)
+            if self.old_distribution_params is not None:
+                self.old_distribution_params = tuple(p.to(device) for p in self.old_distribution_params)
+            if self.privileged_actions is not None:
+                self.privileged_actions = self.privileged_actions.to(device)
+            if self.dones is not None:
+                self.dones = self.dones.to(device)
+            self.hidden_states = (
+                _hidden_state_to_device(self.hidden_states[0], device),
+                _hidden_state_to_device(self.hidden_states[1], device),
+            )
+            self.memory_hidden_state = _hidden_state_to_device(self.memory_hidden_state, device)
+            if self.masks is not None:
+                self.masks = self.masks.to(device)
 
     def __init__(
         self,
@@ -231,7 +264,7 @@ class RolloutStorage:
         self.step = 0
 
     # For distillation
-    def generator(self) -> Generator[Batch, None, None]:
+    def generator(self, device: str | None = None) -> Generator[Batch, None, None]:
         """Yield per-timestep batches for distillation training."""
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
@@ -241,6 +274,7 @@ class RolloutStorage:
                 observations=self.observations[i],  # type: ignore
                 privileged_actions=self.privileged_actions[i],
                 dones=self.dones[i],
+                device=device,
             )
 
     # For reinforcement learning with feedforward networks
@@ -274,13 +308,14 @@ class RolloutStorage:
 
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
-                    observations=observations[batch_idx].to(device),  # type: ignore
-                    actions=actions[batch_idx].to(device),
-                    values=values[batch_idx].to(device),
-                    advantages=advantages[batch_idx].to(device),
-                    returns=returns[batch_idx].to(device),
-                    old_actions_log_prob=old_actions_log_prob[batch_idx].to(device),
-                    old_distribution_params=tuple(p[batch_idx].to(device) for p in old_distribution_params),
+                    observations=observations[batch_idx],  # type: ignore
+                    actions=actions[batch_idx],
+                    values=values[batch_idx],
+                    advantages=advantages[batch_idx],
+                    returns=returns[batch_idx],
+                    old_actions_log_prob=old_actions_log_prob[batch_idx],
+                    old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    device=device,
                 )
 
     # For reinforcement learning with recurrent networks
@@ -357,19 +392,17 @@ class RolloutStorage:
 
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
-                    observations=padded_obs_trajectories[:, first_traj:last_traj].to(device),  # type: ignore
-                    actions=self.actions[:, start:stop].to(device),
-                    values=self.values[:, start:stop].to(device),
-                    advantages=self.advantages[:, start:stop].to(device),
-                    returns=self.returns[:, start:stop].to(device),
-                    old_actions_log_prob=self.actions_log_prob[:, start:stop].to(device),
-                    old_distribution_params=tuple(p[:, start:stop].to(device) for p in self.distribution_params),  # type: ignore
-                    hidden_states=(
-                        _hidden_state_to_device(hidden_state_a_batch, device),
-                        _hidden_state_to_device(hidden_state_c_batch, device),
-                    ),
-                    memory_hidden_state=_hidden_state_to_device(hidden_state_m_batch, device),
-                    masks=trajectory_masks[:, first_traj:last_traj].to(device),
+                    observations=padded_obs_trajectories[:, first_traj:last_traj],  # type: ignore
+                    actions=self.actions[:, start:stop],
+                    values=self.values[:, start:stop],
+                    advantages=self.advantages[:, start:stop],
+                    returns=self.returns[:, start:stop],
+                    old_actions_log_prob=self.actions_log_prob[:, start:stop],
+                    old_distribution_params=tuple(p[:, start:stop] for p in self.distribution_params),  # type: ignore
+                    hidden_states=(hidden_state_a_batch, hidden_state_c_batch),
+                    memory_hidden_state=hidden_state_m_batch,
+                    masks=trajectory_masks[:, first_traj:last_traj],
+                    device=device,
                 )
 
                 first_traj = last_traj

@@ -20,6 +20,30 @@ from robot_rl.storage import RolloutStorage
 from robot_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 
 
+class _SharedMemoryInferencePolicy(nn.Module):
+    """Adapter that chains a shared memory module into actor inference.
+
+    Returned from :meth:`PPO.get_policy` when a shared memory module is configured: the actor itself was
+    built with ``input_dim_override`` and has ``obs_groups=[]``, so calling ``actor(obs)`` is invalid — the
+    correct chain is ``actor.forward_from_latent(memory(obs))``.
+    """
+
+    is_recurrent: bool = True
+
+    def __init__(self, memory: nn.Module, actor: MLPModel) -> None:
+        super().__init__()
+        self.memory = memory
+        self.actor = actor
+
+    def forward(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        latent = self.memory(obs)
+        return self.actor.forward_from_latent(latent, *args, **kwargs)
+
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        self.memory.reset(dones)
+        self.actor.reset(dones)
+
+
 class PPO:
     """Proximal Policy Optimization algorithm.
 
@@ -247,6 +271,8 @@ class PPO:
             last_values = self.critic.forward_from_latent(latent).detach()
         else:
             last_values = self.critic(obs).detach()
+        # GAE runs over storage tensors; bring the bootstrap value to the storage device.
+        last_values = last_values.to(st.device)
         # Compute returns and advantages
         advantage = 0
         for step in reversed(range(st.num_transitions_per_env)):
@@ -551,8 +577,14 @@ class PPO:
             self.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         return load_cfg.get("iteration", False)
 
-    def get_policy(self) -> MLPModel:
-        """Get the policy model."""
+    def get_policy(self) -> nn.Module:
+        """Get the policy model.
+
+        Wraps the actor with the shared memory module when configured, since the actor is then a head over a
+        precomputed latent and cannot consume raw obs.
+        """
+        if self.memory is not None:
+            return _SharedMemoryInferencePolicy(self.memory, self.actor)
         return self.actor
 
     @staticmethod
@@ -603,7 +635,12 @@ class PPO:
         # Initialize the storage. Use "meta_rl" when meta-RL is configured so the trajectory generator splits
         # at trial boundaries (where memory was reset) rather than episode boundaries.
         training_type = "meta_rl" if cfg["algorithm"].get("meta_rl_cfg") is not None else "rl"
-        storage = RolloutStorage(training_type, env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        storage_device = cfg.get("storage_device")
+        if storage_device is None:
+            storage_device = device
+        storage = RolloutStorage(
+            training_type, env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], storage_device
+        )
 
         # Initialize the algorithm
         alg: PPO = alg_class(

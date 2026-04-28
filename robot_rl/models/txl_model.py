@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Any
 
 from robot_rl.models import MLPModel
 from robot_rl.modules import HiddenState, TransformerXL
@@ -27,7 +28,6 @@ class TXLModel(MLPModel):
         obs_set: str,
         output_dim: int,
         hidden_dims: tuple[int, ...] | list[int] = (1024, 1024),
-        activation: str = "gelu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
         txl_hidden_dim: int = 256,
@@ -36,6 +36,7 @@ class TXLModel(MLPModel):
         txl_mem_len: int = 64,
         txl_max_seq_len: int = 64,
         memory_only: bool = False,
+        **kwargs: Any,
     ) -> None:
         """Initialize the TXL-based model.
 
@@ -48,8 +49,6 @@ class TXLModel(MLPModel):
                 of TXL layers and each entry is the feed-forward width of that layer. (TXLModel does not have
                 an MLP head: the transformer output is the model output, with at most a single linear
                 projection to ``output_dim`` when ``memory_only=False``.)
-            activation: Unused (the TXL stack's internal feed-forward activation is GELU, fixed). Accepted
-                for cfg-class symmetry with :class:`MLPModel` / :class:`RNNModel`.
             obs_normalization: Whether to normalize the observations before feeding them to the TXL.
             distribution_cfg: Configuration dictionary for the output distribution. Only used when
                 ``memory_only=False``.
@@ -62,6 +61,8 @@ class TXLModel(MLPModel):
                 be at least the longest padded trajectory seen at update time.
             memory_only: When ``True``, skip the optional output head and return the TXL latent directly.
                 Used when this model serves as a shared memory module under :class:`MetaRlCfg.memory`.
+            **kwargs: Ignored extra keyword arguments accepted for cfg-class symmetry with
+                :class:`MLPModel` / :class:`RNNModel` (e.g. ``activation``).
         """
         self.latent_dim = txl_hidden_dim
 
@@ -72,7 +73,7 @@ class TXLModel(MLPModel):
             obs_set,
             output_dim,
             hidden_dims=[],  # Single layer input -> output
-            activation=activation,
+            activation="gelu",
             obs_normalization=obs_normalization,
             distribution_cfg=distribution_cfg,
             memory_only=memory_only,
