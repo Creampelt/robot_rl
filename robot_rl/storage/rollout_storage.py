@@ -14,6 +14,15 @@ from robot_rl.modules import HiddenState
 from robot_rl.utils import split_and_pad_trajectories
 
 
+def _hidden_state_to_device(hs: HiddenState | list[torch.Tensor], device: str | None) -> HiddenState:
+    """Move a hidden state to ``device``. Handles ``None``, single tensors, and per-layer lists/tuples."""
+    if hs is None:
+        return None
+    if isinstance(hs, (list, tuple)):
+        return type(hs)(t.to(device) for t in hs)  # type: ignore[return-value]
+    return hs.to(device)
+
+
 class RolloutStorage:
     """Storage for the data collected during a rollout.
 
@@ -60,6 +69,9 @@ class RolloutStorage:
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
             """Hidden states for recurrent networks, e.g., (actor, critic)."""
 
+            self.memory_hidden_state: HiddenState = None
+            """Hidden state of a shared memory module (used when ``MetaRlCfg.memory`` is set)."""
+
             # For meta-reinforcement learning
             self.meta_dones: torch.Tensor | None = None
             """Done flags indicating trial termination."""
@@ -85,6 +97,7 @@ class RolloutStorage:
             old_actions_log_prob: torch.Tensor | None = None,
             old_distribution_params: tuple[torch.Tensor, ...] | None = None,
             hidden_states: tuple[HiddenState, HiddenState] = (None, None),
+            memory_hidden_state: HiddenState = None,
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
@@ -122,6 +135,9 @@ class RolloutStorage:
             # For recurrent networks
             self.hidden_states: tuple[HiddenState, HiddenState] = hidden_states
             """Batch of hidden states for recurrent networks (RL recurrent only)."""
+
+            self.memory_hidden_state: HiddenState = memory_hidden_state
+            """Batch of hidden states for the shared memory module (RL recurrent only)."""
 
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
@@ -169,6 +185,7 @@ class RolloutStorage:
         # For recurrent networks
         self.saved_hidden_state_a: list[torch.Tensor] | None = None
         self.saved_hidden_state_c: list[torch.Tensor] | None = None
+        self.saved_hidden_state_m: list[torch.Tensor] | None = None
 
         # Counter for the number of transitions stored
         self.step = 0
@@ -204,7 +221,7 @@ class RolloutStorage:
                 self.meta_dones[self.step].copy_(transition.meta_dones.view(-1, 1))
 
         # For RNN networks
-        self._save_hidden_states(transition.hidden_states)
+        self._save_hidden_states(transition.hidden_states, transition.memory_hidden_state)
 
         # Increment the counter
         self.step += 1
@@ -325,6 +342,18 @@ class RolloutStorage:
                     )
                 else:
                     hidden_state_c_batch = None
+                if self.saved_hidden_state_m is not None:
+                    hidden_state_m_batch = [
+                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
+                        .transpose(1, 0)
+                        .contiguous()
+                        for saved_hidden_state in self.saved_hidden_state_m
+                    ]
+                    hidden_state_m_batch = (
+                        hidden_state_m_batch[0] if len(hidden_state_m_batch) == 1 else hidden_state_m_batch
+                    )
+                else:
+                    hidden_state_m_batch = None
 
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
@@ -335,21 +364,31 @@ class RolloutStorage:
                     returns=self.returns[:, start:stop].to(device),
                     old_actions_log_prob=self.actions_log_prob[:, start:stop].to(device),
                     old_distribution_params=tuple(p[:, start:stop].to(device) for p in self.distribution_params),  # type: ignore
-                    hidden_states=(hidden_state_a_batch.to(device), hidden_state_c_batch.to(device)),  # type: ignore
+                    hidden_states=(
+                        _hidden_state_to_device(hidden_state_a_batch, device),
+                        _hidden_state_to_device(hidden_state_c_batch, device),
+                    ),
+                    memory_hidden_state=_hidden_state_to_device(hidden_state_m_batch, device),
                     masks=trajectory_masks[:, first_traj:last_traj].to(device),
                 )
 
                 first_traj = last_traj
 
-    def _save_hidden_states(self, hidden_states: tuple[HiddenState, HiddenState]) -> None:
-        """Save recurrent hidden states to the rollout storage."""
-        if hidden_states == (None, None):
+    def _save_hidden_states(
+        self,
+        hidden_states: tuple[HiddenState, HiddenState],
+        memory_hidden_state: HiddenState = None,
+    ) -> None:
+        """Save recurrent hidden states for actor, critic, and shared memory to the rollout storage."""
+        if hidden_states == (None, None) and memory_hidden_state is None:
             return
         # Make a tuple out of GRU hidden states to match the LSTM format
         if hidden_states[0] is not None:
             hidden_state_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
         if hidden_states[1] is not None:
             hidden_state_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
+        if memory_hidden_state is not None:
+            hidden_state_m = memory_hidden_state if isinstance(memory_hidden_state, tuple) else (memory_hidden_state,)
         # Initialize hidden states if needed
         if self.saved_hidden_state_a is None and hidden_states[0] is not None:
             self.saved_hidden_state_a = [
@@ -361,6 +400,11 @@ class RolloutStorage:
                 torch.zeros(self.observations.shape[0], *hidden_state_c[i].shape, device=self.device)
                 for i in range(len(hidden_state_c))
             ]
+        if self.saved_hidden_state_m is None and memory_hidden_state is not None:
+            self.saved_hidden_state_m = [
+                torch.zeros(self.observations.shape[0], *hidden_state_m[i].shape, device=self.device)
+                for i in range(len(hidden_state_m))
+            ]
         # Copy the states
         if hidden_states[0] is not None:
             for i in range(len(hidden_state_a)):
@@ -368,3 +412,6 @@ class RolloutStorage:
         if hidden_states[1] is not None:
             for i in range(len(hidden_state_c)):
                 self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])  # type: ignore
+        if memory_hidden_state is not None:
+            for i in range(len(hidden_state_m)):
+                self.saved_hidden_state_m[i][self.step].copy_(hidden_state_m[i])  # type: ignore

@@ -40,6 +40,7 @@ class RNNModel(MLPModel):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        memory_only: bool = False,
     ) -> None:
         """Initialize the RNN-based model.
 
@@ -55,6 +56,8 @@ class RNNModel(MLPModel):
             rnn_type: Type of RNN to use ("lstm" or "gru").
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
+            memory_only: When ``True``, skip building the MLP head and output distribution. Used when this
+                model is constructed as a shared memory module under :class:`MetaRlCfg.memory`.
         """
         self.latent_dim = rnn_hidden_dim
 
@@ -68,6 +71,7 @@ class RNNModel(MLPModel):
             activation=activation,
             obs_normalization=obs_normalization,
             distribution_cfg=distribution_cfg,
+            memory_only=memory_only,
         )
 
         # RNN

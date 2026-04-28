@@ -15,11 +15,6 @@ class TXLModel(MLPModel):
     groups before passing the resulting latent to an MLP head. Drop-in alternative to
     :class:`~robot_rl.models.rnn_model.RNNModel` for environments that benefit from longer memory (e.g.,
     meta-RL where trials span multiple episodes).
-
-    Phase 1 training semantics: each trajectory segment starts from zero memory; TXL-style rolling memory of
-    length ``txl_mem_len`` is only active during rollout. :meth:`get_hidden_state` returns ``None`` so rollout
-    storage skips saving per-step memory snapshots. Trial- vs episode-boundary reset is handled by PPO's
-    existing ``trial_dones`` / ``dones`` dispatch — TXL inherits it via the duck-typed reset contract.
     """
 
     is_recurrent: bool = True
@@ -31,17 +26,16 @@ class TXLModel(MLPModel):
         obs_groups: dict[str, list[str]],
         obs_set: str,
         output_dim: int,
-        hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
-        activation: str = "elu",
+        hidden_dims: tuple[int, ...] | list[int] = (1024, 1024),
+        activation: str = "gelu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
         txl_hidden_dim: int = 256,
         txl_num_heads: int = 4,
-        txl_num_layers: int = 2,
-        txl_feedforward_dim: int = 1024,
         txl_dropout: float = 0.0,
         txl_mem_len: int = 64,
         txl_max_seq_len: int = 64,
+        memory_only: bool = False,
     ) -> None:
         """Initialize the TXL-based model.
 
@@ -50,39 +44,45 @@ class TXLModel(MLPModel):
             obs_groups: Dictionary mapping observation sets to lists of observation groups.
             obs_set: Observation set to use for this model (e.g., "actor" or "critic").
             output_dim: Dimension of the output.
-            hidden_dims: Hidden dimensions of the MLP head.
-            activation: Activation function of the MLP head.
+            hidden_dims: Per-layer feed-forward widths of the TXL stack. ``len(hidden_dims)`` is the number
+                of TXL layers and each entry is the feed-forward width of that layer. (TXLModel does not have
+                an MLP head: the transformer output is the model output, with at most a single linear
+                projection to ``output_dim`` when ``memory_only=False``.)
+            activation: Unused (the TXL stack's internal feed-forward activation is GELU, fixed). Accepted
+                for cfg-class symmetry with :class:`MLPModel` / :class:`RNNModel`.
             obs_normalization: Whether to normalize the observations before feeding them to the TXL.
-            distribution_cfg: Configuration dictionary for the output distribution.
+            distribution_cfg: Configuration dictionary for the output distribution. Only used when
+                ``memory_only=False``.
             txl_hidden_dim: TXL model/latent width. Must be divisible by ``txl_num_heads``.
             txl_num_heads: Number of attention heads per layer.
-            txl_num_layers: Number of TXL layers.
-            txl_feedforward_dim: Hidden width of each layer's feed-forward block.
             txl_dropout: Dropout probability used in attention and feed-forward blocks.
             txl_mem_len: Rolling memory length used during rollout. Set to 0 to disable memory (stateless
                 causal transformer over a single token).
             txl_max_seq_len: Largest training segment length the relative-position bias table must cover. Must
                 be at least the longest padded trajectory seen at update time.
+            memory_only: When ``True``, skip the optional output head and return the TXL latent directly.
+                Used when this model serves as a shared memory module under :class:`MetaRlCfg.memory`.
         """
         self.latent_dim = txl_hidden_dim
 
+        # When memory_only, bypass MLP-head
         super().__init__(
             obs,
             obs_groups,
             obs_set,
             output_dim,
-            hidden_dims=hidden_dims,
+            hidden_dims=[],  # Single layer input -> output
             activation=activation,
             obs_normalization=obs_normalization,
             distribution_cfg=distribution_cfg,
+            memory_only=memory_only,
         )
 
         self.memory_module = TransformerXL(
             input_size=self.obs_dim,
             d_model=txl_hidden_dim,
             nhead=txl_num_heads,
-            num_layers=txl_num_layers,
-            dim_feedforward=txl_feedforward_dim,
+            feedforward_dims=hidden_dims,
             dropout=txl_dropout,
             mem_len=txl_mem_len,
             max_seq_len=txl_max_seq_len,
@@ -100,12 +100,8 @@ class TXLModel(MLPModel):
         self.memory_module.reset(dones, hidden_state)  # type: ignore[arg-type]
 
     def get_hidden_state(self) -> HiddenState:
-        """Return ``None`` under Phase 1 semantics.
-
-        Segments are trained from zero memory, so there's nothing to snapshot per step. Will return
-        ``self.memory_module.memory`` once Phase 2 (segment-recurrent training) lands.
-        """
-        return None
+        """Return the per-layer rolling memory cache as a tuple of ``[mem_len, num_envs, d_model]`` tensors."""
+        return self.memory_module.memory  # type: ignore[return-value]
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
         """Detach the TXL memory. Typically a no-op during rollout because memory is detached on write."""

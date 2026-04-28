@@ -44,6 +44,8 @@ class MLPModel(nn.Module):
         obs_normalization: bool = False,
         normalize_first_layer: bool = False,
         distribution_cfg: dict | None = None,
+        input_dim_override: int | None = None,
+        memory_only: bool = False,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -61,22 +63,41 @@ class MLPModel(nn.Module):
             normalize_first_layer: Whether to normalize the first layer output with LayerNorm.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
+            input_dim_override: When set, bypass observation extraction and size the MLP head from this dimension
+                instead of ``obs_dim``. Used by PPO when actor/critic act as heads on top of a shared memory module
+                that produces a precomputed latent. Forward must then be called via :meth:`forward_from_latent`.
+            memory_only: When ``True``, skip building the MLP head and output distribution. Used when a
+                memory-bearing model (RNN/TXL) is constructed solely to provide a shared latent to downstream
+                heads — :meth:`forward` then returns the memory module's latent directly.
         """
         super().__init__()
 
-        # Resolve observation groups and dimensions
-        self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
+        # Head-only mode bypasses observation handling entirely; the latent is produced upstream.
+        self._input_dim_override = input_dim_override
+        self.memory_only = memory_only
+        if input_dim_override is not None:
+            self.obs_groups: list[str] = []
+            self.obs_dim = 0
+        else:
+            # Resolve observation groups and dimensions
+            self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
 
         # Resolve total number of inputs and dimensions
         self.num_inputs = 1 + len(other_input_dims)
         self.other_input_dim = int(np.sum(other_input_dims))
 
         # Observation normalization
-        self.obs_normalization = obs_normalization
-        if obs_normalization:
+        self.obs_normalization = obs_normalization and input_dim_override is None
+        if self.obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
         else:
             self.obs_normalizer = torch.nn.Identity()
+
+        # Memory-only mode excludes the MLP and distribution (only uses latent)
+        if memory_only:
+            self.distribution = None
+            self.mlp = torch.nn.Identity()
+            return
 
         # Distribution
         if distribution_cfg is not None:
@@ -122,9 +143,34 @@ class MLPModel(nn.Module):
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
         # Get MLP input latent
         latent = self.get_latent(obs, *args, masks=masks, hidden_state=hidden_state)
+        # Memory-only models stop here: their output is the memory latent, consumed by downstream heads
+        if self.memory_only:
+            return latent
         # MLP forward pass
         mlp_output = self.mlp(latent)
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
+        if self.distribution is not None:
+            if stochastic_output:
+                self.distribution.update(mlp_output)
+                return self.distribution.sample(std_clip=std_clip)
+            return self.distribution.deterministic_output(mlp_output)
+        return mlp_output
+
+    def forward_from_latent(
+        self,
+        latent: torch.Tensor,
+        *args: torch.Tensor,
+        stochastic_output: bool = False,
+        std_clip: float | None = None,
+    ) -> torch.Tensor:
+        """Apply the MLP head and output distribution to a precomputed latent.
+
+        Used when this model serves as a head on top of a shared memory module that produces the latent upstream. Skips
+        obs extraction, normalization, and trajectory unpadding.
+        """
+        if args:
+            latent = torch.cat([latent, *args], dim=-1)
+        mlp_output = self.mlp(latent)
         if self.distribution is not None:
             if stochastic_output:
                 self.distribution.update(mlp_output)
@@ -225,7 +271,8 @@ class MLPModel(nn.Module):
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
-        return self.obs_dim + self.other_input_dim
+        base_dim = self._input_dim_override if self._input_dim_override is not None else self.obs_dim
+        return base_dim + self.other_input_dim
 
 
 class _TorchMLPModel(nn.Module):

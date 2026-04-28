@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
+from collections.abc import Sequence
 
 from robot_rl.utils import unpad_trajectories
 
@@ -108,21 +109,26 @@ class TransformerXL(nn.Module):
         input_size: int,
         d_model: int = 256,
         nhead: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 1024,
+        feedforward_dims: Sequence[int] = (1024, 1024),
         dropout: float = 0.0,
         mem_len: int = 64,
         max_seq_len: int = 64,
     ) -> None:
-        """Build the TXL stack with a rolling memory cache of length ``mem_len`` per layer."""
+        """Build the TXL stack with a rolling memory cache of length ``mem_len`` per layer.
+
+        ``feedforward_dims`` is a per-layer list: ``len(feedforward_dims)`` is the number of TXL layers and
+        each entry is the feed-forward width of the corresponding layer.
+        """
         super().__init__()
         if mem_len < 0:
             raise ValueError(f"mem_len must be non-negative, got {mem_len}.")
         if max_seq_len < 1:
             raise ValueError(f"max_seq_len must be at least 1, got {max_seq_len}.")
+        if len(feedforward_dims) < 1:
+            raise ValueError(f"feedforward_dims must have at least one entry, got {list(feedforward_dims)}.")
 
         self.d_model = d_model
-        self.num_layers = num_layers
+        self.num_layers = len(feedforward_dims)
         self.mem_len = mem_len
         self.max_seq_len = max_seq_len
         # Worst-case attention span governs the relative-bias table size.
@@ -130,7 +136,7 @@ class TransformerXL(nn.Module):
 
         self.input_proj = nn.Linear(input_size, d_model)
         self.layers = nn.ModuleList([
-            _TransformerXLLayer(d_model, nhead, dim_feedforward, dropout, max_rel_dist) for _ in range(num_layers)
+            _TransformerXLLayer(d_model, nhead, ff_dim, dropout, max_rel_dist) for ff_dim in feedforward_dims
         ])
         self.norm_out = nn.LayerNorm(d_model)
         # Per-layer memory cache. Each element: [mem_len, batch, d_model]. None before the first rollout forward
@@ -141,7 +147,7 @@ class TransformerXL(nn.Module):
         self,
         input: torch.Tensor,
         masks: torch.Tensor | None = None,
-        hidden_state: tuple[torch.Tensor, ...] | None = None,
+        hidden_state: tuple[torch.Tensor, ...] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dispatch to rollout or batch mode based on whether ``masks`` is provided."""
         if masks is None:
@@ -152,14 +158,21 @@ class TransformerXL(nn.Module):
         """Single-step inference. Updates and reads ``self.memory`` in place."""
         x = self.input_proj(input).unsqueeze(0)  # [1, batch, d_model]
 
+        # Pre-allocate full-size zero memory so the saved-hidden-state buffer has a stable shape.
+        if self.memory is None and self.mem_len > 0:
+            batch = x.shape[1]
+            self.memory = tuple(
+                torch.zeros(self.mem_len, batch, self.d_model, device=x.device, dtype=x.dtype)
+                for _ in range(self.num_layers)
+            )
+
         prev_mem: list[torch.Tensor | None] = list(self.memory) if self.memory is not None else [None] * self.num_layers
         new_mem: list[torch.Tensor] = []
 
         for i, layer in enumerate(self.layers):
             mem_i = prev_mem[i]
             if self.mem_len > 0:
-                # The new memory entry for this layer is the current input (pre-layer activation), detached so
-                # gradients don't flow across rollout steps — same semantics as RNN hidden-state detach.
+                # New entry is the current pre-layer activation, detached so gradients don't cross rollout steps.
                 x_det = x.detach()
                 combined = torch.cat([mem_i, x_det], dim=0) if mem_i is not None and mem_i.size(0) > 0 else x_det
                 new_mem.append(combined[-self.mem_len :])
@@ -175,28 +188,61 @@ class TransformerXL(nn.Module):
         self,
         input: torch.Tensor,
         masks: torch.Tensor,
-        hidden_state: tuple[torch.Tensor, ...] | None,
+        hidden_state: tuple[torch.Tensor, ...] | torch.Tensor | None,
     ) -> torch.Tensor:
-        """Run a padded trajectory segment with causal + padding attention, starting from zero memory (Phase 1)."""
-        # hidden_state is accepted for API symmetry but ignored until Phase 2 segment-recurrent training.
-        del hidden_state
+        """Run a padded trajectory segment with ``hidden_state`` as the memory prefix.
 
-        seq_len = input.shape[0]
-        if seq_len > self.max_seq_len:
-            raise ValueError(
-                f"Training segment length {seq_len} exceeds max_seq_len={self.max_seq_len}; increase max_seq_len."
-            )
+        Inputs longer than ``max_seq_len`` are split into chunks; per-layer memory carries (detached) between
+        chunks so gradients flow only within each chunk's window.
+        """
+        x_proj = self.input_proj(input)  # [seq_len, batch, d_model]
+        seq_len, batch_size, _ = x_proj.shape
 
-        x = self.input_proj(input)  # [seq_len, batch, d_model]
+        # The recurrent generator unwraps single-layer hidden state to a bare tensor; re-wrap for iteration.
+        # Also cast to input dtype so per-layer cat with autocast'd activations doesn't error.
+        if hidden_state is not None:
+            hs = [hidden_state] if torch.is_tensor(hidden_state) else list(hidden_state)
+            mem: list[torch.Tensor | None] = [h.to(x_proj.dtype) for h in hs]
+        else:
+            mem = [None] * self.num_layers
 
-        # Causal (upper-triangle) mask + key-padding mask, combined into a [batch, 1, seq_q, seq_kv] bool mask.
-        causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=input.device).triu(1)
-        key_pad = ~masks.transpose(0, 1)  # [batch, seq_len]
-        attn_mask = causal[None, None, :, :] | key_pad[:, None, None, :]
+        outputs: list[torch.Tensor] = []
+        for chunk_start in range(0, seq_len, self.max_seq_len):
+            chunk_end = min(chunk_start + self.max_seq_len, seq_len)
+            chunk = x_proj[chunk_start:chunk_end]  # [chunk_len, batch, d_model]
+            chunk_masks = masks[chunk_start:chunk_end]  # [chunk_len, batch]
+            chunk_len = chunk.shape[0]
+            chunk_mem_len = mem[0].size(0) if mem[0] is not None else 0
 
-        for layer in self.layers:
-            x = layer(x, mem=None, attn_mask=attn_mask)
+            # Causal + key-padding mask over [batch, 1, chunk_len, mem_len + chunk_len]. Memory positions are
+            # always attendable (they're rollout activations or zero, both safe).
+            causal = torch.ones(chunk_len, chunk_len, dtype=torch.bool, device=input.device).triu(1)
+            key_pad = ~chunk_masks.transpose(0, 1)  # [batch, chunk_len]
+            if chunk_mem_len > 0:
+                mem_causal = torch.zeros(chunk_len, chunk_mem_len, dtype=torch.bool, device=input.device)
+                full_causal = torch.cat([mem_causal, causal], dim=1)
+                mem_key_pad = torch.zeros(batch_size, chunk_mem_len, dtype=torch.bool, device=input.device)
+                full_key_pad = torch.cat([mem_key_pad, key_pad], dim=1)
+            else:
+                full_causal = causal
+                full_key_pad = key_pad
+            attn_mask = full_causal[None, None, :, :] | full_key_pad[:, None, None, :]
 
+            new_mem: list[torch.Tensor] = []
+            h = chunk
+            for i, layer in enumerate(self.layers):
+                mem_i = mem[i]
+                if self.mem_len > 0:
+                    h_det = h.detach()
+                    combined = torch.cat([mem_i, h_det], dim=0) if mem_i is not None and mem_i.size(0) > 0 else h_det
+                    new_mem.append(combined[-self.mem_len :])
+                h = layer(h, mem=mem_i, attn_mask=attn_mask)
+
+            if self.mem_len > 0:
+                mem = new_mem  # type: ignore[assignment]
+            outputs.append(h)
+
+        x = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
         x = self.norm_out(x)
         return unpad_trajectories(x, masks)
 

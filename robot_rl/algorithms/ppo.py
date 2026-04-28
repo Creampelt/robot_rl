@@ -53,6 +53,8 @@ class PPO:
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
         device: str = "cpu",
+        # Optional shared memory module (consumed by both actor and critic as heads)
+        memory: nn.Module | None = None,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -105,8 +107,10 @@ class PPO:
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry
-            if actor.is_recurrent or critic.is_recurrent:
-                raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
+            if actor.is_recurrent or critic.is_recurrent or memory is not None:
+                raise ValueError(
+                    "Symmetry augmentation is not supported for recurrent policies (including shared memory)."
+                )
             # Store symmetry configuration
             self.symmetry = symmetry_cfg
         else:
@@ -122,11 +126,19 @@ class PPO:
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
+        # Shared memory (optional). When set, actor/critic must be MLP heads on top of the memory's latent.
+        if memory is not None and (actor.is_recurrent or critic.is_recurrent):
+            raise ValueError(
+                "Shared memory is not supported with recurrent actor/critic models. "
+                "When `meta_rl_cfg.memory` is set, actor and critic must be plain MLP heads."
+            )
+        self.memory: nn.Module | None = memory.to(self.device) if memory is not None else None
 
         # Create the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
-        )  # type: ignore
+        params: Any = chain(self.actor.parameters(), self.critic.parameters())
+        if self.memory is not None:
+            params = chain(params, self.memory.parameters())
+        self.optimizer = resolve_optimizer(optimizer)(params, lr=learning_rate)  # type: ignore
 
         # Add storage
         self.storage = storage
@@ -149,11 +161,18 @@ class PPO:
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
-        # Record the hidden states for recurrent policies
-        self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
-        # Compute the actions and values
-        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-        self.transition.values = self.critic(obs).detach()
+        if self.memory is not None:
+            # For shared-memory, run the memory once, feed latent to both heads.
+            self.transition.memory_hidden_state = self.memory.get_hidden_state()
+            self.transition.hidden_states = (None, None)
+            latent = self.memory(obs).detach()
+            self.transition.actions = self.actor.forward_from_latent(latent, stochastic_output=True).detach()
+            self.transition.values = self.critic.forward_from_latent(latent).detach()
+        else:
+            # Each model owns its own (optional) memory.
+            self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
+            self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+            self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         # Record observations before env.step()
@@ -169,6 +188,8 @@ class PPO:
     ) -> torch.Tensor | None:
         """Record one environment step and update the normalizers."""
         # Update the normalizers
+        if self.memory is not None:
+            self.memory.update_normalization(obs)
         self.actor.update_normalization(obs)
         self.critic.update_normalization(obs)
         if self.rnd:
@@ -210,20 +231,22 @@ class PPO:
 
         # For meta-RL environments, we only want to reset hidden states at end of trial
         # Otherwise we reset at end of episode
-        if self.meta_rl:
-            self.actor.reset(trial_dones)
-            self.critic.reset(trial_dones)
-            return trial_dones.nonzero(as_tuple=False).squeeze(1)
-        else:
-            self.actor.reset(dones)
-            self.critic.reset(dones)
-            return None
+        do_reset = trial_dones if self.meta_rl else dones
+        if self.memory is not None:
+            self.memory.reset(do_reset)
+        self.actor.reset(do_reset)
+        self.critic.reset(do_reset)
+        return trial_dones.nonzero(as_tuple=False).squeeze(1) if self.meta_rl else None
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute return and advantage targets from stored transitions."""
         st = self.storage
         # Compute value for the last step
-        last_values = self.critic(obs).detach()
+        if self.memory is not None:
+            latent = self.memory(obs).detach()
+            last_values = self.critic.forward_from_latent(latent).detach()
+        else:
+            last_values = self.critic(obs).detach()
         # Compute returns and advantages
         advantage = 0
         for step in reversed(range(st.num_transitions_per_env)):
@@ -254,7 +277,7 @@ class PPO:
         mean_symmetry_loss = 0 if self.symmetry else None
 
         # Get mini batch generator
-        if self.actor.is_recurrent or self.critic.is_recurrent:
+        if self.actor.is_recurrent or self.critic.is_recurrent or self.memory is not None:
             generator = self.storage.recurrent_mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs, device=self.device
             )
@@ -294,14 +317,25 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
-            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+            if self.memory is not None:
+                # Run shared memory once per mini-batch; both heads consume the same unpadded latent.
+                latent = self.memory(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.memory_hidden_state,
+                )
+                self.actor.forward_from_latent(latent, stochastic_output=True)
+                actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+                values = self.critic.forward_from_latent(latent)
+            else:
+                self.actor(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
+                actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             # Note: We only keep the distribution parameters and entropy of the first augmentation (the original one)
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
@@ -414,6 +448,8 @@ class PPO:
             # Apply the gradients for PPO
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            if self.memory is not None:
+                nn.utils.clip_grad_norm_(self.memory.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
@@ -460,6 +496,8 @@ class PPO:
         """Set train mode for learnable models."""
         self.actor.train()
         self.critic.train()
+        if self.memory is not None:
+            self.memory.train()
         if self.rnd:
             self.rnd.train()
 
@@ -467,6 +505,8 @@ class PPO:
         """Set evaluation mode for learnable models."""
         self.actor.eval()
         self.critic.eval()
+        if self.memory is not None:
+            self.memory.eval()
         if self.rnd:
             self.rnd.eval()
 
@@ -477,6 +517,8 @@ class PPO:
             "critic_state_dict": self.critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
+        if self.memory is not None:
+            saved_dict["memory_state_dict"] = self.memory.state_dict()
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd_optimizer.state_dict()
@@ -489,6 +531,7 @@ class PPO:
             load_cfg = {
                 "actor": True,
                 "critic": True,
+                "memory": True,
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
@@ -499,6 +542,8 @@ class PPO:
             self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
         if load_cfg.get("critic"):
             self.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+        if load_cfg.get("memory") and self.memory is not None and "memory_state_dict" in loaded_dict:
+            self.memory.load_state_dict(loaded_dict["memory_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if load_cfg.get("rnd") and self.rnd:
@@ -518,8 +563,14 @@ class PPO:
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
         critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
 
+        # Optional shared memory config
+        meta_rl_cfg = cfg["algorithm"].get("meta_rl_cfg")
+        shared_memory_cfg: dict | None = meta_rl_cfg.get("memory") if isinstance(meta_rl_cfg, dict) else None
+
         # Resolve observation groups
         default_sets = ["actor", "critic"]
+        if shared_memory_cfg is not None:
+            default_sets.append("memory")
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
@@ -530,19 +581,40 @@ class PPO:
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
+        # Build the optional shared memory module first so we can size actor/critic heads from its latent_dim.
+        memory: nn.Module | None = None
+        head_kwargs: dict = {}
+        if shared_memory_cfg is not None:
+            mem_class: type[MLPModel] = resolve_callable(shared_memory_cfg.pop("class_name"))  # type: ignore
+            memory = mem_class(obs, cfg["obs_groups"], "memory", 1, memory_only=True, **shared_memory_cfg).to(device)
+            print(f"Shared Memory Model: {memory}")
+            head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
+
         # Initialize the policy
-        actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        actor: MLPModel = actor_class(
+            obs, cfg["obs_groups"], "actor", env.num_actions, **head_kwargs, **cfg["actor"]
+        ).to(device)
         print(f"Actor Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **head_kwargs, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
 
-        # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        # Initialize the storage. Use "meta_rl" when meta-RL is configured so the trajectory generator splits
+        # at trial boundaries (where memory was reset) rather than episode boundaries.
+        training_type = "meta_rl" if cfg["algorithm"].get("meta_rl_cfg") is not None else "rl"
+        storage = RolloutStorage(training_type, env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
         # Initialize the algorithm
-        alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        alg: PPO = alg_class(
+            actor,
+            critic,
+            storage,
+            device=device,
+            memory=memory,
+            **cfg["algorithm"],
+            multi_gpu_cfg=cfg["multi_gpu"],
+        )
 
         return alg
 
@@ -550,6 +622,8 @@ class PPO:
         """Broadcast model parameters to all GPUs."""
         # Obtain the model parameters on current GPU
         model_params = [self.actor.state_dict(), self.critic.state_dict()]
+        if self.memory is not None:
+            model_params.append(self.memory.state_dict())
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
         # Broadcast the model parameters
@@ -557,8 +631,12 @@ class PPO:
         # Load the model parameters on all GPUs from source GPU
         self.actor.load_state_dict(model_params[0])
         self.critic.load_state_dict(model_params[1])
+        idx = 2
+        if self.memory is not None:
+            self.memory.load_state_dict(model_params[idx])
+            idx += 1
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[2])
+            self.rnd.predictor.load_state_dict(model_params[idx])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -567,6 +645,8 @@ class PPO:
         """
         # Create a tensor to store the gradients
         all_params = chain(self.actor.parameters(), self.critic.parameters())
+        if self.memory is not None:
+            all_params = chain(all_params, self.memory.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         all_params = list(all_params)
