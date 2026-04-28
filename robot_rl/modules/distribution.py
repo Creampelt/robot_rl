@@ -345,6 +345,18 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         self._low = low
         self._high = high
         self._eps = eps
+        # Affine factors for the tanh-shaped mean.
+        self._mean_scale = (high - low) / 2
+        self._mean_offset = (high + low) / 2
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the truncated Gaussian distribution from MLP output, with the mean shaped by tanh into (low, high)."""
+        mean = self._mean_scale * torch.tanh(mlp_output) + self._mean_offset
+        if self.std_type == "scalar":
+            std = self.std_param.expand_as(mean)
+        elif self.std_type == "log":
+            std = torch.exp(self.log_std_param).expand_as(mean)
+        self._distribution = Normal(mean, std)
 
     def sample(self, std_clip: float | None = None) -> torch.Tensor:
         """Sample from the Gaussian distribution."""
@@ -359,12 +371,12 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         return x - x.detach() + clamped_x.detach()
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
-        """Extract the mean from the MLP output, clamped to the truncation bounds."""
-        return torch.clamp(mlp_output, self._low + self._eps, self._high - self._eps)
+        """Extract the mean from the MLP output, shaped by tanh into (low, high)."""
+        return self._mean_scale * torch.tanh(mlp_output) + self._mean_offset
 
     def as_deterministic_output_module(self) -> nn.Module:
-        """Return an export-friendly module that returns the MLP output clamped to the truncation bounds."""
-        return _ClampedDeterministicOutput(self._low + self._eps, self._high - self._eps)
+        """Return an export-friendly module that returns the MLP output shaped by tanh into ``[low, high]``."""
+        return _TanhScaledDeterministicOutput(self._mean_scale, self._mean_offset)
 
 
 class _IdentityDeterministicOutput(nn.Module):
@@ -384,6 +396,18 @@ class _ClampedDeterministicOutput(nn.Module):
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
         return torch.clamp(mlp_output, self.low, self.high)
+
+
+class _TanhScaledDeterministicOutput(nn.Module):
+    """Exportable module that returns ``scale * tanh(mlp_output) + offset``, bounded to ``(low, high)``."""
+
+    def __init__(self, scale: float, offset: float) -> None:
+        super().__init__()
+        self.scale = scale
+        self.offset = offset
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return self.scale * torch.tanh(mlp_output) + self.offset
 
 
 class _MeanSliceDeterministicOutput(nn.Module):

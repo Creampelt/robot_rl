@@ -112,7 +112,8 @@ class ResMLP(nn.Sequential):
                 qs = torch.stack(qs, dim=0)
                 with torch.no_grad():
                     weight.view_as(qs).copy_(qs)
-                    weight.mul_(get_param(scales, idx))
+                    # Apply ReLU gain on parallel layers to match BFM-Zero's parallel-orthogonal init.
+                    weight.mul_(get_param(scales, idx) * nn.init.calculate_gain("relu"))
                 module.bias.data.fill_(0.0)
                 idx += 1
 

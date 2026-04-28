@@ -51,11 +51,13 @@ class OffPolicyRunner:
 
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
         """Run the learning loop for the specified number of iterations."""
-        # Add expert buffer to environment
+        # Add expert buffer to environment, then re-reset so the initial state is RSI'd from the expert buffer rather
+        # than the default-pose state produced by the env wrapper's first reset (which ran before attach).
         self.env.set_expert_buffer(self.alg.expert_buffer)
 
         # Start learning
-        obs = self.env.get_observations().to(self.device)
+        obs, _ = self.env.reset()
+        obs = obs.to(self.device)
         # Switch models and environment to train mode (for dropout, env events, etc.)
         self.alg.train_mode()
         self.env.train_mode()
