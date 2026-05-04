@@ -366,7 +366,7 @@ class Logger:
                     if len(info[key].shape) == 0:
                         info[key] = info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, info[key].to(self.device)))
-                value = torch.mean(infotensor)
+                value = torch.nan_to_num(torch.mean(infotensor), nan=0.0)
                 if "/" in key:
                     self.writer.add_scalar(key, value, it)  # type: ignore
                     if override_console_format:

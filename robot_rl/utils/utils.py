@@ -509,10 +509,14 @@ def pad_to_size(x: torch.Tensor, size: int, dim: int = 0) -> torch.Tensor:
 
 
 def forward_sliding_mean(x: torch.Tensor, window_len: int, dim: int = 0) -> torch.Tensor:
-    """Smooth x by averaging within window_len."""
-    # Move target dim to position 0 for simplicity
+    """Smooth x by averaging within window_len.
+
+    For each position ``t`` along ``dim``, returns the mean of ``x[..., t:t+window_len, ...]``,
+    truncating at the end (so the last entries average over fewer elements).
+    """
+    # Move target dim to position 0 for cumsum
     perm = [i for i in range(x.dim()) if i != dim]
-    perm.insert(1, dim)
+    perm.insert(0, dim)
     x = x.permute(perm)
 
     cumsum = torch.cumsum(x, dim=0)

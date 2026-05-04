@@ -359,8 +359,11 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         self._distribution = Normal(mean, std)
 
     def sample(self, std_clip: float | None = None) -> torch.Tensor:
-        """Sample from the Gaussian distribution."""
-        x = self._distribution.sample()  # type: ignore
+        """Sample from the Gaussian distribution.
+
+        Uses :meth:`Normal.rsample` so the sampled action carries gradient w.r.t. the actor's parameters via ``mean``.
+        """
+        x = self._distribution.rsample()  # type: ignore
         if std_clip is not None:
             x = torch.clamp(x, self.mean - std_clip, self.mean + std_clip)
         return self._clamp(x)

@@ -734,8 +734,13 @@ class FbCpr:
                 "Discriminator_Loss/expert_loss": expert_loss.mean().detach(),
                 "Discriminator_Loss/gradient_loss": grad_loss.mean().detach(),
             }
+            extras = {
+                "disc_logit_expert": expert_logits.mean().detach(),
+                "disc_logit_rollout": unlabeled_logits.mean().detach(),
+                "disc_logit_gap": (expert_logits.mean() - unlabeled_logits.mean()).detach(),
+            }
 
-        return loss_dict, {}
+        return loss_dict, extras
 
     def _update_forward_backward(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -951,6 +956,7 @@ class FbCpr:
 
             extras_dict = {
                 "actor_reg_weight": reg_weight.mean().detach(),
+                "actor_F1": Fs[0].mean().detach(),
             }
 
         return loss_dict, extras_dict
