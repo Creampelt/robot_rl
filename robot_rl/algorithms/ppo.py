@@ -35,6 +35,26 @@ class _SharedMemoryInferencePolicy(nn.Module):
         self.memory = memory
         self.actor = actor
 
+    @property
+    def output_mean(self) -> torch.Tensor:
+        """Return the mean of the current output distribution."""
+        return self.actor.output_mean
+
+    @property
+    def output_std(self) -> torch.Tensor:
+        """Return the standard deviation of the current output distribution."""
+        return self.actor.output_std
+
+    @property
+    def output_entropy(self) -> torch.Tensor:
+        """Return the entropy of the current output distribution."""
+        return self.actor.output_entropy
+
+    @property
+    def output_distribution_params(self) -> tuple[torch.Tensor, ...]:
+        """Return raw parameters of the current output distribution."""
+        return self.actor.output_distribution_params
+
     def forward(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         latent = self.memory(obs)
         return self.actor.forward_from_latent(latent, *args, **kwargs)
@@ -297,6 +317,10 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        # KL stats (only logged when self.desired_kl is set)
+        sum_kl = 0.0
+        max_kl = 0.0
+        kl_first_minibatch: float | None = None
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -376,6 +400,15 @@ class PPO:
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
+
+                    # Captured before the first optimizer.step(), so it isolates rollout-vs-update path
+                    # discrepancy (e.g. TXL attention-window mismatch, bf16 numerics) from real policy drift.
+                    kl_value = kl_mean.item()
+                    if kl_first_minibatch is None:
+                        kl_first_minibatch = kl_value
+                    sum_kl += kl_value
+                    if kl_value > max_kl:
+                        max_kl = kl_value
 
                     # Update the learning rate only on the main process
                     if self.gpu_global_rank == 0:
@@ -511,6 +544,11 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if self.desired_kl is not None and self.schedule == "adaptive":
+            loss_dict["kl_mean"] = sum_kl / num_updates
+            loss_dict["kl_max"] = max_kl
+            if kl_first_minibatch is not None:
+                loss_dict["kl_first_minibatch"] = kl_first_minibatch
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
