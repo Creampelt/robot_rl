@@ -215,7 +215,16 @@ class RolloutStorage:
             if training_type == "meta_rl":
                 self.meta_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
-        # For recurrent networks
+        # For recurrent networks. Hidden states are saved sparsely: only at trajectory-start indices,
+        # since that's all the recurrent generator ever reads. ``_pending_traj_X`` is the per-step
+        # accumulator (one entry per step that has any new starts), populated during rollout. On the
+        # first call to the recurrent generator, ``_finalize_traj_hidden_states`` flattens it into
+        # ``saved_hidden_state_X`` — per-layer ``[total_trajs, *per_env_shape]`` tensors in env-major,
+        # time-order. Saving every step would be ``num_steps_per_env`` x wasted (eg ~24 GB for TXL with
+        # 4096 envs / 64 steps / mem_len 64 / 3 layers / d_model 256 / bf16).
+        self._pending_traj_a: list[tuple[torch.Tensor, list[torch.Tensor]]] | None = None
+        self._pending_traj_c: list[tuple[torch.Tensor, list[torch.Tensor]]] | None = None
+        self._pending_traj_m: list[tuple[torch.Tensor, list[torch.Tensor]]] | None = None
         self.saved_hidden_state_a: list[torch.Tensor] | None = None
         self.saved_hidden_state_c: list[torch.Tensor] | None = None
         self.saved_hidden_state_m: list[torch.Tensor] | None = None
@@ -262,6 +271,12 @@ class RolloutStorage:
     def clear(self) -> None:
         """Reset the write cursor for the next rollout."""
         self.step = 0
+        self._pending_traj_a = None
+        self._pending_traj_c = None
+        self._pending_traj_m = None
+        self.saved_hidden_state_a = None
+        self.saved_hidden_state_c = None
+        self.saved_hidden_state_m = None
 
     # For distillation
     def generator(self, device: str | None = None) -> Generator[Batch, None, None]:
@@ -333,62 +348,26 @@ class RolloutStorage:
         mini_batch_size = self.num_envs // num_mini_batches
         mem_bounds = mem_bounds.squeeze(-1)
 
+        # Flatten the per-step pending hidden states into env-major time-order [total_trajs, ...] tensors.
+        self._finalize_traj_hidden_states()
+
+        # Per-env trajectory counts let us resolve [first_traj, last_traj) into the env-major flat tensor.
+        last_was_done = torch.zeros_like(mem_bounds, dtype=torch.bool)
+        last_was_done[1:] = mem_bounds[:-1]
+        last_was_done[0] = True
+        trajs_per_env = last_was_done.sum(dim=0)
+
         for ep in range(num_epochs):
-            first_traj = 0
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
+                first_traj = int(trajs_per_env[:start].sum().item())
+                last_traj = int(trajs_per_env[:stop].sum().item())
 
-                last_was_done = torch.zeros_like(mem_bounds, dtype=torch.bool)
-                last_was_done[1:] = mem_bounds[:-1]
-                last_was_done[0] = True
-                trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
-                last_traj = first_traj + trajectories_batch_size
-
-                # Handle the hidden states
-                # Reshape to [num_envs, time, num layers, hidden dim]
-                # Original shape: [time, num_layers, num_envs, hidden_dim])
-                last_was_done = last_was_done.permute(1, 0)
-                # Take only time steps after dones (flattens num envs and time dimensions),
-                # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
-                if self.saved_hidden_state_a is not None:
-                    hidden_state_a_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                        .transpose(1, 0)
-                        .contiguous()
-                        for saved_hidden_state in self.saved_hidden_state_a
-                    ]
-                    # Remove the tuple for GRU
-                    hidden_state_a_batch = (
-                        hidden_state_a_batch[0] if len(hidden_state_a_batch) == 1 else hidden_state_a_batch
-                    )
-                else:
-                    hidden_state_a_batch = None
-                if self.saved_hidden_state_c is not None:
-                    hidden_state_c_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                        .transpose(1, 0)
-                        .contiguous()
-                        for saved_hidden_state in self.saved_hidden_state_c
-                    ]
-                    hidden_state_c_batch = (
-                        hidden_state_c_batch[0] if len(hidden_state_c_batch) == 1 else hidden_state_c_batch
-                    )
-                else:
-                    hidden_state_c_batch = None
-                if self.saved_hidden_state_m is not None:
-                    hidden_state_m_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                        .transpose(1, 0)
-                        .contiguous()
-                        for saved_hidden_state in self.saved_hidden_state_m
-                    ]
-                    hidden_state_m_batch = (
-                        hidden_state_m_batch[0] if len(hidden_state_m_batch) == 1 else hidden_state_m_batch
-                    )
-                else:
-                    hidden_state_m_batch = None
+                hidden_state_a_batch = self._slice_saved_hidden_states(self.saved_hidden_state_a, first_traj, last_traj)
+                hidden_state_c_batch = self._slice_saved_hidden_states(self.saved_hidden_state_c, first_traj, last_traj)
+                hidden_state_m_batch = self._slice_saved_hidden_states(self.saved_hidden_state_m, first_traj, last_traj)
 
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
@@ -405,46 +384,116 @@ class RolloutStorage:
                     device=device,
                 )
 
-                first_traj = last_traj
+    @staticmethod
+    def _slice_saved_hidden_states(saved: list[torch.Tensor] | None, first_traj: int, last_traj: int) -> HiddenState:
+        """Slice the env-major flat hidden-state tensors to a trajectory mini-batch."""
+        if saved is None:
+            return None
+        sliced = [t[first_traj:last_traj].transpose(0, 1).contiguous() for t in saved]
+        return sliced[0] if len(sliced) == 1 else sliced
 
     def _save_hidden_states(
         self,
         hidden_states: tuple[HiddenState, HiddenState],
         memory_hidden_state: HiddenState = None,
     ) -> None:
-        """Save recurrent hidden states for actor, critic, and shared memory to the rollout storage."""
+        """Save recurrent hidden states for actor, critic, and shared memory to the rollout storage.
+
+        Only the hidden states at trajectory-start envs (step 0 for all envs, otherwise envs whose
+        previous step was a done) are kept — these are the only ones the recurrent generator reads.
+        """
         if hidden_states == (None, None) and memory_hidden_state is None:
             return
-        # Make a tuple out of GRU hidden states to match the LSTM format
-        if hidden_states[0] is not None:
-            hidden_state_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
-        if hidden_states[1] is not None:
-            hidden_state_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
-        if memory_hidden_state is not None:
-            hidden_state_m = memory_hidden_state if isinstance(memory_hidden_state, tuple) else (memory_hidden_state,)
-        # Initialize hidden states if needed
-        if self.saved_hidden_state_a is None and hidden_states[0] is not None:
-            self.saved_hidden_state_a = [
-                torch.zeros(self.observations.shape[0], *hidden_state_a[i].shape, device=self.device)
-                for i in range(len(hidden_state_a))
+        # Wrap GRU/single-tensor states as tuples to match the LSTM/multi-layer format.
+        hidden_state_a = (
+            None
+            if hidden_states[0] is None
+            else (hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],))
+        )
+        hidden_state_c = (
+            None
+            if hidden_states[1] is None
+            else (hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],))
+        )
+        hidden_state_m = (
+            None
+            if memory_hidden_state is None
+            else (memory_hidden_state if isinstance(memory_hidden_state, tuple) else (memory_hidden_state,))
+        )
+
+        # Determine the env indices that start a new trajectory at this step.
+        if self.step == 0:
+            env_indices_storage = torch.arange(self.num_envs, device=self.device)
+            all_envs = True
+        else:
+            prev_done_field = self.meta_dones if self.training_type == "meta_rl" else self.dones
+            prev_done = prev_done_field[self.step - 1].squeeze(-1).bool()
+            env_indices_storage = prev_done.nonzero(as_tuple=True)[0]
+            if env_indices_storage.numel() == 0:
+                return
+            all_envs = False
+
+        if hidden_state_a is not None:
+            self._pending_traj_a = self._append_traj_starts(
+                self._pending_traj_a, hidden_state_a, env_indices_storage, all_envs
+            )
+        if hidden_state_c is not None:
+            self._pending_traj_c = self._append_traj_starts(
+                self._pending_traj_c, hidden_state_c, env_indices_storage, all_envs
+            )
+        if hidden_state_m is not None:
+            self._pending_traj_m = self._append_traj_starts(
+                self._pending_traj_m, hidden_state_m, env_indices_storage, all_envs
+            )
+
+    def _append_traj_starts(
+        self,
+        pending: list[tuple[torch.Tensor, list[torch.Tensor]]] | None,
+        hs_tuple: tuple[torch.Tensor, ...],
+        env_indices_storage: torch.Tensor,
+        all_envs: bool,
+    ) -> list[tuple[torch.Tensor, list[torch.Tensor]]]:
+        """Slice ``hs_tuple`` to the trajectory-start envs and append a snapshot to ``pending``.
+
+        Each per-layer tensor in ``hs_tuple`` has env at dim 1; output slices have env moved to dim 0
+        with shape ``[num_starts, *per_env_shape]`` on storage device.
+        """
+        compute_device = hs_tuple[0].device
+        if all_envs:
+            sliced = [hs.movedim(1, 0).contiguous().to(self.device) for hs in hs_tuple]
+        else:
+            env_idx_compute = env_indices_storage.to(compute_device)
+            sliced = [
+                hs.index_select(dim=1, index=env_idx_compute).movedim(1, 0).contiguous().to(self.device)
+                for hs in hs_tuple
             ]
-        if self.saved_hidden_state_c is None and hidden_states[1] is not None:
-            self.saved_hidden_state_c = [
-                torch.zeros(self.observations.shape[0], *hidden_state_c[i].shape, device=self.device)
-                for i in range(len(hidden_state_c))
-            ]
-        if self.saved_hidden_state_m is None and memory_hidden_state is not None:
-            self.saved_hidden_state_m = [
-                torch.zeros(self.observations.shape[0], *hidden_state_m[i].shape, device=self.device)
-                for i in range(len(hidden_state_m))
-            ]
-        # Copy the states
-        if hidden_states[0] is not None:
-            for i in range(len(hidden_state_a)):
-                self.saved_hidden_state_a[i][self.step].copy_(hidden_state_a[i])  # type: ignore
-        if hidden_states[1] is not None:
-            for i in range(len(hidden_state_c)):
-                self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])  # type: ignore
-        if memory_hidden_state is not None:
-            for i in range(len(hidden_state_m)):
-                self.saved_hidden_state_m[i][self.step].copy_(hidden_state_m[i])  # type: ignore
+        if pending is None:
+            pending = []
+        pending.append((env_indices_storage, sliced))
+        return pending
+
+    def _finalize_traj_hidden_states(self) -> None:
+        """Flatten per-step ``_pending_traj_X`` lists into env-major time-order tensors.
+
+        Idempotent: re-runs only when the corresponding ``saved_hidden_state_X`` is still ``None``.
+        Each pending entry contributes ``num_starts_at_step`` trajectories in env-order; concatenating
+        across steps gives time-major order, then a stable argsort on env indices reorders to env-major
+        while preserving time-order within each env (matching ``split_and_pad_trajectories``).
+        """
+        if self.saved_hidden_state_a is None and self._pending_traj_a is not None:
+            self.saved_hidden_state_a = self._flatten_traj_hidden_states(self._pending_traj_a)
+        if self.saved_hidden_state_c is None and self._pending_traj_c is not None:
+            self.saved_hidden_state_c = self._flatten_traj_hidden_states(self._pending_traj_c)
+        if self.saved_hidden_state_m is None and self._pending_traj_m is not None:
+            self.saved_hidden_state_m = self._flatten_traj_hidden_states(self._pending_traj_m)
+
+    @staticmethod
+    def _flatten_traj_hidden_states(
+        pending: list[tuple[torch.Tensor, list[torch.Tensor]]],
+    ) -> list[torch.Tensor]:
+        """Concatenate pending per-step entries and reorder to env-major time-order."""
+        env_indices_concat = torch.cat([e for e, _ in pending], dim=0)
+        num_layers = len(pending[0][1])
+        per_layer_concat = [torch.cat([slices[layer] for _, slices in pending], dim=0) for layer in range(num_layers)]
+        perm = torch.argsort(env_indices_concat, stable=True)
+        return [t[perm] for t in per_layer_concat]
