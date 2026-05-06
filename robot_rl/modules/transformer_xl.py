@@ -214,17 +214,21 @@ class TransformerXL(nn.Module):
             chunk_len = chunk.shape[0]
             chunk_mem_len = mem[0].size(0) if mem[0] is not None else 0
 
-            # Causal + key-padding mask over [batch, 1, chunk_len, mem_len + chunk_len]. Memory positions are
-            # always attendable (they're rollout activations or zero, both safe).
-            causal = torch.ones(chunk_len, chunk_len, dtype=torch.bool, device=input.device).triu(1)
+            # Sliding-window causal mask over [batch, 1, chunk_len, mem_len + chunk_len]. Query at chunk position
+            # t (abs position chunk_mem_len + t in the [mem | chunk] sequence) attends to keys at relative offset
+            # in [0, mem_len] — i.e., causal plus a sliding window the same width as rollout's cache. This makes
+            # the update-time K/V at every position match what the policy attended to during rollout (at unchanged
+            # params), so epoch-0 KL collapses to zero like an RNN's would.
+            total_kv_len = chunk_mem_len + chunk_len
+            q_abs = torch.arange(chunk_len, device=input.device) + chunk_mem_len
+            k_abs = torch.arange(total_kv_len, device=input.device)
+            rel = q_abs[:, None] - k_abs[None, :]  # [chunk_len, total_kv_len]
+            full_causal = (rel < 0) | (rel > self.mem_len)
             key_pad = ~chunk_masks.transpose(0, 1)  # [batch, chunk_len]
             if chunk_mem_len > 0:
-                mem_causal = torch.zeros(chunk_len, chunk_mem_len, dtype=torch.bool, device=input.device)
-                full_causal = torch.cat([mem_causal, causal], dim=1)
                 mem_key_pad = torch.zeros(batch_size, chunk_mem_len, dtype=torch.bool, device=input.device)
                 full_key_pad = torch.cat([mem_key_pad, key_pad], dim=1)
             else:
-                full_causal = causal
                 full_key_pad = key_pad
             attn_mask = full_causal[None, None, :, :] | full_key_pad[:, None, None, :]
 
