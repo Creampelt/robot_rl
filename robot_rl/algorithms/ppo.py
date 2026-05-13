@@ -317,7 +317,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
-        # KL stats (only logged when self.desired_kl is set)
+        mean_log_prob = 0
         sum_kl = 0.0
         max_kl = 0.0
         kl_first_minibatch: float | None = None
@@ -390,26 +390,24 @@ class PPO:
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
 
-            # Compute KL divergence and adapt the learning rate
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
-                    kl_mean = torch.mean(kl)
+            # Compute KL divergence (always, for logging) and adapt the learning rate if scheduled
+            with torch.inference_mode():
+                kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
+                kl_mean = torch.mean(kl)
 
-                    # Reduce the KL divergence across all GPUs
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+                # Reduce the KL divergence across all GPUs
+                if self.is_multi_gpu:
+                    torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                    kl_mean /= self.gpu_world_size
 
-                    # Captured before the first optimizer.step(), so it isolates rollout-vs-update path
-                    # discrepancy (e.g. TXL attention-window mismatch, bf16 numerics) from real policy drift.
-                    kl_value = kl_mean.item()
-                    if kl_first_minibatch is None:
-                        kl_first_minibatch = kl_value
-                    sum_kl += kl_value
-                    if kl_value > max_kl:
-                        max_kl = kl_value
+                kl_value = kl_mean.item()
+                if kl_first_minibatch is None:
+                    kl_first_minibatch = kl_value
+                sum_kl += kl_value
+                if kl_value > max_kl:
+                    max_kl = kl_value
 
+                if self.desired_kl is not None and self.schedule == "adaptive":
                     # Update the learning rate only on the main process
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
@@ -518,6 +516,7 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
+            mean_log_prob += actions_log_prob.mean().item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -530,6 +529,7 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_log_prob /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -543,12 +543,12 @@ class PPO:
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "log_prob": mean_log_prob,
         }
-        if self.desired_kl is not None and self.schedule == "adaptive":
-            loss_dict["kl_mean"] = sum_kl / num_updates
-            loss_dict["kl_max"] = max_kl
-            if kl_first_minibatch is not None:
-                loss_dict["kl_first_minibatch"] = kl_first_minibatch
+        loss_dict["kl_mean"] = sum_kl / num_updates
+        loss_dict["kl_max"] = max_kl
+        if kl_first_minibatch is not None:
+            loss_dict["kl_first_minibatch"] = kl_first_minibatch
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

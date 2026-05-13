@@ -215,13 +215,7 @@ class RolloutStorage:
             if training_type == "meta_rl":
                 self.meta_dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
-        # For recurrent networks. Hidden states are saved sparsely: only at trajectory-start indices,
-        # since that's all the recurrent generator ever reads. ``_pending_traj_X`` is the per-step
-        # accumulator (one entry per step that has any new starts), populated during rollout. On the
-        # first call to the recurrent generator, ``_finalize_traj_hidden_states`` flattens it into
-        # ``saved_hidden_state_X`` — per-layer ``[total_trajs, *per_env_shape]`` tensors in env-major,
-        # time-order. Saving every step would be ``num_steps_per_env`` x wasted (eg ~24 GB for TXL with
-        # 4096 envs / 64 steps / mem_len 64 / 3 layers / d_model 256 / bf16).
+        # For recurrent networks. Hidden states are saved sparsely: only at trajectory-start indices.
         self._pending_traj_a: list[tuple[torch.Tensor, list[torch.Tensor]]] | None = None
         self._pending_traj_c: list[tuple[torch.Tensor, list[torch.Tensor]]] | None = None
         self._pending_traj_m: list[tuple[torch.Tensor, list[torch.Tensor]]] | None = None

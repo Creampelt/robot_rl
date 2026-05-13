@@ -49,8 +49,8 @@ class _RelPosMultiheadAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, S_q, S_kv]
 
         # Relative-position bias. Query position i aligns to key position (S_kv - S_q + i); key position j is j.
-        # This handles both rollout (S_q=1, S_kv=mem_len+1 -> query is the newest position) and batch mode
-        # (S_q=S_kv=seq_len -> query/key positions coincide).
+        # This handles both rollout (S_q=1, S_kv=rollout_mem_len+1 -> query is the newest position) and batch
+        # mode (S_q=S_kv=seq_len -> query/key positions coincide).
         q_pos = torch.arange(s_q, device=query.device) + (s_kv - s_q)
         k_pos = torch.arange(s_kv, device=query.device)
         rel = q_pos[:, None] - k_pos[None, :]  # [S_q, S_kv] in [-(S_kv-1), S_q-1]
@@ -102,7 +102,13 @@ class _TransformerXLLayer(nn.Module):
 
 
 class TransformerXL(nn.Module):
-    """Transformer-XL memory module."""
+    """Transformer-XL memory module.
+
+    Single parameter ``max_seq_len`` = segment length L. Training caches one previous segment of length L
+    (detached, stop-gradient) as the attention prefix; rollout maintains a rolling KV cache of length
+    ``2L - 1`` so every deployed step sees the same maximum context (``2L`` keys) as end-of-segment queries
+    saw during training.
+    """
 
     def __init__(
         self,
@@ -111,17 +117,14 @@ class TransformerXL(nn.Module):
         nhead: int = 4,
         feedforward_dims: Sequence[int] = (1024, 1024),
         dropout: float = 0.0,
-        mem_len: int = 64,
         max_seq_len: int = 64,
     ) -> None:
-        """Build the TXL stack with a rolling memory cache of length ``mem_len`` per layer.
+        """Build the TXL stack.
 
         ``feedforward_dims`` is a per-layer list: ``len(feedforward_dims)`` is the number of TXL layers and
         each entry is the feed-forward width of the corresponding layer.
         """
         super().__init__()
-        if mem_len < 0:
-            raise ValueError(f"mem_len must be non-negative, got {mem_len}.")
         if max_seq_len < 1:
             raise ValueError(f"max_seq_len must be at least 1, got {max_seq_len}.")
         if len(feedforward_dims) < 1:
@@ -129,18 +132,19 @@ class TransformerXL(nn.Module):
 
         self.d_model = d_model
         self.num_layers = len(feedforward_dims)
-        self.mem_len = mem_len
-        self.max_seq_len = max_seq_len
-        # Worst-case attention span governs the relative-bias table size.
-        max_rel_dist = mem_len + max_seq_len + 1
+        self.max_seq_len = max_seq_len  # segment length L
+        self.train_mem_len = max_seq_len  # cache during training = one previous segment
+        self.rollout_mem_len = 2 * max_seq_len - 1  # rolling KV cache during rollout
+        # Worst-case attention span (offsets 0..2L-1 in both training and rollout) governs the rel-bias table.
+        max_rel_dist = 2 * max_seq_len
 
         self.input_proj = nn.Linear(input_size, d_model)
         self.layers = nn.ModuleList([
             _TransformerXLLayer(d_model, nhead, ff_dim, dropout, max_rel_dist) for ff_dim in feedforward_dims
         ])
         self.norm_out = nn.LayerNorm(d_model)
-        # Per-layer memory cache. Each element: [mem_len, batch, d_model]. None before the first rollout forward
-        # or after a full reset.
+        # Per-layer rolling KV cache. Each element: [rollout_mem_len, batch, d_model]. None before the first
+        # rollout forward or after a full reset.
         self.memory: tuple[torch.Tensor, ...] | None = None
 
     def forward(
@@ -155,32 +159,29 @@ class TransformerXL(nn.Module):
         return self._forward_batch(input, masks, hidden_state)
 
     def _forward_rollout(self, input: torch.Tensor) -> torch.Tensor:
-        """Single-step inference. Updates and reads ``self.memory`` in place."""
+        """Single-step inference. Updates and reads ``self.memory`` (length ``2L-1``) in place."""
         x = self.input_proj(input).unsqueeze(0)  # [1, batch, d_model]
 
         # Pre-allocate full-size zero memory so the saved-hidden-state buffer has a stable shape.
-        if self.memory is None and self.mem_len > 0:
+        if self.memory is None:
             batch = x.shape[1]
             self.memory = tuple(
-                torch.zeros(self.mem_len, batch, self.d_model, device=x.device, dtype=x.dtype)
+                torch.zeros(self.rollout_mem_len, batch, self.d_model, device=x.device, dtype=x.dtype)
                 for _ in range(self.num_layers)
             )
 
-        prev_mem: list[torch.Tensor | None] = list(self.memory) if self.memory is not None else [None] * self.num_layers
+        prev_mem: list[torch.Tensor] = list(self.memory)
         new_mem: list[torch.Tensor] = []
 
         for i, layer in enumerate(self.layers):
             mem_i = prev_mem[i]
-            if self.mem_len > 0:
-                # New entry is the current pre-layer activation, detached so gradients don't cross rollout steps.
-                x_det = x.detach()
-                combined = torch.cat([mem_i, x_det], dim=0) if mem_i is not None and mem_i.size(0) > 0 else x_det
-                new_mem.append(combined[-self.mem_len :])
+            # New entry is the current pre-layer activation, detached so gradients don't cross rollout steps.
+            x_det = x.detach()
+            combined = torch.cat([mem_i, x_det], dim=0)
+            new_mem.append(combined[-self.rollout_mem_len :])
             x = layer(x, mem=mem_i)
 
-        if self.mem_len > 0:
-            self.memory = tuple(new_mem)
-
+        self.memory = tuple(new_mem)
         x = self.norm_out(x)
         return x.squeeze(0)
 
@@ -190,19 +191,19 @@ class TransformerXL(nn.Module):
         masks: torch.Tensor,
         hidden_state: tuple[torch.Tensor, ...] | torch.Tensor | None,
     ) -> torch.Tensor:
-        """Run a padded trajectory segment with ``hidden_state`` as the memory prefix.
+        """TXL update over padded trajectories.
 
-        Inputs longer than ``max_seq_len`` are split into chunks; per-layer memory carries (detached) between
-        chunks so gradients flow only within each chunk's window.
+        Splits the trajectory into chunks of ``max_seq_len`` (= segment length L). Each chunk attends
+        to a detached prefix of length L (the previous chunk's activations, or the most recent L positions
+        of the rollout snapshot for chunk 0).
         """
         x_proj = self.input_proj(input)  # [seq_len, batch, d_model]
         seq_len, batch_size, _ = x_proj.shape
 
-        # The recurrent generator unwraps single-layer hidden state to a bare tensor; re-wrap for iteration.
-        # Also cast to input dtype so per-layer cat with autocast'd activations doesn't error.
+        # The recurrent generator unwraps single-layer hidden state to a bare tensor, re-wrap for iteration.
         if hidden_state is not None:
             hs = [hidden_state] if torch.is_tensor(hidden_state) else list(hidden_state)
-            mem: list[torch.Tensor | None] = [h.to(x_proj.dtype) for h in hs]
+            mem: list[torch.Tensor | None] = [h.to(x_proj.dtype)[-self.train_mem_len :] for h in hs]
         else:
             mem = [None] * self.num_layers
 
@@ -214,36 +215,34 @@ class TransformerXL(nn.Module):
             chunk_len = chunk.shape[0]
             chunk_mem_len = mem[0].size(0) if mem[0] is not None else 0
 
-            # Sliding-window causal mask over [batch, 1, chunk_len, mem_len + chunk_len]. Query at chunk position
-            # t (abs position chunk_mem_len + t in the [mem | chunk] sequence) attends to keys at relative offset
-            # in [0, mem_len] — i.e., causal plus a sliding window the same width as rollout's cache. This makes
-            # the update-time K/V at every position match what the policy attended to during rollout (at unchanged
-            # params), so epoch-0 KL collapses to zero like an RNN's would.
+            # Canonical causal mask: query at chunk position t (abs position chunk_mem_len + t) attends to
+            # all cache keys (abs 0..chunk_mem_len-1) and chunk keys at abs <= chunk_mem_len + t.
             total_kv_len = chunk_mem_len + chunk_len
             q_abs = torch.arange(chunk_len, device=input.device) + chunk_mem_len
             k_abs = torch.arange(total_kv_len, device=input.device)
-            rel = q_abs[:, None] - k_abs[None, :]  # [chunk_len, total_kv_len]
-            full_causal = (rel < 0) | (rel > self.mem_len)
+            causal = q_abs[:, None] < k_abs[None, :]  # True = mask out (key is in the future)
+
+            # Padding mask on chunk keys (False entries of `masks` are padding).
             key_pad = ~chunk_masks.transpose(0, 1)  # [batch, chunk_len]
             if chunk_mem_len > 0:
                 mem_key_pad = torch.zeros(batch_size, chunk_mem_len, dtype=torch.bool, device=input.device)
                 full_key_pad = torch.cat([mem_key_pad, key_pad], dim=1)
             else:
                 full_key_pad = key_pad
-            attn_mask = full_causal[None, None, :, :] | full_key_pad[:, None, None, :]
+            attn_mask = causal[None, None, :, :] | full_key_pad[:, None, None, :]
 
             new_mem: list[torch.Tensor] = []
             h = chunk
             for i, layer in enumerate(self.layers):
                 mem_i = mem[i]
-                if self.mem_len > 0:
-                    h_det = h.detach()
-                    combined = torch.cat([mem_i, h_det], dim=0) if mem_i is not None and mem_i.size(0) > 0 else h_det
-                    new_mem.append(combined[-self.mem_len :])
+                # Cache passed to the next chunk = last L positions of [prev_cache | current_chunk_pre_layer],
+                # detached so gradients don't span chunk boundaries.
+                h_det = h.detach()
+                combined = torch.cat([mem_i, h_det], dim=0) if mem_i is not None and mem_i.size(0) > 0 else h_det
+                new_mem.append(combined[-self.train_mem_len :])
                 h = layer(h, mem=mem_i, attn_mask=attn_mask)
 
-            if self.mem_len > 0:
-                mem = new_mem  # type: ignore[assignment]
+            mem = new_mem  # type: ignore[assignment]
             outputs.append(h)
 
         x = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]

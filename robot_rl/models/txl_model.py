@@ -13,13 +13,11 @@ class TXLModel(MLPModel):
     """Transformer-XL-based neural model.
 
     Uses a :class:`~robot_rl.modules.transformer_xl.TransformerXL` memory module to process 1D observation
-    groups before passing the resulting latent to an MLP head. Drop-in alternative to
-    :class:`~robot_rl.models.rnn_model.RNNModel` for environments that benefit from longer memory (e.g.,
-    meta-RL where trials span multiple episodes).
+    groups before passing the resulting latent to an MLP head.
     """
 
     is_recurrent: bool = True
-    """Whether the model contains a stateful memory module."""
+    """Whether the model contains a recurrent module."""
 
     def __init__(
         self,
@@ -33,7 +31,6 @@ class TXLModel(MLPModel):
         txl_hidden_dim: int = 256,
         txl_num_heads: int = 4,
         txl_dropout: float = 0.0,
-        txl_mem_len: int = 64,
         txl_max_seq_len: int = 64,
         memory_only: bool = False,
         **kwargs: Any,
@@ -55,10 +52,9 @@ class TXLModel(MLPModel):
             txl_hidden_dim: TXL model/latent width. Must be divisible by ``txl_num_heads``.
             txl_num_heads: Number of attention heads per layer.
             txl_dropout: Dropout probability used in attention and feed-forward blocks.
-            txl_mem_len: Rolling memory length used during rollout. Set to 0 to disable memory (stateless
-                causal transformer over a single token).
-            txl_max_seq_len: Largest training segment length the relative-position bias table must cover. Must
-                be at least the longest padded trajectory seen at update time.
+            txl_max_seq_len: Segment length L. Training caches one previous segment of length L (detached); rollout
+                maintains a rolling KV cache of length ``2L - 1`` so deployed steps see the same max context (``2L``
+                keys) as end-of-segment training queries.
             memory_only: When ``True``, skip the optional output head and return the TXL latent directly.
                 Used when this model serves as a shared memory module under :class:`MetaRlCfg.memory`.
             **kwargs: Ignored extra keyword arguments accepted for cfg-class symmetry with
@@ -85,7 +81,6 @@ class TXLModel(MLPModel):
             nhead=txl_num_heads,
             feedforward_dims=hidden_dims,
             dropout=txl_dropout,
-            mem_len=txl_mem_len,
             max_seq_len=txl_max_seq_len,
         )
 
@@ -101,7 +96,7 @@ class TXLModel(MLPModel):
         self.memory_module.reset(dones, hidden_state)  # type: ignore[arg-type]
 
     def get_hidden_state(self) -> HiddenState:
-        """Return the per-layer rolling memory cache as a tuple of ``[mem_len, num_envs, d_model]`` tensors."""
+        """Return the per-layer rolling KV cache as a tuple of ``[2L-1, num_envs, d_model]`` tensors."""
         return self.memory_module.memory  # type: ignore[return-value]
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
@@ -109,12 +104,12 @@ class TXLModel(MLPModel):
         self.memory_module.detach_hidden_state(dones)
 
     def as_jit(self) -> nn.Module:
-        """TorchScript export for TXL is not implemented yet (deferred; see CLAUDE.md)."""
-        raise NotImplementedError("TorchScript export for TXLModel is not implemented yet.")
+        """Export as JIT (not implemented)."""
+        raise NotImplementedError
 
     def as_onnx(self, verbose: bool = False) -> nn.Module:
-        """ONNX export for TXL is not implemented yet (deferred; see CLAUDE.md)."""
-        raise NotImplementedError("ONNX export for TXLModel is not implemented yet.")
+        """Export as ONNX (not implemented)."""
+        raise NotImplementedError
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
