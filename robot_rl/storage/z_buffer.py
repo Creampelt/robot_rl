@@ -36,3 +36,14 @@ class ZBuffer:
         """Sample z values from the buffer for all environments."""
         indices = torch.randint(0, len(self), (num_envs,), device=self.device)
         return self.z[indices].to(device)
+
+    def state_dict(self) -> dict:
+        """Return the buffer contents and fill state for checkpointing."""
+        return {"z": self.z, "curr_idx": self._curr_idx, "is_full": self._is_full}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the buffer contents and fill state from a checkpoint."""
+        self.z = state["z"].to(self.device)
+        self.capacity = self.z.shape[0]
+        self._curr_idx = int(state["curr_idx"])
+        self._is_full = bool(state["is_full"])

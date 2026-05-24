@@ -116,6 +116,20 @@ class TrajectoryBuffer(ExpertBuffer):
         """Normalize all priorities by dividing by their sum."""
         self.priorities /= self.priorities.sum()
 
+    def state_dict(self) -> dict:
+        """Return the per-motion sampling priorities for checkpointing."""
+        return {"priorities": self.priorities}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the per-motion sampling priorities from a checkpoint."""
+        priorities = state["priorities"].to(self.device)
+        if priorities.shape != self.priorities.shape:
+            raise ValueError(
+                f"Loaded expert priorities shape {tuple(priorities.shape)} does not match the current buffer "
+                f"{tuple(self.priorities.shape)}; the motion dataset likely differs from the checkpointed run."
+            )
+        self.priorities = priorities
+
     def get_expert_state(self, obs: TensorDict, device: str | None = None) -> dict[str, torch.Tensor]:
         """Convert the observations TensorDict into a state dictionary of tensors.
 

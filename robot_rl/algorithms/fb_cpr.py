@@ -479,6 +479,12 @@ class FbCpr:
             "disc_critic_optimizer_state_dict": self.disc_critic_optimizer.state_dict(),
             "aux_critic_optimizer_state_dict": self.aux_critic_optimizer.state_dict(),
             "discriminator_optimizer_state_dict": self.discriminator_optimizer.state_dict(),
+            "target_forward_map_state_dict": self.target_forward_map.state_dict(),
+            "target_backward_map_state_dict": self.target_backward_map.state_dict(),
+            "target_disc_critic_state_dict": self.target_disc_critic.state_dict(),
+            "target_aux_critic_state_dict": self.target_aux_critic.state_dict(),
+            "z_buffer_state": self.z_buffer.state_dict(),
+            "expert_buffer_state": self.expert_buffer.state_dict(),
         }
         return saved_dict
 
@@ -488,28 +494,34 @@ class FbCpr:
         if load_cfg is None:
             load_cfg = {
                 "actor": True,
-                "forward": True,
                 "backward": True,
-                "disc_critic": True,
-                "aux_critic": True,
+                "critic": True,
                 "discriminator": True,
+                "target": True,
                 "optimizer": True,
+                "buffer": True,
                 "iteration": True,
             }
 
         # Load the specified models
         if load_cfg.get("actor"):
             self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
-        if load_cfg.get("forward"):
-            self.forward_map.load_state_dict(loaded_dict["forward_map_state_dict"], strict=strict)
         if load_cfg.get("backward"):
             self.backward_map.load_state_dict(loaded_dict["backward_map_state_dict"], strict=strict)
-        if load_cfg.get("disc_critic"):
+        if load_cfg.get("critic"):
+            self.forward_map.load_state_dict(loaded_dict["forward_map_state_dict"], strict=strict)
             self.disc_critic.load_state_dict(loaded_dict["disc_critic_state_dict"], strict=strict)
-        if load_cfg.get("aux_critic"):
             self.aux_critic.load_state_dict(loaded_dict["aux_critic_state_dict"], strict=strict)
         if load_cfg.get("discriminator"):
             self.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"], strict=strict)
+        if load_cfg.get("target"):
+            for online, target, target_key in (
+                (self.forward_map, self.target_forward_map, "target_forward_map_state_dict"),
+                (self.backward_map, self.target_backward_map, "target_backward_map_state_dict"),
+                (self.disc_critic, self.target_disc_critic, "target_disc_critic_state_dict"),
+                (self.aux_critic, self.target_aux_critic, "target_aux_critic_state_dict"),
+            ):
+                target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
         if "obs_normalizer_state_dict" in loaded_dict:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_normalizer_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
@@ -519,6 +531,9 @@ class FbCpr:
             self.disc_critic_optimizer.load_state_dict(loaded_dict["disc_critic_optimizer_state_dict"])
             self.aux_critic_optimizer.load_state_dict(loaded_dict["aux_critic_optimizer_state_dict"])
             self.discriminator_optimizer.load_state_dict(loaded_dict["discriminator_optimizer_state_dict"])
+        if load_cfg.get("buffer"):
+            self.z_buffer.load_state_dict(loaded_dict["z_buffer_state"])
+            self.expert_buffer.load_state_dict(loaded_dict["expert_buffer_state"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
