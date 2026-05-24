@@ -24,8 +24,9 @@ class WandbSummaryWriter(SummaryWriter):
         """Initialize a W&B run for logging."""
         super().__init__(log_dir, flush_secs=flush_secs)
 
-        # Get the run name
-        run_name = os.path.split(log_dir)[-1]
+        # Get the run name and group
+        run_name = cfg.get("wandb_run_name") or os.path.split(log_dir)[-1]
+        group = cfg.get("wandb_group") or None
 
         # Get wandb project and entity
         try:
@@ -53,6 +54,7 @@ class WandbSummaryWriter(SummaryWriter):
             project=project,
             entity=entity,
             name=run_name,
+            group=group,
             config={"log_dir": log_dir},
             settings=settings,
             tags=tags,
