@@ -10,6 +10,7 @@ import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Any
 
 from robot_rl.models.mlp_model import MLPModel
 from robot_rl.modules import RNN, HiddenState
@@ -41,6 +42,7 @@ class RNNModel(MLPModel):
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
         memory_only: bool = False,
+        **kwargs: Any,
     ) -> None:
         """Initialize the RNN-based model.
 
@@ -58,6 +60,7 @@ class RNNModel(MLPModel):
             rnn_num_layers: Number of RNN layers.
             memory_only: When ``True``, skip building the MLP head and output distribution. Used when this
                 model is constructed as a shared memory module under :class:`MetaRlCfg.memory`.
+            **kwargs: Ignored extra keyword arguments accepted for cfg-class symmetry with other models.
         """
         self.latent_dim = rnn_hidden_dim
 

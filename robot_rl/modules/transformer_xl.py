@@ -102,13 +102,7 @@ class _TransformerXLLayer(nn.Module):
 
 
 class TransformerXL(nn.Module):
-    """Transformer-XL memory module.
-
-    Single parameter ``max_seq_len`` = segment length L. Training caches one previous segment of length L
-    (detached, stop-gradient) as the attention prefix; rollout maintains a rolling KV cache of length
-    ``2L - 1`` so every deployed step sees the same maximum context (``2L`` keys) as end-of-segment queries
-    saw during training.
-    """
+    """Transformer-XL memory module."""
 
     def __init__(
         self,
@@ -119,11 +113,7 @@ class TransformerXL(nn.Module):
         dropout: float = 0.0,
         max_seq_len: int = 64,
     ) -> None:
-        """Build the TXL stack.
-
-        ``feedforward_dims`` is a per-layer list: ``len(feedforward_dims)`` is the number of TXL layers and
-        each entry is the feed-forward width of the corresponding layer.
-        """
+        """Build the TXL stack."""
         super().__init__()
         if max_seq_len < 1:
             raise ValueError(f"max_seq_len must be at least 1, got {max_seq_len}.")
@@ -132,10 +122,9 @@ class TransformerXL(nn.Module):
 
         self.d_model = d_model
         self.num_layers = len(feedforward_dims)
-        self.max_seq_len = max_seq_len  # segment length L
-        self.train_mem_len = max_seq_len  # cache during training = one previous segment
-        self.rollout_mem_len = 2 * max_seq_len - 1  # rolling KV cache during rollout
-        # Worst-case attention span (offsets 0..2L-1 in both training and rollout) governs the rel-bias table.
+        self.max_seq_len = max_seq_len
+        self.train_mem_len = max_seq_len
+        self.rollout_mem_len = 2 * max_seq_len - 1
         max_rel_dist = 2 * max_seq_len
 
         self.input_proj = nn.Linear(input_size, d_model)
@@ -143,8 +132,6 @@ class TransformerXL(nn.Module):
             _TransformerXLLayer(d_model, nhead, ff_dim, dropout, max_rel_dist) for ff_dim in feedforward_dims
         ])
         self.norm_out = nn.LayerNorm(d_model)
-        # Per-layer rolling KV cache. Each element: [rollout_mem_len, batch, d_model]. None before the first
-        # rollout forward or after a full reset.
         self.memory: tuple[torch.Tensor, ...] | None = None
 
     def forward(
@@ -191,62 +178,36 @@ class TransformerXL(nn.Module):
         masks: torch.Tensor,
         hidden_state: tuple[torch.Tensor, ...] | torch.Tensor | None,
     ) -> torch.Tensor:
-        """TXL update over padded trajectories.
-
-        Splits the trajectory into chunks of ``max_seq_len`` (= segment length L). Each chunk attends
-        to a detached prefix of length L (the previous chunk's activations, or the most recent L positions
-        of the rollout snapshot for chunk 0).
-        """
+        """TXL update that reproduces the rollout per-step context."""
         x_proj = self.input_proj(input)  # [seq_len, batch, d_model]
         seq_len, batch_size, _ = x_proj.shape
+        r = self.rollout_mem_len
 
-        # The recurrent generator unwraps single-layer hidden state to a bare tensor, re-wrap for iteration.
         if hidden_state is not None:
             hs = [hidden_state] if torch.is_tensor(hidden_state) else list(hidden_state)
-            mem: list[torch.Tensor | None] = [h.to(x_proj.dtype)[-self.train_mem_len :] for h in hs]
+            mem: list[torch.Tensor] = [h.to(x_proj.dtype) for h in hs]
         else:
-            mem = [None] * self.num_layers
+            mem = [
+                torch.zeros(r, batch_size, self.d_model, device=x_proj.device, dtype=x_proj.dtype)
+                for _ in range(self.num_layers)
+            ]
 
-        outputs: list[torch.Tensor] = []
-        for chunk_start in range(0, seq_len, self.max_seq_len):
-            chunk_end = min(chunk_start + self.max_seq_len, seq_len)
-            chunk = x_proj[chunk_start:chunk_end]  # [chunk_len, batch, d_model]
-            chunk_masks = masks[chunk_start:chunk_end]  # [chunk_len, batch]
-            chunk_len = chunk.shape[0]
-            chunk_mem_len = mem[0].size(0) if mem[0] is not None else 0
+        # Per-position causal sliding window of width R over the [prefix(R) | trajectory(seq_len)] tape
+        q_abs = torch.arange(seq_len, device=input.device) + r
+        k_abs = torch.arange(r + seq_len, device=input.device)
+        future = k_abs[None, :] > q_abs[:, None]
+        too_old = k_abs[None, :] < (q_abs[:, None] - r)
+        window = future | too_old  # True = masked out
+        chunk_key_pad = ~masks.transpose(0, 1)
+        prefix_pad = torch.zeros(batch_size, r, dtype=torch.bool, device=input.device)
+        full_key_pad = torch.cat([prefix_pad, chunk_key_pad], dim=1)
+        attn_mask = window[None, None, :, :] | full_key_pad[:, None, None, :]
 
-            # Canonical causal mask: query at chunk position t (abs position chunk_mem_len + t) attends to
-            # all cache keys (abs 0..chunk_mem_len-1) and chunk keys at abs <= chunk_mem_len + t.
-            total_kv_len = chunk_mem_len + chunk_len
-            q_abs = torch.arange(chunk_len, device=input.device) + chunk_mem_len
-            k_abs = torch.arange(total_kv_len, device=input.device)
-            causal = q_abs[:, None] < k_abs[None, :]  # True = mask out (key is in the future)
+        h = x_proj
+        for i, layer in enumerate(self.layers):
+            h = layer(h, mem=mem[i], attn_mask=attn_mask)
 
-            # Padding mask on chunk keys (False entries of `masks` are padding).
-            key_pad = ~chunk_masks.transpose(0, 1)  # [batch, chunk_len]
-            if chunk_mem_len > 0:
-                mem_key_pad = torch.zeros(batch_size, chunk_mem_len, dtype=torch.bool, device=input.device)
-                full_key_pad = torch.cat([mem_key_pad, key_pad], dim=1)
-            else:
-                full_key_pad = key_pad
-            attn_mask = causal[None, None, :, :] | full_key_pad[:, None, None, :]
-
-            new_mem: list[torch.Tensor] = []
-            h = chunk
-            for i, layer in enumerate(self.layers):
-                mem_i = mem[i]
-                # Cache passed to the next chunk = last L positions of [prev_cache | current_chunk_pre_layer],
-                # detached so gradients don't span chunk boundaries.
-                h_det = h.detach()
-                combined = torch.cat([mem_i, h_det], dim=0) if mem_i is not None and mem_i.size(0) > 0 else h_det
-                new_mem.append(combined[-self.train_mem_len :])
-                h = layer(h, mem=mem_i, attn_mask=attn_mask)
-
-            mem = new_mem  # type: ignore[assignment]
-            outputs.append(h)
-
-        x = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
-        x = self.norm_out(x)
+        x = self.norm_out(h)
         return unpad_trajectories(x, masks)
 
     def reset(

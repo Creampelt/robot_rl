@@ -40,9 +40,8 @@ class RNN(nn.Module):
         """Run recurrent inference in rollout mode or batched update mode."""
         batch_mode = masks is not None
         if batch_mode:
-            # Batch mode needs saved hidden states
-            if hidden_state is None:
-                raise ValueError("Hidden states not passed to RNN module during policy update")
+            if isinstance(hidden_state, list):
+                hidden_state = tuple(hidden_state)
             out, _ = self.rnn(input, hidden_state)
             out = unpad_trajectories(out, masks)
         else:
