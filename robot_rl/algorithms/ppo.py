@@ -21,12 +21,7 @@ from robot_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimiz
 
 
 class _SharedMemoryInferencePolicy(nn.Module):
-    """Adapter that chains a shared memory module into actor inference.
-
-    Returned from :meth:`PPO.get_policy` when a shared memory module is configured: the actor itself was
-    built with ``input_dim_override`` and has ``obs_groups=[]``, so calling ``actor(obs)`` is invalid — the
-    correct chain is ``actor.forward_from_latent(memory(obs))``.
-    """
+    """Adapter that chains a shared memory module into actor inference."""
 
     is_recurrent: bool = True
 
@@ -96,6 +91,7 @@ class PPO:
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
+        adaptive_lr_once_per_iteration: bool = False,
         device: str = "cpu",
         # Optional shared memory module (consumed by both actor and critic as heads)
         memory: nn.Module | None = None,
@@ -162,8 +158,10 @@ class PPO:
 
         # Meta RL components
         self.meta_rl = meta_rl_cfg is not None
+        self.detach_critic_memory = False
         if meta_rl_cfg is not None:
             self.num_episodes_per_trial: int = meta_rl_cfg["num_episodes_per_trial"]
+            self.detach_critic_memory = meta_rl_cfg.get("detach_critic_memory", False)
             # Wait to initialize episode counter since we use data shape to get num_envs
             self.ep_counter: torch.Tensor | None = None
 
@@ -200,20 +198,23 @@ class PPO:
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
         self.schedule = schedule
+        self.adaptive_lr_once_per_iteration = adaptive_lr_once_per_iteration
         self.learning_rate = learning_rate
+        # Bounds for the once-per-iteration adaptive LR (per-minibatch uses 1e-2/1e-5).
+        self.max_learning_rate = 1e-3
+        self.min_learning_rate = 1e-5
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
         if self.memory is not None:
-            # For shared-memory, run the memory once, feed latent to both heads.
             self.transition.memory_hidden_state = self.memory.get_hidden_state()
             self.transition.hidden_states = (None, None)
             latent = self.memory(obs).detach()
             self.transition.actions = self.actor.forward_from_latent(latent, stochastic_output=True).detach()
-            self.transition.values = self.critic.forward_from_latent(latent).detach()
+            # Include additional critic obs for asymmetric actor-critic
+            self.transition.values = self.critic.forward_from_latent(latent, obs=obs).detach()
         else:
-            # Each model owns its own (optional) memory.
             self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
             self.transition.actions = self.actor(obs, stochastic_output=True).detach()
             self.transition.values = self.critic(obs).detach()
@@ -288,7 +289,7 @@ class PPO:
         # Compute value for the last step
         if self.memory is not None:
             latent = self.memory(obs).detach()
-            last_values = self.critic.forward_from_latent(latent).detach()
+            last_values = self.critic.forward_from_latent(latent, obs=obs).detach()
         else:
             last_values = self.critic(obs).detach()
         # GAE runs over storage tensors; bring the bootstrap value to the storage device.
@@ -376,7 +377,9 @@ class PPO:
                 )
                 self.actor.forward_from_latent(latent, stochastic_output=True)
                 actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-                values = self.critic.forward_from_latent(latent)
+                # Optionally stop the value loss from backpropagating into the shared memory
+                critic_latent = latent.detach() if self.detach_critic_memory else latent
+                values = self.critic.forward_from_latent(critic_latent, obs=batch.observations, masks=batch.masks)
             else:
                 self.actor(
                     batch.observations,
@@ -407,21 +410,16 @@ class PPO:
                 if kl_value > max_kl:
                     max_kl = kl_value
 
-                if self.desired_kl is not None and self.schedule == "adaptive":
-                    # Update the learning rate only on the main process
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
-
-                    # Update the learning rate for all parameter groups
+                # Per-minibatch adaptive LR
+                if (
+                    self.desired_kl is not None
+                    and self.schedule == "adaptive"
+                    and not self.adaptive_lr_once_per_iteration
+                ):
+                    if kl_value > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif self.desired_kl / 2.0 > kl_value > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
@@ -526,6 +524,22 @@ class PPO:
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
+
+        # Adapt the LR once per iteration
+        if self.desired_kl is not None and self.schedule == "adaptive" and self.adaptive_lr_once_per_iteration:
+            mean_kl_iter = sum_kl / num_updates
+            if self.gpu_global_rank == 0:
+                if mean_kl_iter > self.desired_kl * 2.0:
+                    self.learning_rate = max(self.min_learning_rate, self.learning_rate / 1.5)
+                elif 0.0 < mean_kl_iter < self.desired_kl / 2.0:
+                    self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
+            if self.is_multi_gpu:
+                lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                torch.distributed.broadcast(lr_tensor, src=0)
+                self.learning_rate = lr_tensor.item()
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
+
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
@@ -639,8 +653,6 @@ class PPO:
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
-        if shared_memory_cfg is not None:
-            default_sets.append("memory")
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
@@ -651,14 +663,18 @@ class PPO:
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
-        # Build the optional shared memory module first so we can size actor/critic heads from its latent_dim.
+        # Build the optional shared memory module first so we can size actor/critic heads from its latent_dim
         memory: nn.Module | None = None
         head_kwargs: dict = {}
+        critic_head_kwargs: dict = {}
         if shared_memory_cfg is not None:
             mem_class: type[MLPModel] = resolve_callable(shared_memory_cfg.pop("class_name"))  # type: ignore
-            memory = mem_class(obs, cfg["obs_groups"], "memory", 1, memory_only=True, **shared_memory_cfg).to(device)
+            memory = mem_class(obs, cfg["obs_groups"], "actor", 1, memory_only=True, **shared_memory_cfg).to(device)
             print(f"Shared Memory Model: {memory}")
             head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
+            # Critic consumes privileged obs + memory latent
+            critic_head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
+            critic_head_kwargs["append_obs_groups"] = True
 
         # Initialize the policy
         actor: MLPModel = actor_class(
@@ -667,7 +683,9 @@ class PPO:
         print(f"Actor Model: {actor}")
         if cfg["algorithm"].pop("share_cnn_encoders", None):  # Share CNN encoders between actor and critic
             cfg["critic"]["cnns"] = actor.cnns  # type: ignore
-        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **head_kwargs, **cfg["critic"]).to(device)
+        critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_head_kwargs, **cfg["critic"]).to(
+            device
+        )
         print(f"Critic Model: {critic}")
 
         # Initialize the storage. Use "meta_rl" when meta-RL is configured so the trajectory generator splits

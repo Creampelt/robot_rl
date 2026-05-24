@@ -45,6 +45,7 @@ class MLPModel(nn.Module):
         normalize_first_layer: bool = False,
         distribution_cfg: dict | None = None,
         input_dim_override: int | None = None,
+        append_obs_groups: bool = False,
         memory_only: bool = False,
     ) -> None:
         """Initialize the MLP-based model.
@@ -66,21 +67,27 @@ class MLPModel(nn.Module):
             input_dim_override: When set, bypass observation extraction and size the MLP head from this dimension
                 instead of ``obs_dim``. Used by PPO when actor/critic act as heads on top of a shared memory module
                 that produces a precomputed latent. Forward must then be called via :meth:`forward_from_latent`.
+            append_obs_groups: When ``True`` alongside ``input_dim_override``, this model still resolves its own
+                observation groups and appends them to the precomputed latent at the head (sized as
+                ``input_dim_override + obs_dim``). :meth:`forward_from_latent` then extracts them when passed
+                ``obs=...``. Used for an asymmetric critic head that consumes privileged obs the actor does not see.
             memory_only: When ``True``, skip building the MLP head and output distribution. Used when a
                 memory-bearing model (RNN/TXL) is constructed solely to provide a shared latent to downstream
                 heads — :meth:`forward` then returns the memory module's latent directly.
         """
         super().__init__()
 
-        # Head-only mode bypasses observation handling entirely; the latent is produced upstream.
+        # Head-only mode bypasses observation handling entirely; the latent is produced upstream. With
+        # ``append_obs_groups`` the head still resolves its obs groups to append them to that latent.
         self._input_dim_override = input_dim_override
+        self._append_obs_groups = append_obs_groups
         self.memory_only = memory_only
-        if input_dim_override is not None:
-            self.obs_groups: list[str] = []
-            self.obs_dim = 0
-        else:
+        if input_dim_override is None or append_obs_groups:
             # Resolve observation groups and dimensions
             self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
+        else:
+            self.obs_groups: list[str] = []
+            self.obs_dim = 0
 
         # Resolve total number of inputs and dimensions
         self.num_inputs = 1 + len(other_input_dims)
@@ -160,14 +167,21 @@ class MLPModel(nn.Module):
         self,
         latent: torch.Tensor,
         *args: torch.Tensor,
+        obs: TensorDict | None = None,
+        masks: torch.Tensor | None = None,
         stochastic_output: bool = False,
         std_clip: float | None = None,
     ) -> torch.Tensor:
         """Apply the MLP head and output distribution to a precomputed latent.
 
-        Used when this model serves as a head on top of a shared memory module that produces the latent upstream. Skips
-        obs extraction, normalization, and trajectory unpadding.
+        Used when this model serves as a head on top of a shared memory module that produces the latent upstream.
+        Optionally accepts extra observations, which are concatenated with the memory latent.
         """
+        if self.obs_groups and obs is not None:
+            obs_tensor = torch.cat([obs[group] for group in self.obs_groups], dim=-1)
+            if masks is not None:
+                obs_tensor = unpad_trajectories(obs_tensor, masks)
+            latent = torch.cat([latent, obs_tensor], dim=-1)
         if args:
             latent = torch.cat([latent, *args], dim=-1)
         mlp_output = self.mlp(latent)
@@ -271,8 +285,8 @@ class MLPModel(nn.Module):
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
-        base_dim = self._input_dim_override if self._input_dim_override is not None else self.obs_dim
-        return base_dim + self.other_input_dim
+        base_dim = self._input_dim_override if self._input_dim_override is not None else 0
+        return base_dim + self.obs_dim + self.other_input_dim
 
 
 class _TorchMLPModel(nn.Module):
