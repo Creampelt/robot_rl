@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import os
 import time
 import torch
+import torch.nn as nn
 from typing import Any
 
 from robot_rl.algorithms import FbCpr
@@ -11,6 +13,56 @@ from robot_rl.env import URLVecEnv
 from robot_rl.models import MLPModel
 from robot_rl.utils import check_nan, resolve_callable
 from robot_rl.utils.logger import Logger
+
+
+class _BfmZeroPolicyExport(nn.Module):
+    """Export-friendly composition of the FB-CPR actor and its (external) observation normalizer."""
+
+    def __init__(self, alg: FbCpr) -> None:
+        """Bake the actor-group normalizer in front of a frozen copy of the actor."""
+        super().__init__()
+        actor = alg.get_policy()
+        if len(actor.obs_groups) != 1:
+            raise NotImplementedError(
+                f"BFM-Zero policy export supports a single actor obs group, got {actor.obs_groups}."
+            )
+        group = actor.obs_groups[0]
+        # external per-group normalizer (BatchNorm1d) applied before the actor during training
+        self.ext_normalizer = copy.deepcopy(alg.obs_normalizer.modules_dict[group])
+        # the actor's own normalizer (typically Identity, normalization is external)
+        self.actor_normalizer = copy.deepcopy(actor.obs_normalizer)
+        self.embeddings = copy.deepcopy(actor.embeddings)
+        self.trunk = copy.deepcopy(actor.trunk)
+        self.input_dims = list(actor.input_dims)
+        if actor.distribution is not None:
+            self.deterministic_output = actor.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+        # dummy-input dimensions for tracing / ONNX export
+        self.obs_dim = int(actor.obs_dim)
+        self.z_dim = int(next(dim for dim in self.input_dims if dim > 0))
+
+    def forward(self, obs: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Return the deterministic joint action for observation ``obs`` and task latent ``z``."""
+        latent = self.actor_normalizer(self.ext_normalizer(obs))
+        embed_inputs = [torch.cat([latent, z], dim=-1) if dim > 0 else latent for dim in self.input_dims]
+        embeds = [embedding(x) for embedding, x in zip(self.embeddings, embed_inputs, strict=True)]
+        trunk_output = self.trunk(torch.cat(embeds, dim=-1))
+        return self.deterministic_output(trunk_output)
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return representative dummy inputs ``(obs, z)`` for tracing / ONNX export."""
+        return (torch.zeros(1, self.obs_dim), torch.zeros(1, self.z_dim))
+
+    @property
+    def input_names(self) -> list[str]:
+        """ONNX input tensor names."""
+        return ["obs", "z"]
+
+    @property
+    def output_names(self) -> list[str]:
+        """ONNX output tensor names."""
+        return ["action"]
 
 
 class OffPolicyRunner:
@@ -256,38 +308,36 @@ class OffPolicyRunner:
         return self.alg.get_policy().to(device)  # type: ignore
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
-        """Export the model to a Torch JIT file."""
-        jit_model = self.alg.get_policy().as_jit()
-        jit_model.to("cpu")
+        """Export the BFM-Zero actor (with its obs normalizer baked in) to a Torch JIT file."""
+        export_model = _BfmZeroPolicyExport(self.alg).to("cpu").eval()
 
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
         save_path = os.path.join(path, filename)
 
-        # Trace and save the model
-        traced_model = torch.jit.script(jit_model)
+        # Trace (rather than script) so the FuseModel/ResMLP submodules export without annotation.
+        with torch.no_grad():
+            traced_model = torch.jit.trace(export_model, export_model.get_dummy_inputs())
         traced_model.save(save_path)
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
-        """Export the model into an ONNX file."""
-        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
-        onnx_model.to("cpu")
-        onnx_model.eval()
+        """Export the BFM-Zero actor (with its obs normalizer baked in) to an ONNX file."""
+        export_model = _BfmZeroPolicyExport(self.alg).to("cpu").eval()
 
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
         save_path = os.path.join(path, filename)
 
-        # Trace and save the model
         torch.onnx.export(
-            onnx_model,
-            onnx_model.get_dummy_inputs(),  # type: ignore
+            export_model,
+            export_model.get_dummy_inputs(),
             save_path,
             export_params=True,
             opset_version=18,
             verbose=verbose,
-            input_names=onnx_model.input_names,  # type: ignore
-            output_names=onnx_model.output_names,  # type: ignore
+            input_names=export_model.input_names,
+            output_names=export_model.output_names,
+            dynamic_axes={"obs": {0: "batch"}, "z": {0: "batch"}, "action": {0: "batch"}},
         )
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
