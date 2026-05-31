@@ -94,8 +94,22 @@ class RNNModel(MLPModel):
         """Reset the recurrent hidden state of the RNN."""
         self.rnn.reset(dones, hidden_state)
 
-    def get_hidden_state(self) -> HiddenState:
-        """Return the recurrent hidden state of the RNN."""
+    def get_hidden_state(self, batch_size: int | None = None, device: torch.device | None = None) -> HiddenState:
+        """Return the recurrent hidden state of the RNN.
+
+        If the hidden state has not yet been materialized (i.e. the model has never run a
+        forward pass) and ``batch_size`` is provided, lazily allocate a zero hidden state so
+        callers that snapshot the pre-step state (PPO ``act()`` on the first rollout step)
+        get a valid tensor rather than ``None``. This matches the TXL memory module which
+        pre-allocates its memory cache on the first rollout call. Without this, the saved
+        per-trajectory-start hidden buffer is short by ``num_envs`` entries (the step-0
+        entries of the very first rollout are skipped by ``_save_hidden_states``), and PPO's
+        first ``update()`` crashes with a GRU shape mismatch.
+        """
+        if self.rnn.hidden_state is None and batch_size is not None:
+            dev = device if device is not None else next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+            self.rnn._materialize_zero_hidden_state(batch_size, dev, dtype)
         return self.rnn.hidden_state  # type: ignore
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:

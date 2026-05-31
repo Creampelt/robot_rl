@@ -29,7 +29,23 @@ class RNN(nn.Module):
         super().__init__()
         rnn_cls = nn.GRU if type.lower() == "gru" else nn.LSTM
         self.rnn = rnn_cls(input_size=input_size, hidden_size=hidden_dim, num_layers=num_layers)
+        self.is_lstm = type.lower() == "lstm"
         self.hidden_state = None
+
+    def _materialize_zero_hidden_state(self, batch: int, device: torch.device, dtype: torch.dtype) -> None:
+        """Lazily allocate ``self.hidden_state`` to zeros for the very first rollout step.
+
+        Matches the TXL memory module. Without this, ``act()`` captures ``None`` at step 0
+        of the first rollout, ``_save_hidden_states`` skips the snapshot, and the saved
+        hidden-state buffer is missing one entry per env per layer. The PPO update then
+        crashes with a GRU/LSTM ``Expected hidden size`` shape mismatch when slicing the
+        saved buffer for a mini-batch (saved buffer is short by ``num_envs`` trajectory starts).
+        """
+        zeros = torch.zeros(self.rnn.num_layers, batch, self.rnn.hidden_size, device=device, dtype=dtype)
+        if self.is_lstm:
+            self.hidden_state = (zeros, zeros.clone())
+        else:
+            self.hidden_state = zeros
 
     def forward(
         self,
@@ -45,7 +61,11 @@ class RNN(nn.Module):
             out, _ = self.rnn(input, hidden_state)
             out = unpad_trajectories(out, masks)
         else:
-            # Inference/distillation mode uses hidden state of last step
+            # Inference/distillation mode uses hidden state of last step. Lazy-init to zeros on
+            # the first call so any prior ``get_hidden_state`` snapshot is a valid tensor rather
+            # than ``None`` (see :meth:`_materialize_zero_hidden_state`).
+            if self.hidden_state is None:
+                self._materialize_zero_hidden_state(input.shape[0], input.device, input.dtype)
             out, self.hidden_state = self.rnn(input.unsqueeze(0), self.hidden_state)
         return out
 

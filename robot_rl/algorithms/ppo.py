@@ -207,15 +207,33 @@ class PPO:
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
+        # Pre-step batch info for lazy-init of recurrent hidden states. ``get_hidden_state`` on the
+        # RNNModel will materialize a zero buffer the first time it is called (the TXL memory
+        # module already does this lazily inside its rollout forward). Without this, the very-first
+        # rollout's step-0 snapshot is ``None`` and ``_save_hidden_states`` skips it, leaving the
+        # saved trajectory-start buffer short by ``num_envs`` entries -> PPO ``update()`` crashes
+        # with a GRU/LSTM "Expected hidden size" shape mismatch on the first iteration. Models that
+        # don't accept these kwargs (MLP, TXL) ignore them.
+        batch_size = obs.batch_size[0]
+        device = obs.device
         if self.memory is not None:
-            self.transition.memory_hidden_state = self.memory.get_hidden_state()
+            try:
+                self.transition.memory_hidden_state = self.memory.get_hidden_state(batch_size=batch_size, device=device)
+            except TypeError:
+                self.transition.memory_hidden_state = self.memory.get_hidden_state()
             self.transition.hidden_states = (None, None)
             latent = self.memory(obs).detach()
             self.transition.actions = self.actor.forward_from_latent(latent, stochastic_output=True).detach()
             # Include additional critic obs for asymmetric actor-critic
             self.transition.values = self.critic.forward_from_latent(latent, obs=obs).detach()
         else:
-            self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
+            try:
+                actor_hs = self.actor.get_hidden_state(batch_size=batch_size, device=device)
+                critic_hs = self.critic.get_hidden_state(batch_size=batch_size, device=device)
+            except TypeError:
+                actor_hs = self.actor.get_hidden_state()
+                critic_hs = self.critic.get_hidden_state()
+            self.transition.hidden_states = (actor_hs, critic_hs)
             self.transition.actions = self.actor(obs, stochastic_output=True).detach()
             self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
