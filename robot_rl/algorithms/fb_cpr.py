@@ -386,7 +386,7 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def eval(self, env: URLVecEnv) -> list[dict[str, torch.Tensor]]:
+    def eval(self, env: URLVecEnv, max_steps: int | None = None) -> list[dict[str, torch.Tensor]]:
         r"""Evaluate motions and update priorities in expert buffer.
 
         Priorities are updated according to:
@@ -396,6 +396,10 @@ class FbCpr:
             2^\{4 * \min(2, \max(0.5, x))}
 
         where x is the Earth Mover's Distance between the actual and expert joint positions for each trajectory.
+
+        If ``max_steps`` is provided, ``env.step`` is called at most that many times across all
+        motion mini-batches and the loop breaks early -- intended for the video logger, which
+        only needs a bounded-length clip rather than the full priorities update.
         """
         print("[INFO] Evaluating motions...")
 
@@ -406,6 +410,7 @@ class FbCpr:
         eval_infos: list[dict[str, torch.Tensor]] = []
         bucket_size = self.expert_buffer.bucket_size
         idx = 0
+        steps_done = 0
         for eval_obs in self.expert_buffer.get_batch_motions(env.num_envs, device=self.device):
             mini_batch_size = eval_obs.shape[0]
             eval_motions = self.expert_buffer.get_expert_state(eval_obs)
@@ -430,6 +435,9 @@ class FbCpr:
                 actual_qpos[:, it, :] = self.expert_buffer.get_expert_state(obs)["joint_position"][:mini_batch_size].to(
                     self.device
                 )
+                steps_done += 1
+                if max_steps is not None and steps_done >= max_steps:
+                    break
             # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
             # Compare against frames 1..bucket_size-1 since actual_qpos[:, t] is the pose after targeting frame t+1.
             eval_qpos = eval_motions["joint_position"][:, 1:]
@@ -442,6 +450,8 @@ class FbCpr:
             eval_infos.append({"emd": emds.detach().cpu()})
 
             idx += mini_batch_size
+            if max_steps is not None and steps_done >= max_steps:
+                break
         self.expert_buffer.normalize_priorities()
 
         # Revert to train mode
