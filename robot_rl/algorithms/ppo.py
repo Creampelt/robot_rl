@@ -429,6 +429,40 @@ class PPO:
         if self.rnd:
             self.rnd.eval()
 
+    def eval(self, env: VecEnv, max_steps: int = 200) -> list[dict[str, torch.Tensor]]:
+        """Run a deterministic evaluation rollout for ``max_steps`` environment steps.
+
+        For vanilla PPO an "eval" rollout is just the inference loop -- no learning, no
+        stochasticity in the action (use the actor's deterministic mean), no transition
+        storage. Subclasses (FB-CPR etc.) override this to run a task-specific eval (e.g.
+        motion replay + EMD). Returns an empty list of per-batch info dicts for API parity
+        with the off-policy evaluators.
+
+        The caller is responsible for any env-side video wrapping: each ``env.step()`` here
+        will produce a rendered frame for any active ``gym.wrappers.RecordVideo`` wrapping
+        the env.
+        """
+        was_training = self.actor.training
+        self.eval_mode()
+        if hasattr(env, "eval_mode"):
+            env.eval_mode()
+
+        obs = env.get_observations() if hasattr(env, "get_observations") else env.reset()[0]
+        # Reset any recurrent / TXL state on the actor so the video starts from a clean context.
+        if hasattr(self.actor, "reset"):
+            self.actor.reset()
+
+        with torch.inference_mode():
+            for _ in range(max_steps):
+                actions = self.actor(obs, stochastic_output=False)
+                obs, _, _, _ = env.step(actions)
+
+        if was_training:
+            self.train_mode()
+            if hasattr(env, "train_mode"):
+                env.train_mode()
+        return []
+
     def save(self) -> dict:
         """Return a dict of all models for saving."""
         saved_dict = {

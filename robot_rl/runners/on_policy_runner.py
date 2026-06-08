@@ -134,11 +134,19 @@ class OnPolicyRunner:
             self.logger.stop_logging_writer()
 
     def save(self, path: str, infos: dict | None = None) -> None:
-        """Save the models and training state to a given path and upload them if external logging is used."""
+        """Save the models and training state to a given path and upload them if external logging is used.
+
+        The torch.save -> os.replace pattern makes the write atomic from a reader's POV: the
+        target path is either nonexistent or fully formed. Without this, a sibling process
+        (notably the out-of-process video_logger) can ``torch.load`` a partial multi-GB file
+        mid-write and crash with ``PytorchStreamReader failed reading zip archive``.
+        """
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
         saved_dict["infos"] = infos
-        torch.save(saved_dict, path)
+        tmp_path = path + ".tmp"
+        torch.save(saved_dict, tmp_path)
+        os.replace(tmp_path, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
 

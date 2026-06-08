@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 from dataclasses import asdict
@@ -24,8 +25,9 @@ class WandbSummaryWriter(SummaryWriter):
         """Initialize a W&B run for logging."""
         super().__init__(log_dir, flush_secs=flush_secs)
 
-        # Get the run name
-        run_name = os.path.split(log_dir)[-1]
+        # Get the run name and group
+        run_name = cfg.get("wandb_run_name") or os.path.split(log_dir)[-1]
+        group = cfg.get("wandb_group") or None
 
         # Get wandb project and entity
         try:
@@ -46,6 +48,7 @@ class WandbSummaryWriter(SummaryWriter):
             settings.x_label = "main"
             settings.mode = "shared"
             settings.x_primary = True
+        if cfg.get("log_videos_async"):
             tags.append("log_videos_async")
 
         # Initialize wandb
@@ -53,6 +56,7 @@ class WandbSummaryWriter(SummaryWriter):
             project=project,
             entity=entity,
             name=run_name,
+            group=group,
             config={"log_dir": log_dir},
             settings=settings,
             tags=tags,
@@ -61,6 +65,22 @@ class WandbSummaryWriter(SummaryWriter):
         # Define custom metrics
         self.run.define_metric("*", step_metric="local_step")  # global step (custom defined for async video logging)
         self.run.define_metric("*", step_metric="env_step")  # env step (step * num_envs)
+
+        # Publish the W&B run identity so out-of-process logger can attach to this exact run
+        if self.shared:
+            try:
+                with open(os.path.join(log_dir, "wandb_run.json"), "w") as f:
+                    json.dump(
+                        {
+                            "id": self.run.id,
+                            "project": project,
+                            "entity": entity,
+                            "num_envs": num_envs,
+                        },
+                        f,
+                    )
+            except OSError:
+                pass
 
         # Initialize set to keep track of logged videos
         self.logged_videos: set[str] = set()
