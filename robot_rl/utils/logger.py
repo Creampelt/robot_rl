@@ -257,9 +257,13 @@ class Logger:
             )
             print(log_string)
 
-            # Upload available videos
+            # Upload available videos. Skip the out-of-process video logger's own dir: it attaches
+            # to this same W&B run and logs those clips at their checkpoint step, so re-uploading
+            # here would duplicate each video at the (drifted) current iteration.
             if self.logger_type == "wandb":
                 for video in pathlib.Path(self.log_dir).rglob("*.mp4"):  # type: ignore
+                    if "video_logger" in video.parts:
+                        continue
                     self.writer.save_video(video, it)  # type: ignore
 
             # Clear extras buffer
