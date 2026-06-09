@@ -14,6 +14,11 @@ Library Features
 RSL-RL is intentionally kept minimal and focuses on a small set of components that cover common robotics workflows while
 remaining easy to adapt. The following sections summarize the main features currently available.
 
+.. note::
+   Adding new algorithms, models, or loggers is straightforward and does not require modifying the library itself.
+   Custom classes can simply be passed as part of the configuration, enabling users to work with the pip version of the
+   library.
+
 Algorithms
 ^^^^^^^^^^
 
@@ -57,9 +62,14 @@ Distributions
    log-scale.
 
 :class:`~rsl_rl.modules.distribution.HeteroscedasticGaussianDistribution`
-   A diagonal Gaussian distribution with state-dependent standard deviation. The model's MLP network predicts both mean 
+   A diagonal Gaussian distribution with state-dependent standard deviation. The model's MLP network predicts both mean
    and standard-deviation terms per sample, allowing uncertainty to vary with the observation. As with the standard
    Gaussian variant, both scalar and log-scale parameterizations are supported.
+
+:class:`~rsl_rl.modules.distribution.BetaDistribution`
+   A Beta distribution for bounded action spaces. Samples are naturally constrained to [0, 1] and linearly rescaled to a
+   configurable action range. The concentration parameters are predicted by the model's MLP and constrained to guarantee
+   a unimodal distribution.
 
 Extensions
 ^^^^^^^^^^
@@ -71,7 +81,7 @@ Extensions
    reward contribution over the training. This extension is compatible with the :class:`~rsl_rl.algorithms.ppo.PPO`
    algorithm. For more details, please check `this paper <https://proceedings.mlr.press/v229/schwarke23a.html>`__.
 
-Symmetry
+:class:`~rsl_rl.extensions.symmetry.Symmetry`
    Symmetry augments the collected environment interaction data with mirrored data using a user-provided symmetry 
    function that defines how observations and actions are transformed. This can improve sample efficiency and promote
    symmetric behaviors for robots with structured morphology. Additionally, a mirror-loss regularization term can be
@@ -193,7 +203,9 @@ not constrain the way an **Extension** may be implemented, allowing for arbitrar
 Utils
 ^^^^^
 **Utils** include various helpers for the library, such as a :class:`~rsl_rl.utils.logger.Logger` to record the learning
-process, or functions to resolve configuration settings.
+process, or functions to resolve configuration settings. For example, the :func:`~rsl_rl.utils.utils.resolve_callable` 
+function allows users to pass classes via the configuration dictionary, enabling the use of custom models, loggers, etc. 
+without modifying the library.
 
 .. _example-integration:
 

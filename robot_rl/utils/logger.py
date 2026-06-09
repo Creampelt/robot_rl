@@ -6,16 +6,18 @@
 
 from __future__ import annotations
 
+import datetime
 import git
 import os
 import pathlib
 import statistics
-import time
 import torch
+import warnings
 from collections import deque
 
 import robot_rl
-from robot_rl.utils import format_date
+from robot_rl.utils.log_writer import LogWriter
+from robot_rl.utils.utils import resolve_callable
 
 
 class Logger:
@@ -43,6 +45,9 @@ class Logger:
         self.tot_timesteps = 0
         self.tot_time = 0
 
+        self.writer: LogWriter | None = None
+        self.logger_type: str | None = None
+
         # Create buffers
         self.ep_extras: list[dict] = []
         self.eval_extras: list[dict] = []
@@ -65,40 +70,67 @@ class Logger:
         self.disable_logs = is_distributed and gpu_global_rank != 0
 
     def init_logging_writer(self) -> None:
-        """Initialize the logging writer, which can be either Tensorboard, W&B or Neptune and save the code state.
+        """Initialize the logging writer and save the code state.
 
-        If the writer is either W&B or Neptune, the configuration and code state are uploaded as well.
+        .. note::
+            The writer is constructed from ``cfg["logger"]``, which should be a dict with a ``"class_name"`` key plus
+            any additional constructor kwargs (see :class:`~robot_rl.utils.LogWriter`). The plain string aliases
+            ``"wandb"`` and ``"neptune"`` are deprecated; use ``"WandbLogWriter"`` and ``"NeptuneLogWriter"`` in the
+            dict form instead. ``"tensorboard"`` (the default) is still accepted as a plain string.
         """
         if self.log_dir is not None and not self.disable_logs:
-            self.logger_type = self.cfg.get("logger", "tensorboard")
-            self.logger_type = self.logger_type.lower()
-            if self.logger_type == "neptune":
-                from robot_rl.utils.neptune_utils import NeptuneSummaryWriter
+            logger_cfg = self.cfg.get("logger", "tensorboard")
+            self.logger_type = logger_cfg if isinstance(logger_cfg, str) else logger_cfg.pop("class_name")
 
-                self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
-            elif self.logger_type == "wandb":
-                from robot_rl.utils.wandb_utils import WandbSummaryWriter
-
-                self.writer = WandbSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, num_envs=self.num_envs, cfg=self.cfg
+            # Handle deprecated plain string logger types for W&B and Neptune
+            if self.logger_type == "wandb" and isinstance(logger_cfg, str):
+                warnings.warn(
+                    "cfg['logger'] = 'wandb' is deprecated. "
+                    "Use cfg['logger'] = {'class_name': 'WandbLogWriter', 'project_name': ...} instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
                 )
-            elif self.logger_type == "tensorboard":
+                self.logger_type = "WandbLogWriter"
+                logger_cfg = {
+                    "project_name": self.cfg.get("wandb_project"),
+                    "run_name": self.cfg.get("wandb_run_name"),
+                    "group": self.cfg.get("wandb_group"),
+                    "shared": self.cfg.get("shared", False),
+                    "log_videos_async": self.cfg.get("log_videos_async", False),
+                }
+            elif self.logger_type == "neptune" and isinstance(logger_cfg, str):
+                warnings.warn(
+                    "cfg['logger'] = 'neptune' is deprecated. "
+                    "Use cfg['logger'] = {'class_name': 'NeptuneLogWriter', 'project_name': ...} instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                self.logger_type = "NeptuneLogWriter"
+                logger_cfg = {"project_name": self.cfg.get("neptune_project")}
+
+            if self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
 
-                self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+                self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)  # type: ignore
             else:
-                raise ValueError("Logger type not found. Please choose 'wandb', 'neptune', or 'tensorboard'.")
+                from robot_rl.utils.wandb_log_writer import WandbLogWriter
+
+                writer_class = resolve_callable(self.logger_type)
+                # The W&B writer logs environment steps as a custom metric, so inject the env count
+                if isinstance(writer_class, type) and issubclass(writer_class, WandbLogWriter):
+                    logger_cfg.setdefault("num_envs", self.num_envs)
+                self.writer = writer_class(log_dir=self.log_dir, **logger_cfg)  # type: ignore
         else:
             self.writer = None
 
         # Save code state
         files_to_upload = self._store_code_state()
 
-        # Upload configuration and code state to external logging service if applicable
-        if self.writer is not None and self.logger_type in ["wandb", "neptune"]:
-            self.writer.store_config(self.env_cfg, self.cfg)  # type: ignore
+        # Upload configuration and code state to external logging service if supported
+        if isinstance(self.writer, LogWriter):
+            self.writer.store_config(self.env_cfg, self.cfg)
             for path in files_to_upload:
-                self.writer.save_file(path)  # type: ignore
+                self.writer.save_file(path)
 
     def process_env_step(
         self,
@@ -229,7 +261,7 @@ class Logger:
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
-                if self.logger_type != "wandb":
+                if self.logger_type != "WandbLogWriter":
                     self.writer.add_scalar(
                         "Train/mean_reward/time", statistics.mean(self.rewbuffer), int(self.tot_time)
                     )
@@ -282,19 +314,20 @@ class Logger:
             log_string += (
                 f"""{"-" * width}\n"""
                 f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-                f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-                f"""{"ETA:":>{pad}} {format_date("%D days %H:%M:%S", eta)}\n"""
+                f"""{"Time elapsed:":>{pad}} {datetime.timedelta(seconds=int(self.tot_time))}\n"""
+                f"""{"ETA:":>{pad}} {datetime.timedelta(seconds=int(eta))}\n"""
             )
             print(log_string)
 
-            # Upload available videos. Skip the out-of-process video logger's own dir: it attaches
-            # to this same W&B run and logs those clips at their checkpoint step, so re-uploading
-            # here would duplicate each video at the (drifted) current iteration.
-            if self.logger_type == "wandb":
+            # Upload available videos to external logging service if supported. Skip the out-of-process
+            # video logger's own dir: it attaches to this same W&B run and logs those clips at their
+            # checkpoint step, so re-uploading here would duplicate each video at the (drifted) current
+            # iteration.
+            if isinstance(self.writer, LogWriter):
                 for video in pathlib.Path(self.log_dir).rglob("*.mp4"):  # type: ignore
                     if "video_logger" in video.parts:
                         continue
-                    self.writer.save_video(video, it)  # type: ignore
+                    self.writer.save_video(video, it)
 
             # Clear extras buffers
             self.ep_extras.clear()
@@ -303,14 +336,14 @@ class Logger:
             self.algo_extras.clear()
 
     def save_model(self, path: str, it: int) -> None:
-        """Save the model to external logging services if specified."""
-        if self.writer is not None and self.logger_type in ["neptune", "wandb"]:
-            self.writer.save_model(path, it)  # type: ignore
+        """Save the model to external logging service if specified."""
+        if isinstance(self.writer, LogWriter):
+            self.writer.save_model(path, it)
 
     def stop_logging_writer(self) -> None:
         """Stop the logging writer."""
-        if self.writer is not None and self.logger_type in ["neptune", "wandb"]:
-            self.writer.stop()  # type: ignore
+        if isinstance(self.writer, LogWriter):
+            self.writer.stop()
 
     def _store_code_state(self) -> list[str]:
         """Store the current git diff of the code repositories involved in the experiment."""
@@ -358,7 +391,7 @@ class Logger:
         extras_string = ""
         if extras:
             # Iterate over all keys in the episode info dictionary
-            for key in extras[0]:
+            for key in {k for info in extras for k in info}:
                 infotensor = torch.tensor([], device=self.device)
                 # Iterate over all steps
                 for info in extras:

@@ -31,11 +31,12 @@ class RandomNetworkDistillation(nn.Module):
         predictor_hidden_dims: tuple[int, ...] | list[int],
         target_hidden_dims: tuple[int, ...] | list[int],
         activation: str = "elu",
-        weight: float = 0.0,
         state_normalization: bool = False,
         reward_normalization: bool = False,
-        device: str = "cpu",
+        weight: float = 0.0,
         weight_schedule: dict | None = None,
+        learning_rate: float = 1e-3,
+        device: str = "cpu",
     ) -> None:
         """Initialize the RND module.
 
@@ -53,10 +54,9 @@ class RandomNetworkDistillation(nn.Module):
             predictor_hidden_dims: List of hidden dimensions of the predictor network.
             target_hidden_dims: List of hidden dimensions of the target network.
             activation: Activation function.
-            weight: Scaling factor of the intrinsic reward.
             state_normalization: Whether to normalize the input state.
             reward_normalization: Whether to normalize the intrinsic reward.
-            device: Device to use.
+            weight: Scaling factor of the intrinsic reward.
             weight_schedule: Type of schedule to use for the RND weight parameter.
                 It is a dictionary with the following keys:
 
@@ -74,6 +74,8 @@ class RandomNetworkDistillation(nn.Module):
                 - "initial_step": Step at which the weight parameter is set to the initial value.
                 - "final_step": Step at which the weight parameter is set to the final value.
                 - "final_value": Final value of the weight parameter.
+            learning_rate: Learning rate for the RND optimizer.
+            device: Device to use.
         """
         # Initialize parent class
         super().__init__()
@@ -112,11 +114,14 @@ class RandomNetworkDistillation(nn.Module):
             self.weight_scheduler = None
 
         # Create network architecture
-        self.predictor = MLP(num_states, num_outputs, predictor_hidden_dims, activation).to(self.device)
-        self.target = MLP(num_states, num_outputs, target_hidden_dims, activation).to(self.device)
+        self.predictor = MLP(num_states, num_outputs, predictor_hidden_dims, activation=activation).to(self.device)
+        self.target = MLP(num_states, num_outputs, target_hidden_dims, activation=activation).to(self.device)
 
         # Make target network not trainable
         self.target.eval()
+
+        # Optimizer for the predictor (the target is frozen)
+        self.optimizer = torch.optim.Adam(self.predictor.parameters(), lr=learning_rate)
 
     def get_intrinsic_reward(self, obs: TensorDict) -> torch.Tensor:
         """Compute weighted intrinsic rewards from prediction error in embedding space."""
@@ -141,6 +146,17 @@ class RandomNetworkDistillation(nn.Module):
         intrinsic_reward *= self.weight
 
         return intrinsic_reward
+
+    def compute_loss(self, obs: TensorDict) -> torch.Tensor:
+        """Compute the predictor loss (MSE between predicted and target embeddings)."""
+        # Prepare the RND state; normalizer statistics are not updated here
+        with torch.no_grad():
+            rnd_state = self.get_rnd_state(obs)
+            rnd_state = self.state_normalizer(rnd_state)
+        # Predictor is trainable, target is frozen
+        predicted_embedding = self.predictor(rnd_state)
+        target_embedding = self.target(rnd_state).detach()
+        return nn.functional.mse_loss(predicted_embedding, target_embedding)
 
     def forward(self, *args: Any, **kwargs: Any) -> NoReturn:
         """Disallow generic forward calls for this module."""
