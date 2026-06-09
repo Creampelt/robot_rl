@@ -12,34 +12,41 @@ import pathlib
 from dataclasses import asdict
 from torch.utils.tensorboard import SummaryWriter
 
+from robot_rl.utils.log_writer import LogWriter
+
 try:
     import wandb
 except ModuleNotFoundError:
-    raise ModuleNotFoundError("wandb package is required to log to Weights and Biases.") from None
+    wandb = None
 
 
-class WandbSummaryWriter(SummaryWriter):
+class WandbLogWriter(SummaryWriter, LogWriter):
     """Summary writer for W&B."""
 
-    def __init__(self, log_dir: str, flush_secs: int, num_envs: int, cfg: dict) -> None:
+    def __init__(
+        self,
+        log_dir: str,
+        project_name: str,
+        run_name: str | None = None,
+        group: str | None = None,
+        num_envs: int = 1,
+        shared: bool = False,
+        log_videos_async: bool = False,
+    ) -> None:
         """Initialize a W&B run for logging."""
-        super().__init__(log_dir, flush_secs=flush_secs)
+        if wandb is None:
+            raise ModuleNotFoundError("wandb package is required to log to Weights and Biases.")
+        super().__init__(log_dir, flush_secs=10)
 
-        # Get the run name and group
-        run_name = cfg.get("wandb_run_name") or os.path.split(log_dir)[-1]
-        group = cfg.get("wandb_group") or None
+        # Get the run name
+        run_name = run_name or os.path.split(log_dir)[-1]
 
-        # Get wandb project and entity
-        try:
-            project = cfg["wandb_project"]
-        except KeyError:
-            raise KeyError("Please specify wandb_project in the runner config, e.g. legged_gym.") from None
         try:
             entity = os.environ["WANDB_USERNAME"]
         except KeyError:
             entity = None
 
-        self.shared = cfg.get("shared", False)
+        self.shared = shared
         self.num_envs = num_envs
 
         settings = wandb.Settings(start_method="thread")
@@ -48,15 +55,15 @@ class WandbSummaryWriter(SummaryWriter):
             settings.x_label = "main"
             settings.mode = "shared"
             settings.x_primary = True
-        if cfg.get("log_videos_async"):
+        if log_videos_async:
             tags.append("log_videos_async")
 
         # Initialize wandb
         self.run = wandb.init(
-            project=project,
+            project=project_name,
             entity=entity,
             name=run_name,
-            group=group,
+            group=group or None,
             config={"log_dir": log_dir},
             settings=settings,
             tags=tags,
@@ -73,7 +80,7 @@ class WandbSummaryWriter(SummaryWriter):
                     json.dump(
                         {
                             "id": self.run.id,
-                            "project": project,
+                            "project": project_name,
                             "entity": entity,
                             "num_envs": num_envs,
                         },
@@ -85,6 +92,21 @@ class WandbSummaryWriter(SummaryWriter):
         # Initialize set to keep track of logged videos
         self.logged_videos: set[str] = set()
 
+    def add_scalar(
+        self,
+        tag: str,
+        scalar_value: float,
+        global_step: int | None = None,
+        walltime: float | None = None,
+        new_style: bool = False,
+    ) -> None:
+        """Log a scalar to both TensorBoard and W&B."""
+        super().add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime, new_style=new_style)
+        self.run.log(
+            {tag: scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs},
+            step=global_step if not self.shared else None,
+        )
+
     def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
         """Upload environment and training configuration to W&B."""
         self.run.config.update({"train_cfg": train_cfg})
@@ -92,31 +114,6 @@ class WandbSummaryWriter(SummaryWriter):
             self.run.config.update({"env_cfg": env_cfg.to_dict()})  # type: ignore
         except Exception:
             self.run.config.update({"env_cfg": asdict(env_cfg)})  # type: ignore
-
-    def add_scalar(
-        self,
-        tag: str,
-        scalar_value: float,
-        global_step: int,
-        walltime: float | None = None,
-        new_style: bool = False,
-    ) -> None:
-        """Log a scalar to both TensorBoard and W&B."""
-        super().add_scalar(
-            tag,
-            scalar_value,
-            global_step=global_step,
-            walltime=walltime,
-            new_style=new_style,
-        )
-        self.run.log(
-            {tag: scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs},
-            step=global_step if not self.shared else None,
-        )
-
-    def stop(self) -> None:
-        """Finish the active W&B run."""
-        self.run.finish()
 
     def save_model(self, model_path: str, it: int) -> None:
         """Upload a model checkpoint artifact to W&B."""
@@ -134,3 +131,7 @@ class WandbSummaryWriter(SummaryWriter):
                 step=it if not self.shared else None,
             )
             self.logged_videos.add(video.name)
+
+    def stop(self) -> None:
+        """Finish the active W&B run."""
+        self.run.finish()

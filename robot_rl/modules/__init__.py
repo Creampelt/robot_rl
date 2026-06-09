@@ -8,6 +8,7 @@
 from .cnn import CNN
 from .dict_module import DictModule
 from .distribution import (
+    BetaDistribution,
     Distribution,
     GaussianDistribution,
     HeteroscedasticGaussianDistribution,
@@ -28,6 +29,7 @@ __all__ = [
     "CNN",
     "MLP",
     "RNN",
+    "BetaDistribution",
     "DictModule",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",

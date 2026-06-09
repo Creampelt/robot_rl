@@ -5,8 +5,11 @@
 
 """Helper functions."""
 
+from .log_writer import LogWriter
+from .neptune_log_writer import NeptuneLogWriter
 from .utils import (
     check_nan,
+    compile_model,
     compute_emd,
     compute_td_targets,
     eval_mode,
@@ -25,9 +28,14 @@ from .utils import (
     split_and_pad_trajectories,
     unpad_trajectories,
 )
+from .wandb_log_writer import WandbLogWriter
 
 __all__ = [
+    "LogWriter",
+    "NeptuneLogWriter",
+    "WandbLogWriter",
     "check_nan",
+    "compile_model",
     "compute_emd",
     "compute_td_targets",
     "eval_mode",

@@ -102,7 +102,10 @@ class ReplayBuffer:
         # Core
         # We only take value.shape[1:] to ignore num_envs dimension
         self.observations = TensorDict(
-            {key: torch.zeros(self.capacity, *value.shape[1:], device=device) for key, value in obs.items()},
+            {
+                key: torch.zeros(self.capacity, *value.shape[1:], dtype=value.dtype, device=device)
+                for key, value in obs.items()
+            },
             batch_size=self.capacity,
             device=self.device,
         )

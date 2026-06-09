@@ -195,9 +195,7 @@ class MLPModel(nn.Module):
     def get_latent(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Build the model latent by concatenating and normalizing selected observation groups and additional inputs."""
         # Select and concatenate observations
-        obs_list: list[torch.Tensor] = [obs[obs_group] for obs_group in self.obs_groups]
-        # Concatenate input into latent tensor
-        latent: torch.Tensor = torch.cat(obs_list, dim=-1)
+        latent = torch.cat([obs[obs_group] for obs_group in self.obs_groups], dim=-1)
         # Normalize observations
         latent = self.obs_normalizer(latent)
         # Add additional tensor input
