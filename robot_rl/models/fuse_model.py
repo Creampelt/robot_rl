@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -113,6 +114,14 @@ class FuseModel(MLPModel):
         self.trunk.init_weights(1.0)
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.trunk)
+
+    def as_jit(self) -> nn.Module:
+        """Return a version of the model compatible with Torch JIT (trace) export."""
+        return _TorchFuseModel(self)
+
+    def as_onnx(self, verbose: bool = False) -> nn.Module:
+        """Return a version of the model compatible with ONNX export."""
+        return _TorchFuseModel(self)
 
     def forward(
         self,
@@ -298,3 +307,49 @@ class ResidualFuseModel(FuseModel):
         return ResMLP(
             input_dim, output_dim, hidden_dims, num_parallel, activation, last_activation, first_residual=True
         )
+
+
+class _TorchFuseModel(nn.Module):
+    """Exportable fuse model: deterministic ``forward(obs, *inputs)`` on plain tensors.
+
+    Observations are pre-concatenated. Serves both TorchScript (traced; see ``jit_trace``) and ONNX.
+    """
+
+    jit_trace = True
+    """FuseModel submodules don't script; exporters must trace with :meth:`get_dummy_inputs`."""
+
+    def __init__(self, model: FuseModel) -> None:
+        super().__init__()
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.embeddings = copy.deepcopy(model.embeddings)
+        self.trunk = copy.deepcopy(model.trunk)
+        self.input_dims = list(model.input_dims)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+        self.obs_dim = int(model.obs_dim)
+        self.other_dims = [int(dim) for dim in model.input_dims if dim > 0]
+
+    def forward(self, obs: torch.Tensor, *inputs: torch.Tensor) -> torch.Tensor:
+        latent = self.obs_normalizer(obs)
+        embed_outputs = []
+        arg_idx = 0
+        for embedding, dim in zip(self.embeddings, self.input_dims, strict=True):
+            x = latent
+            if dim > 0:
+                x = torch.cat([latent, inputs[arg_idx]], dim=-1)
+                arg_idx += 1
+            embed_outputs.append(embedding(x))
+        return self.deterministic_output(self.trunk(torch.cat(embed_outputs, dim=-1)))
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
+        return (torch.zeros(1, self.obs_dim), *(torch.zeros(1, dim) for dim in self.other_dims))
+
+    @property
+    def input_names(self) -> list[str]:
+        return ["obs", *(f"input_{i}" for i in range(len(self.other_dims)))]
+
+    @property
+    def output_names(self) -> list[str]:
+        return ["output"]

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import contextlib
-import copy
 import os
 import time
 import torch
-import torch.nn as nn
 from datetime import timedelta
 from typing import Any
 
@@ -13,57 +11,8 @@ from robot_rl.algorithms import FbCpr
 from robot_rl.env import URLVecEnv
 from robot_rl.models import MLPModel
 from robot_rl.utils import check_nan, resolve_callable
+from robot_rl.utils.export import _BfmZeroPolicyExport
 from robot_rl.utils.logger import Logger
-
-
-class _BfmZeroPolicyExport(nn.Module):
-    """Export-friendly composition of the FB-CPR actor and its (external) observation normalizer."""
-
-    def __init__(self, alg: FbCpr) -> None:
-        """Bake the actor-group normalizer in front of a frozen copy of the actor."""
-        super().__init__()
-        actor = alg.get_policy()
-        if len(actor.obs_groups) != 1:
-            raise NotImplementedError(
-                f"BFM-Zero policy export supports a single actor obs group, got {actor.obs_groups}."
-            )
-        group = actor.obs_groups[0]
-        # external per-group normalizer (BatchNorm1d) applied before the actor during training
-        self.ext_normalizer = copy.deepcopy(alg.obs_normalizer.modules_dict[group])
-        # the actor's own normalizer (typically Identity, normalization is external)
-        self.actor_normalizer = copy.deepcopy(actor.obs_normalizer)
-        self.embeddings = copy.deepcopy(actor.embeddings)
-        self.trunk = copy.deepcopy(actor.trunk)
-        self.input_dims = list(actor.input_dims)
-        if actor.distribution is not None:
-            self.deterministic_output = actor.distribution.as_deterministic_output_module()
-        else:
-            self.deterministic_output = nn.Identity()
-        # dummy-input dimensions for tracing / ONNX export
-        self.obs_dim = int(actor.obs_dim)
-        self.z_dim = int(next(dim for dim in self.input_dims if dim > 0))
-
-    def forward(self, obs: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Return the deterministic joint action for observation ``obs`` and task latent ``z``."""
-        latent = self.actor_normalizer(self.ext_normalizer(obs))
-        embed_inputs = [torch.cat([latent, z], dim=-1) if dim > 0 else latent for dim in self.input_dims]
-        embeds = [embedding(x) for embedding, x in zip(self.embeddings, embed_inputs, strict=True)]
-        trunk_output = self.trunk(torch.cat(embeds, dim=-1))
-        return self.deterministic_output(trunk_output)
-
-    def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return representative dummy inputs ``(obs, z)`` for tracing / ONNX export."""
-        return (torch.zeros(1, self.obs_dim), torch.zeros(1, self.z_dim))
-
-    @property
-    def input_names(self) -> list[str]:
-        """ONNX input tensor names."""
-        return ["obs", "z"]
-
-    @property
-    def output_names(self) -> list[str]:
-        """ONNX output tensor names."""
-        return ["action"]
 
 
 class OffPolicyRunner:
