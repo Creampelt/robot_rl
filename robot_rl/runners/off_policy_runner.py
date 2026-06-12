@@ -11,7 +11,7 @@ from robot_rl.algorithms import FbCpr
 from robot_rl.env import URLVecEnv
 from robot_rl.models import MLPModel
 from robot_rl.utils import check_nan, resolve_callable
-from robot_rl.utils.export import _BfmZeroPolicyExport
+from robot_rl.utils.export import bake_live_normalizer, save_jit, save_onnx
 from robot_rl.utils.logger import Logger
 
 
@@ -305,36 +305,13 @@ class OffPolicyRunner:
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
         """Export the BFM-Zero actor (with its obs normalizer baked in) to a Torch JIT file."""
-        export_model = _BfmZeroPolicyExport(self.alg).to("cpu").eval()
-
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        save_path = os.path.join(path, filename)
-
-        # Trace (rather than script) so the FuseModel/ResMLP submodules export without annotation.
-        with torch.no_grad():
-            traced_model = torch.jit.trace(export_model, export_model.get_dummy_inputs())
-        traced_model.save(save_path)
+        export_model = bake_live_normalizer(self.alg.get_policy(), self.alg.obs_normalizer).to("cpu")
+        save_jit(export_model.as_jit(), path, filename)
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
         """Export the BFM-Zero actor (with its obs normalizer baked in) to an ONNX file."""
-        export_model = _BfmZeroPolicyExport(self.alg).to("cpu").eval()
-
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        save_path = os.path.join(path, filename)
-
-        torch.onnx.export(
-            export_model,
-            export_model.get_dummy_inputs(),
-            save_path,
-            export_params=True,
-            opset_version=18,
-            verbose=verbose,
-            input_names=export_model.input_names,
-            output_names=export_model.output_names,
-            dynamic_axes={"obs": {0: "batch"}, "z": {0: "batch"}, "action": {0: "batch"}},
-        )
+        export_model = bake_live_normalizer(self.alg.get_policy(), self.alg.obs_normalizer).to("cpu")
+        save_onnx(export_model.as_onnx(verbose), path, filename, verbose)
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""
