@@ -143,6 +143,10 @@ class OnPolicyRunner:
         """
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
+        # Persist the cumulative env-step count (per-env steps x effective env count) so a resume can
+        # reconstruct the curriculum clock at the same sample budget regardless of the env/GPU count
+        # this run uses vs. the original (see load()).
+        saved_dict["env_step"] = int(self.env.unwrapped.common_step_counter) * self.env.num_envs * self.gpu_world_size
         saved_dict["infos"] = infos
         tmp_path = path + ".tmp"
         torch.save(saved_dict, tmp_path)
@@ -166,7 +170,16 @@ class OnPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
-            self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.cfg["num_steps_per_env"]  # type: ignore
+            # Restore the curriculum clock (env.common_step_counter) from the persisted cumulative
+            # env-step count, dividing by THIS run's effective env count. Curriculum step params are
+            # env-scaled per run (train.py), so reconstructing from the iteration alone would make the
+            # curriculum fraction jump on a resume whose env/GPU count differs from the original.
+            effective_envs = self.env.num_envs * self.gpu_world_size
+            env_step = loaded_dict.get("env_step")
+            if env_step is not None:
+                self.env.unwrapped.common_step_counter = round(env_step / effective_envs)  # type: ignore
+            else:
+                self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.cfg["num_steps_per_env"]  # type: ignore
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device: str | None = None) -> MLPModel:
