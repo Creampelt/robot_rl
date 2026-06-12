@@ -145,17 +145,27 @@ class TransformerXL(nn.Module):
             return self._forward_rollout(input)
         return self._forward_batch(input, masks, hidden_state)
 
+    def _materialize_zero_memory(self, batch: int, device: torch.device, dtype: torch.dtype) -> None:
+        """Lazily allocate :attr:`memory` to per-layer zero tensors of shape ``[2L-1, batch, d_model]``.
+
+        Mirrors :meth:`robot_rl.modules.rnn.RNN._materialize_zero_hidden_state`. Without this, the first
+        PPO ``act()`` snapshots :attr:`memory` ``= None`` for the step-0 trajectory starts; the rollout
+        storage then drops those ``num_envs`` starts and the recurrent mini-batch generator produces a
+        hidden-state batch dim that is short by ``num_envs`` (manifests as a ``cat`` shape mismatch in
+        :class:`_TransformerXLLayer.forward`).
+        """
+        self.memory = tuple(
+            torch.zeros(self.rollout_mem_len, batch, self.d_model, device=device, dtype=dtype)
+            for _ in range(self.num_layers)
+        )
+
     def _forward_rollout(self, input: torch.Tensor) -> torch.Tensor:
         """Single-step inference. Updates and reads ``self.memory`` (length ``2L-1``) in place."""
         x = self.input_proj(input).unsqueeze(0)  # [1, batch, d_model]
 
         # Pre-allocate full-size zero memory so the saved-hidden-state buffer has a stable shape.
         if self.memory is None:
-            batch = x.shape[1]
-            self.memory = tuple(
-                torch.zeros(self.rollout_mem_len, batch, self.d_model, device=x.device, dtype=x.dtype)
-                for _ in range(self.num_layers)
-            )
+            self._materialize_zero_memory(x.shape[1], x.device, x.dtype)
 
         prev_mem: list[torch.Tensor] = list(self.memory)
         new_mem: list[torch.Tensor] = []

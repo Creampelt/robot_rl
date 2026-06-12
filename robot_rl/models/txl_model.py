@@ -95,8 +95,20 @@ class TXLModel(MLPModel):
         """Reset the TXL memory cache."""
         self.memory_module.reset(dones, hidden_state)  # type: ignore[arg-type]
 
-    def get_hidden_state(self) -> HiddenState:
-        """Return the per-layer rolling KV cache as a tuple of ``[2L-1, num_envs, d_model]`` tensors."""
+    def get_hidden_state(self, batch_size: int | None = None, device: torch.device | None = None) -> HiddenState:
+        """Return the per-layer rolling KV cache as a tuple of ``[2L-1, batch_size, d_model]`` tensors.
+
+        If the cache has not yet been materialized (no rollout step has run) and ``batch_size`` is
+        provided, lazily allocate per-layer zero memories of the correct shape so callers that
+        snapshot the pre-step state (PPO ``act()`` on the very first rollout step) get a valid
+        tensor rather than ``None``. Mirrors :meth:`RNNModel.get_hidden_state`. Without this the
+        saved trajectory-start buffer is short by ``num_envs`` snapshots and PPO's first
+        ``update()`` crashes with a TXL ``cat`` shape mismatch.
+        """
+        if self.memory_module.memory is None and batch_size is not None:
+            dev = device if device is not None else next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+            self.memory_module._materialize_zero_memory(batch_size, dev, dtype)
         return self.memory_module.memory  # type: ignore[return-value]
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
