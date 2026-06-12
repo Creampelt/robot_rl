@@ -6,6 +6,7 @@ import os
 import time
 import torch
 import torch.nn as nn
+from datetime import timedelta
 from typing import Any
 
 from robot_rl.algorithms import FbCpr
@@ -71,8 +72,19 @@ class OffPolicyRunner:
     alg: FbCpr
     """The actor-critic algorithm."""
 
-    def __init__(self, env: URLVecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
-        """Construct the runner, algorithm, and logging stack."""
+    def __init__(
+        self,
+        env: URLVecEnv,
+        train_cfg: dict,
+        log_dir: str | None = None,
+        device: str = "cpu",
+        build_expert_buffer: bool = True,
+    ) -> None:
+        """Construct the runner, algorithm, and logging stack.
+
+        ``build_expert_buffer=False`` skips loading the expert motion buffer (a large dataset only
+        needed for training/eval), so play/visualization can construct the policy without the disk load.
+        """
         self.cfg = train_cfg
         self.device = device
         self.env = env
@@ -85,7 +97,9 @@ class OffPolicyRunner:
 
         # Create the algorithm
         alg_class: type[FbCpr] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
-        self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
+        self.alg = alg_class.construct_algorithm(
+            obs, self.env, self.cfg, self.device, build_expert_buffer=build_expert_buffer
+        )
 
         # Create the logger
         self.logger = Logger(
@@ -135,23 +149,36 @@ class OffPolicyRunner:
         with self._get_profile_context() as prof:
             for it in range(start_it, total_it):
                 with torch.inference_mode(), torch.profiler.record_function("rollout"):
-                    # Run evaluation
+                    # Run evaluation (skip_eval bypasses it entirely — debug-only speed-up)
                     eval_extras = None
-                    if (it - start_it) % self.cfg["eval_interval"] == 0:
-                        # Save and clear all logging buffers (environments will reset after eval)
-                        self.logger.reset_all_envs()
-                        # Run evaluation
-                        start = time.time()
-                        with torch.profiler.record_function("eval"):
-                            eval_extras = self.alg.eval(self.env)
-                        stop = time.time()
-                        eval_time += stop - start
+                    if not self.cfg.get("skip_eval", False) and (it - start_it) % self.cfg["eval_interval"] == 0:
+                        # Eval runs on rank 0 ONLY: it steps the env and mutates the expert
+                        # buffer's priorities, and only needs to happen once. The other ranks
+                        # skip it and wait at the barrier below so the collective all-reduces in
+                        # update() stay in lockstep (otherwise rank 0 would still be evaluating
+                        # while the others entered update() and hung on the all-reduce).
+                        if self.gpu_global_rank == 0:
+                            # Save and clear all logging buffers (environments will reset after eval)
+                            self.logger.reset_all_envs()
+                            # Run evaluation
+                            start = time.time()
+                            with torch.profiler.record_function("eval"):
+                                eval_extras = self.alg.eval(self.env)
+                            stop = time.time()
+                            eval_time += stop - start
 
-                        # reset env and training variables
-                        obs, _ = self.env.reset()
-                        obs = obs.to(self.device)
-                        last_dones = None
-                        cur_episode_length[:] = 0
+                            # reset env and training variables (only rank 0's env was perturbed)
+                            obs, _ = self.env.reset()
+                            obs = obs.to(self.device)
+                            last_dones = None
+                            cur_episode_length[:] = 0
+                        if self.is_distributed:
+                            torch.distributed.barrier()
+                            # Eval just rewrote the expert buffer's priorities on rank 0; mirror
+                            # them so every rank keeps an identical expert-sampling distribution.
+                            priorities = self.alg.expert_buffer.priorities.to(self.device)
+                            torch.distributed.broadcast(priorities, src=0)
+                            self.alg.expert_buffer.priorities.copy_(priorities)
 
                     # Rollout
                     start = time.time()
@@ -283,6 +310,10 @@ class OffPolicyRunner:
         """
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
+        # Persist the cumulative env-step count (per-env steps x effective env count) so a resume can
+        # reconstruct the curriculum clock at the same sample budget regardless of the env/GPU count
+        # this run uses vs. the original (see load()).
+        saved_dict["env_step"] = int(self.env.unwrapped.common_step_counter) * self.env.num_envs * self.gpu_world_size
         saved_dict["infos"] = infos
         tmp_path = path + ".tmp"
         torch.save(saved_dict, tmp_path)
@@ -306,7 +337,16 @@ class OffPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
-            self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.cfg["num_steps_per_env"]  # type: ignore
+            # Restore the curriculum clock (env.common_step_counter) from the persisted cumulative
+            # env-step count, dividing by THIS run's effective env count. Curriculum step params are
+            # env-scaled per run (train.py), so reconstructing from the iteration alone would make the
+            # curriculum fraction jump on a resume whose env/GPU count differs from the original.
+            effective_envs = self.env.num_envs * self.gpu_world_size
+            env_step = loaded_dict.get("env_step")
+            if env_step is not None:
+                self.env.unwrapped.common_step_counter = round(env_step / effective_envs)  # type: ignore
+            else:
+                self.env.unwrapped.common_step_counter = self.current_learning_iteration * self.cfg["num_steps_per_env"]  # type: ignore
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device: str | None = None) -> MLPModel:
@@ -390,7 +430,14 @@ class OffPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        # Initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        # Initialize torch distributed. The timeout must cover the rank-0-only motion eval
+        # (~15 min for the full motion set), during which the other ranks sit at a barrier;
+        # NCCL's default 10-minute watchdog would kill them mid-wait.
+        torch.distributed.init_process_group(
+            backend="nccl",
+            rank=self.gpu_global_rank,
+            world_size=self.gpu_world_size,
+            timeout=timedelta(hours=2),
+        )
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)

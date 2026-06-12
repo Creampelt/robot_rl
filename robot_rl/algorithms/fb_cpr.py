@@ -5,7 +5,6 @@ import math
 import os
 import torch
 import torch.nn as nn
-from itertools import chain
 from tensordict import TensorDict
 from typing import Any
 
@@ -63,7 +62,7 @@ class FbCpr:
         discriminator: DiscriminatorModel,
         obs_normalizer: DictModule[nn.BatchNorm1d],
         replay_buffer: ReplayBuffer,
-        expert_buffer: TrajectoryBuffer,
+        expert_buffer: TrajectoryBuffer | None,
         z_buffer: ZBuffer,
         z_dim: int,
         motion_path: str,
@@ -288,7 +287,14 @@ class FbCpr:
     def compute_gammas(self) -> None:
         """Compute gamma values from stored transitions."""
         st = self.replay_buffer
-        st.gammas = self.gamma * (1 - st.next_terminated).float()
+        # Write in place into the buffer's pre-allocated (normal) gammas tensor rather than
+        # reassigning it. This is called under torch.inference_mode(), so a reassignment would
+        # make ``st.gammas`` an *inference* tensor; with an on-GPU replay buffer
+        # (storage_device="cuda") sample_mini_batch then returns it without a device copy, and
+        # CUDA-graph capture (compile_mode="reduce-overhead") forbids in-place updates to
+        # inference tensors. Copying values into the existing normal tensor avoids this while
+        # being numerically identical. (With a CPU buffer the prior .to(device) copy hid this.)
+        st.gammas.copy_(self.gamma * (1 - st.next_terminated).float())
 
     def update_rollout_z(self, z: torch.Tensor | None, cur_episode_length: torch.Tensor, num_envs: int) -> torch.Tensor:
         """Refresh the per-environment latent ``z`` used for rollout based on episode progress."""
@@ -551,8 +557,15 @@ class FbCpr:
         return self.actor
 
     @staticmethod
-    def construct_algorithm(obs: TensorDict, env: URLVecEnv, cfg: dict, device: str) -> FbCpr:
-        """Construct the FB-CPR algorithm."""
+    def construct_algorithm(
+        obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, build_expert_buffer: bool = True
+    ) -> FbCpr:
+        """Construct the FB-CPR algorithm.
+
+        Set ``build_expert_buffer=False`` to skip loading the expert motion ``TrajectoryBuffer`` (the
+        ~GB-scale motion dataset at ``cfg["algorithm"]["motion_path"]``). Only training/eval touch it,
+        so play/visualization paths (which just need the actor + obs normalizer) can avoid the disk load.
+        """
         # Resolve class callables
         alg_class: type[FbCpr] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[FuseModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
@@ -623,8 +636,10 @@ class FbCpr:
             cfg["algorithm"]["batch_size"],
             cfg["storage_device"],
         )
-        expert_buffer = TrajectoryBuffer(
-            cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"]
+        expert_buffer = (
+            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"])
+            if build_expert_buffer
+            else None
         )
         z_buffer = ZBuffer(cfg["algorithm"]["z_buffer_capacity"], z_dim, cfg["storage_device"])
 
@@ -658,27 +673,28 @@ class FbCpr:
             model.load_state_dict(model_params[i])
 
     def reduce_parameters(self, m: nn.Module) -> None:
-        """Collect gradients from all GPUs and average them.
+        """Average module ``m``'s gradients across all GPUs (call after ``m``'s backward pass).
 
-        This function is called after the backward pass to synchronize the gradients across all GPUs.
+        Scoped to a single module on purpose: FB-CPR trains several models with separate
+        optimizers and backward/step cycles, so each model's gradients must be all-reduced
+        independently right before its own ``optimizer.step()`` — reducing every model's
+        parameters here (as a global reduce would) is both incorrect (it would touch other
+        models' stale grads) and wasteful (one collective per model instead of per step).
         """
-        # Create a tensor to store the gradients
-        all_params = chain(*[model.parameters() for model in self.models])
-        all_params = list(all_params)
-        grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
-        all_grads = torch.cat(grads)
-        # Average the gradients across all GPUs
+        # Collect this module's populated gradients into one flat buffer for a single collective.
+        params = [param for param in m.parameters() if param.grad is not None]
+        if not params:
+            return
+        all_grads = torch.cat([param.grad.view(-1) for param in params])
+        # Sum across ranks, then average.
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
-        # Update the gradients for all parameters with the reduced gradients
+        # Scatter the reduced gradients back into the parameters.
         offset = 0
-        for param in all_params:
-            if param.grad is not None:
-                numel = param.numel()
-                # Copy data back from shared buffer
-                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-                # Update the offset for the next parameter
-                offset += numel
+        for param in params:
+            numel = param.numel()
+            param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+            offset += numel
 
     def project_z(self, z: torch.Tensor) -> torch.Tensor:
         """Project ``z`` onto the sphere of radius ``sqrt(z_dim)``."""
