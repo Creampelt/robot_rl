@@ -220,6 +220,31 @@ class Distillation:
         """Get the policy model."""
         return self._raw_student
 
+    def eval(self, env: VecEnv, max_steps: int = 200) -> list[dict[str, torch.Tensor]]:
+        """Run a deterministic student rollout for ``max_steps`` env steps.
+
+        API parity with :meth:`ppo.PPO.eval`; no learning, no transition storage.
+        """
+        was_training = self.student.training
+        self.eval_mode()
+        if hasattr(env, "eval_mode"):
+            env.eval_mode()
+
+        obs = env.get_observations() if hasattr(env, "get_observations") else env.reset()[0]
+        if hasattr(self.student, "reset"):
+            self.student.reset()
+
+        with torch.inference_mode():
+            for _ in range(max_steps):
+                actions = self.student(obs, stochastic_output=False)
+                obs, _, _, _ = env.step(actions)
+
+        if was_training:
+            self.train_mode()
+            if hasattr(env, "train_mode"):
+                env.train_mode()
+        return []
+
     def compile(self, mode: str | None = None) -> None:
         """Compile student and teacher with ``torch.compile``.
 
