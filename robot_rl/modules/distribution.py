@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -520,11 +521,234 @@ class BetaDistribution(Distribution):
         torch.nn.init.zeros_(mlp[-2].bias[self.output_dim :])  # type: ignore
 
 
+class VonMisesFisherDistribution(Distribution):
+    r"""von Mises-Fisher distribution on the unit hypersphere :math:`S^{d-1}`.
+
+    This is the "Gaussian on a sphere": a rotationally-symmetric directional distribution parameterized by a unit
+    **mean direction** :math:`\hat{\mu}` (the normalized MLP output) and a single, state-independent scalar
+    **concentration** :math:`\kappa \ge 0`. Its density w.r.t. the surface measure is
+
+    .. math::
+        p(x;\hat{\mu},\kappa) = C_p(\kappa)\,\exp(\kappa\,\hat{\mu}^\top x),\qquad
+        C_p(\kappa) = \frac{\kappa^{p/2-1}}{(2\pi)^{p/2} I_{p/2-1}(\kappa)},
+
+    with :math:`p` the ambient dimension (``output_dim``) and :math:`I_\nu` the modified Bessel function of the first
+    kind. As :math:`\kappa\to 0` the distribution becomes uniform on the sphere (maximum, **bounded** entropy) and as
+    :math:`\kappa\to\infty` it collapses to the point :math:`\hat{\mu}`.
+
+    Why this over a Gaussian-then-normalize action: ball-normalizing a Gaussian discards a magnitude DoF, so its
+    entropy (computed pre-normalization) is unbounded in ``std`` even though the *behavioral* (directional) spread
+    saturates to uniform — the entropy bonus then inflates ``std`` without limit. The vMF measures entropy on the
+    sphere itself, so it is bounded above by the uniform entropy and the entropy bonus is correctly priced.
+
+    The samples produced are **unit vectors**; the downstream action term is responsible for scaling them onto the
+    radius-:math:`\sqrt{p}` sphere expected by the pretrained low-level policy.
+
+    .. note::
+        Sampling uses Wood's rejection algorithm and is **not** reparameterized — this distribution targets PPO, where
+        actions are detached and only ``log_prob``/``entropy`` need to carry gradients (w.r.t. :math:`\hat{\mu}` and
+        :math:`\kappa`). It is therefore unsuitable as-is for algorithms that backpropagate through the sampled action.
+
+    .. note::
+        ``init_std`` is interpreted as an (asymptotic) tangent-space standard deviation: the concentration is
+        initialized to :math:`\kappa_0 = 1/\text{init\_std}^2` (exact only for :math:`\kappa \gg p`, where the vMF
+        looks Gaussian with per-tangent-dim variance :math:`1/\kappa`). The reported :attr:`std` is likewise
+        :math:`1/\sqrt{\kappa}`, so smaller "std" means more concentrated, matching Gaussian semantics.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        init_std: float = 1.0,
+        learn_std: bool = True,
+        kappa_range: tuple[float, float] = (1e-2, 1e5),
+        cf_extra_terms: int = 64,
+    ) -> None:
+        """Initialize the von Mises-Fisher distribution module.
+
+        Args:
+            output_dim: Dimension ``p`` of the ambient space (the sphere is ``S^{p-1}``). Must be even.
+            init_std: Initial (asymptotic tangent) standard deviation; sets ``kappa = 1 / init_std**2``.
+            learn_std: Whether the concentration is a learnable parameter. If False, it is fixed at its initial value.
+            kappa_range: ``(min, max)`` clamp applied to the concentration for numerical stability.
+            cf_extra_terms: Extra terms used to seed the backward Bessel-ratio recurrence (higher = more accurate).
+        """
+        super().__init__(output_dim)
+        if output_dim % 2 != 0:
+            raise ValueError(f"VonMisesFisherDistribution requires an even output_dim, got {output_dim}.")
+
+        # Concentration is a single scalar, stored in log-space for positivity and a well-conditioned parameterization.
+        init_kappa = 1.0 / max(init_std, 1e-6) ** 2
+        self.log_kappa = nn.Parameter(torch.log(torch.tensor([init_kappa])), requires_grad=learn_std)
+        self.kappa_range = (float(kappa_range[0]), float(kappa_range[1]))
+        self._cf_extra = int(cf_extra_terms)
+
+        # Current state (populated by update())
+        self._mu: torch.Tensor | None = None  # [B, p] unit mean direction
+        self._kappa: torch.Tensor | None = None  # scalar concentration
+        self._log_norm: torch.Tensor | None = None  # log C_p(kappa)
+        self._a_ratio: torch.Tensor | None = None  # A_p(kappa) = I_{p/2}(kappa) / I_{p/2-1}(kappa)
+
+    def _bessel_terms(self, kappa: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        r"""Compute ``(log C_p(kappa), A_p(kappa))`` for a scalar concentration, differentiably.
+
+        Uses a downward recurrence for the Bessel ratios :math:`r_k = I_k(\kappa)/I_{k-1}(\kappa)`, which are bounded
+        in ``(0, 1)`` and hence numerically stable. ``log I_{p/2-1}`` is then accumulated from
+        :math:`\log I_0(\kappa) = \kappa + \log(\text{i0e}(\kappa))` and the log-ratios; everything is plain arithmetic
+        so autograd yields the exact gradients (with :math:`\frac{d}{d\kappa}(-\log C_p) = A_p`). ``kappa`` is a single
+        scalar, so the Python loop is cheap.
+        """
+        p = self.output_dim
+        half = p // 2  # = p/2 ; A_p = r_{p/2} = ratios[half]
+        nu = half - 1  # order of the normalizer's Bessel term, I_{p/2-1}
+        m = half + self._cf_extra
+        # Downward recurrence: r_k = 1 / (2k/kappa + r_{k+1}). Seed r_{m+1} with the recurrence's fixed point
+        # (the Amos/continued-fraction limit ``sqrt(1 + s^2) - s`` with ``s = (m+1)/kappa``) rather than 0, so it
+        # converges immediately even for large kappa (where the ratios approach 1 and a 0-seed needs many terms).
+        ratios: list[torch.Tensor | None] = [None] * (half + 1)
+        s = (m + 1) / kappa
+        r = torch.sqrt(1.0 + s * s) - s
+        for k in range(m, 0, -1):
+            r = 1.0 / (2.0 * k / kappa + r)
+            if k <= half:
+                ratios[k] = r
+        a_ratio = ratios[half]  # I_{p/2}/I_{p/2-1}
+        # log I_{nu} = log I_0 + sum_{j=1}^{nu} log r_j, with log I_0 = kappa + log(i0e(kappa)).
+        log_i_nu = kappa + torch.log(torch.special.i0e(kappa))
+        for j in range(1, nu + 1):
+            log_i_nu = log_i_nu + torch.log(ratios[j])
+        log_norm = nu * torch.log(kappa) - half * math.log(2.0 * math.pi) - log_i_nu
+        return log_norm.squeeze(), a_ratio.squeeze()
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the distribution: mean direction = normalized MLP output, concentration = kappa param."""
+        self._mu = torch.nn.functional.normalize(mlp_output, dim=-1)
+        self._kappa = torch.exp(self.log_kappa).clamp(self.kappa_range[0], self.kappa_range[1])
+        self._log_norm, self._a_ratio = self._bessel_terms(self._kappa)
+
+    def sample(self, std_clip: float | None = None) -> torch.Tensor:
+        """Sample unit vectors from the vMF distribution via Wood's rejection algorithm (no gradient).
+
+        Supports arbitrary leading dims (e.g. meta-RL's [batch, seq, p] tensors): leading dims are flattened
+        for the per-row rejection sampler, then restored. ``std_clip`` is accepted for interface compatibility
+        but unused (vMF spread is set by the concentration).
+        """
+        mu = self._mu  # [..., p]
+        p = mu.shape[-1]
+        lead = mu.shape[:-1]
+        flat_mu = mu.reshape(-1, p)  # [N, p]
+        n = flat_mu.shape[0]
+        device = mu.device
+        kappa = float(self._kappa.item())
+
+        # Component along the mean direction, w = mu . x, drawn from its marginal density on [-1, 1].
+        w = self._sample_weight(n, p, kappa, device)  # [N]
+        # Direction orthogonal to mu, uniform on the (p-2)-subsphere.
+        v = torch.randn(n, p, device=device)
+        v = v - (v * flat_mu).sum(dim=-1, keepdim=True) * flat_mu
+        v = torch.nn.functional.normalize(v, dim=-1)
+        x = w.unsqueeze(-1) * flat_mu + torch.sqrt((1.0 - w * w).clamp_min(0.0)).unsqueeze(-1) * v
+        x = torch.nn.functional.normalize(x, dim=-1)  # defensive re-normalization
+        return x.reshape(*lead, p)
+
+    def _sample_weight(self, batch: int, p: int, kappa: float, device: torch.device) -> torch.Tensor:
+        """Sample the tangential component ``w`` of a vMF sample (Wood, 1994), vectorized with rejection refill."""
+        d = float(p - 1)
+        b = (-2.0 * kappa + math.sqrt(4.0 * kappa * kappa + d * d)) / d
+        x0 = (1.0 - b) / (1.0 + b)
+        c = kappa * x0 + d * math.log(max(1.0 - x0 * x0, 1e-300))
+        beta = Beta(torch.tensor(d / 2.0, device=device), torch.tensor(d / 2.0, device=device))
+
+        w = torch.empty(batch, device=device)
+        done = torch.zeros(batch, dtype=torch.bool, device=device)
+        # Refill only the not-yet-accepted entries each round until all are accepted.
+        for _ in range(100):
+            todo = (~done).nonzero(as_tuple=True)[0]
+            n = todo.numel()
+            if n == 0:
+                break
+            z = beta.sample((n,))
+            w_prop = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
+            u = torch.rand(n, device=device)
+            accept = kappa * w_prop + d * torch.log((1.0 - x0 * w_prop).clamp_min(1e-300)) - c >= torch.log(u)
+            acc_idx = todo[accept]
+            w[acc_idx] = w_prop[accept]
+            done[acc_idx] = True
+        # Any stragglers (should not happen): fall back to the mode.
+        if not bool(done.all()):
+            w[~done] = x0
+        return w
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Return the unit mean direction (the deterministic action is the mode of the vMF)."""
+        return torch.nn.functional.normalize(mlp_output, dim=-1)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Return an export-friendly module that normalizes the MLP output to the unit mean direction."""
+        return _NormalizeDeterministicOutput()
+
+    @property
+    def input_dim(self) -> int:
+        """Return the input dimension required by the distribution (the MLP outputs the raw mean direction)."""
+        return self.output_dim
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Return the unit mean direction."""
+        return self._mu  # type: ignore
+
+    @property
+    def std(self) -> torch.Tensor:
+        """Return the (asymptotic tangent) standard deviation ``1/sqrt(kappa)``, broadcast to the mean's shape."""
+        return torch.ones_like(self._mu) * self._kappa.rsqrt()  # type: ignore
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        r"""Return the vMF entropy ``-log C_p(kappa) - kappa * A_p(kappa)``, broadcast over leading dims."""
+        ent = -self._log_norm - self._kappa.squeeze() * self._a_ratio
+        lead = self._mu.shape[:-1]  # type: ignore
+        return ent.reshape((1,) * len(lead)).expand(lead)  # type: ignore
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        """Return ``(mean_direction, kappa)``; kappa broadcast to ``[..., 1]`` over leading dims for KL."""
+        lead = self._mu.shape[:-1]  # type: ignore
+        kappa_b = self._kappa.reshape((1,) * len(lead) + (1,)).expand(*lead, 1)  # type: ignore
+        return (self._mu, kappa_b)  # type: ignore
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Compute ``log C_p(kappa) + kappa * (mu . x)`` for unit-vector ``outputs``."""
+        dot = (self._mu * outputs).sum(dim=-1)  # type: ignore
+        return self._log_norm + self._kappa.squeeze() * dot
+
+    def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        r"""Compute ``KL(old || new)`` between two vMF distributions.
+
+        :math:`\mathrm{KL} = \log C_p(\kappa_0) - \log C_p(\kappa_1)
+        + A_p(\kappa_0)\,(\kappa_0 - \kappa_1\,\hat{\mu}_0^\top\hat{\mu}_1)`.
+        """
+        mu0, kappa0_b = old_params
+        mu1, kappa1_b = new_params
+        kappa0 = kappa0_b.reshape(-1)[0]
+        kappa1 = kappa1_b.reshape(-1)[0]
+        log_norm0, a0 = self._bessel_terms(kappa0)
+        log_norm1, _ = self._bessel_terms(kappa1)
+        dot = (mu0 * mu1).sum(dim=-1)
+        return (log_norm0 - log_norm1) + a0 * (kappa0 - kappa1 * dot)
+
+
 class _IdentityDeterministicOutput(nn.Module):
     """Exportable module that returns the MLP output as is."""
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
         return mlp_output
+
+
+class _NormalizeDeterministicOutput(nn.Module):
+    """Exportable module that L2-normalizes the MLP output to a unit vector (vMF mean direction)."""
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.normalize(mlp_output, dim=-1)
 
 
 class _ClampedDeterministicOutput(nn.Module):

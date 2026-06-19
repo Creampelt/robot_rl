@@ -13,6 +13,7 @@ from .distribution import (
     GaussianDistribution,
     HeteroscedasticGaussianDistribution,
     TruncatedGaussianDistribution,
+    VonMisesFisherDistribution,
 )
 from .mlp import MLP
 from .normalization import (
@@ -43,4 +44,5 @@ __all__ = [
     "ResMLP",
     "TransformerXL",
     "TruncatedGaussianDistribution",
+    "VonMisesFisherDistribution",
 ]
