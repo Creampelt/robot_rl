@@ -84,6 +84,8 @@ class PPO:
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
+        max_learning_rate: float = 1e-2,
+        min_learning_rate: float = 1e-5,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
         use_clipped_value_loss: bool = True,
@@ -187,9 +189,9 @@ class PPO:
         self.schedule = schedule
         self.adaptive_lr_once_per_iteration = adaptive_lr_once_per_iteration
         self.learning_rate = learning_rate
-        # Bounds for the once-per-iteration adaptive LR (per-minibatch uses 1e-2/1e-5).
-        self.max_learning_rate = 1e-3
-        self.min_learning_rate = 1e-5
+        # Bounds for the adaptive LR schedule (both the per-minibatch and once-per-iteration paths).
+        self.max_learning_rate = max_learning_rate
+        self.min_learning_rate = min_learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def act(self, obs: TensorDict) -> torch.Tensor:
@@ -366,6 +368,7 @@ class PPO:
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_log_prob = 0
+        mean_clip_fraction = 0.0
         sum_kl = 0.0
         max_kl = 0.0
         kl_first_minibatch: float | None = None
@@ -450,9 +453,9 @@ class PPO:
                     and not self.adaptive_lr_once_per_iteration
                 ):
                     if kl_value > self.desired_kl * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        self.learning_rate = max(self.min_learning_rate, self.learning_rate / 1.5)
                     elif self.desired_kl / 2.0 > kl_value > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                        self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
@@ -463,6 +466,8 @@ class PPO:
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # Fraction of samples whose importance ratio fell outside the clip band (PPO trust-region diagnostic).
+            clip_fraction = ((ratio - 1.0).abs() > self.clip_param).float().mean()
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -511,6 +516,7 @@ class PPO:
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
             mean_log_prob += actions_log_prob.mean().item()
+            mean_clip_fraction += clip_fraction.item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -540,22 +546,25 @@ class PPO:
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_log_prob /= num_updates
+        mean_clip_fraction /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
 
         # Construct the loss dictionary
+        # Slash-prefixed keys are logged under that scalar group as-is (Train/...); bare keys go under Loss/.
         loss_dict = {
             "value": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
-            "log_prob": mean_log_prob,
+            "Train/log_prob": mean_log_prob,
+            "Train/clip_fraction": mean_clip_fraction,
         }
-        loss_dict["kl_mean"] = sum_kl / num_updates
-        loss_dict["kl_max"] = max_kl
+        loss_dict["Train/kl_mean"] = sum_kl / num_updates
+        loss_dict["Train/kl_max"] = max_kl
         if kl_first_minibatch is not None:
-            loss_dict["kl_first_minibatch"] = kl_first_minibatch
+            loss_dict["Train/kl_first_minibatch"] = kl_first_minibatch
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

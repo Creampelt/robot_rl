@@ -231,8 +231,11 @@ class Logger:
                 # Use loss dict directly for on-policy (one update per log)
                 loss_string = ""
                 for key, value in loss_dict.items():
-                    self.writer.add_scalar(f"Loss/{key}", value, it)
-                    loss_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+                    # A slash in the key picks its own scalar group (e.g. Train/kl_mean); bare keys -> Loss/.
+                    scalar_key = key if "/" in key else f"Loss/{key}"
+                    label = key.rsplit("/", 1)[-1]
+                    self.writer.add_scalar(scalar_key, value, it)
+                    loss_string += f"""{f"Mean {label} loss:":>{pad}} {value:.4f}\n"""
                 if learning_rate is not None:
                     self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
             else:

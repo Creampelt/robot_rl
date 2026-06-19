@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 import torch
+from datetime import timedelta
 
 from robot_rl.algorithms import PPO
 from robot_rl.env import VecEnv
@@ -288,7 +289,15 @@ class OnPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        # Initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        # Initialize torch distributed. Use a long timeout so the NCCL watchdog tolerates a slow, uneven
+        # startup across nodes -- e.g. the meta task's replicate_physics=False scene build (per-env USD parse,
+        # NFS-bound) can take >10 min on one node while the other waits at the first collective; the default
+        # ~10 min NCCL timeout trips during that window (ALLREDUCE watchdog timeout).
+        torch.distributed.init_process_group(
+            backend="nccl",
+            rank=self.gpu_global_rank,
+            world_size=self.gpu_world_size,
+            timeout=timedelta(hours=2),
+        )
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
