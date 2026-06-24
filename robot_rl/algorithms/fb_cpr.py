@@ -392,7 +392,7 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def eval(self, env: URLVecEnv, max_steps: int | None = None) -> list[dict[str, torch.Tensor]]:
+    def eval(self, env: URLVecEnv, max_steps: int | None = None, **kwargs: Any) -> list[dict[str, torch.Tensor]]:
         r"""Evaluate motions and update priorities in expert buffer.
 
         Priorities are updated according to:
@@ -403,9 +403,16 @@ class FbCpr:
 
         where x is the Earth Mover's Distance between the actual and expert joint positions for each trajectory.
 
-        If ``max_steps`` is provided, ``env.step`` is called at most that many times across all
-        motion mini-batches and the loop breaks early -- intended for the video logger, which
-        only needs a bounded-length clip rather than the full priorities update.
+        Args:
+            env: Vectorized environment to replay the expert motions in.
+            max_steps: When provided, ``env.step`` is called at most this many times across all motion
+                mini-batches and the loop breaks early -- intended for the video logger, which only needs a
+                bounded-length clip rather than the full priorities update. ``None`` runs every mini-batch.
+            **kwargs: Extra keyword eval arguments (e.g. ``stochastic``, ``action_repeat``) are accepted and
+                ignored, so this method tolerates a uniform eval call signature.
+
+        Returns:
+            A list of per-batch info dicts collected over the evaluated motion mini-batches.
         """
         print("[INFO] Evaluating motions...")
 

@@ -593,18 +593,29 @@ class PPO:
         if self.rnd:
             self.rnd.eval()
 
-    def eval(self, env: VecEnv, max_steps: int = 200) -> list[dict[str, torch.Tensor]]:
-        """Run a deterministic evaluation rollout for ``max_steps`` environment steps.
+    def eval(
+        self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
+    ) -> list[dict[str, torch.Tensor]]:
+        """Run an evaluation rollout for ``max_steps`` environment steps.
 
-        For vanilla PPO an "eval" rollout is just the inference loop -- no learning, no
-        stochasticity in the action (use the actor's deterministic mean), no transition
-        storage. Subclasses (FB-CPR etc.) override this to run a task-specific eval (e.g.
-        motion replay + EMD). Returns an empty list of per-batch info dicts for API parity
-        with :meth:`fb_cpr.FbCpr.eval`.
+        The caller is responsible for any env-side video wrapping: each ``env.step()`` here produces a rendered
+        frame for any active video-recording wrapper around the env.
 
-        The caller is responsible for any env-side video wrapping: each ``env.step()`` here
-        will produce a rendered frame for any active ``gym.wrappers.RecordVideo`` wrapping
-        the env.
+        Args:
+            env: Vectorized environment to roll out in.
+            max_steps: Number of environment steps to run.
+            stochastic: When ``False`` (default), act with the actor's deterministic mean. When ``True``,
+                sample the action exactly as during training (same exploration noise). The stochastic rollout
+                reflects what training actually experiences, which can differ markedly from the deterministic
+                mean (e.g. a hierarchical policy whose mean is a trivial fixed point).
+            action_repeat: Hold each queried action for this many ``env.step`` calls, re-querying the actor --
+                and advancing the recurrent memory -- only every ``action_repeat`` steps. For a hierarchical
+                task recorded at the low-level rate (env ``decimation`` lowered to the low-level value for
+                smooth frames), set this to the high-level decimation so the high-level control rate matches
+                training instead of running ``action_repeat``x too fast. Default 1 = re-query every step.
+
+        Returns:
+            A list of per-batch info dicts; empty, as this rollout collects none.
         """
         was_training = self.actor.training
         self.eval_mode()
@@ -618,13 +629,20 @@ class PPO:
         if self.memory is not None and hasattr(self.memory, "reset"):
             self.memory.reset()
 
+        action_repeat = max(1, action_repeat)
+
+        def query_actions() -> torch.Tensor:
+            # query the actor (advancing the recurrent memory, if any) for one high-level decision
+            if self.memory is not None:
+                return self.actor.forward_from_latent(self.memory(obs), stochastic_output=stochastic)
+            return self.actor(obs, stochastic_output=stochastic)
+
         with torch.inference_mode():
-            for _ in range(max_steps):
-                if self.memory is not None:
-                    latent = self.memory(obs)
-                    actions = self.actor.forward_from_latent(latent, stochastic_output=False)
-                else:
-                    actions = self.actor(obs, stochastic_output=False)
+            actions = query_actions()  # initial decision (step 0)
+            for step in range(max_steps):
+                # re-query only once per high-level decision; step 0 already used the initial query above
+                if step > 0 and step % action_repeat == 0:
+                    actions = query_actions()
                 obs, _, _, _ = env.step(actions)
 
         if was_training:
