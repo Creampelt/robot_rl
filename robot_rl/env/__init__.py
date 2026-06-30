@@ -5,6 +5,7 @@
 
 """Environment definition."""
 
+from .url_vec_env import URLVecEnv
 from .vec_env import VecEnv
 
-__all__ = ["VecEnv"]
+__all__ = ["URLVecEnv", "VecEnv"]

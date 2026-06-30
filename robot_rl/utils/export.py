@@ -1,8 +1,3 @@
-# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
 """Rebuild trained policies from a checkpoint + train cfg (no env needed) for export.
 
 Every rebuilt model has its observation normalizer baked into the model's own ``obs_normalizer``

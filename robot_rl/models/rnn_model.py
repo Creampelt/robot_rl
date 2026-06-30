@@ -10,6 +10,7 @@ import copy
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Any
 
 from robot_rl.models.mlp_model import MLPModel
 from robot_rl.modules import RNN, HiddenState
@@ -40,6 +41,8 @@ class RNNModel(MLPModel):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        memory_only: bool = False,
+        **kwargs: Any,
     ) -> None:
         """Initialize the RNN-based model.
 
@@ -55,6 +58,9 @@ class RNNModel(MLPModel):
             rnn_type: Type of RNN to use ("lstm" or "gru").
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
+            memory_only: When ``True``, skip building the MLP head and output distribution. Used when this
+                model is constructed as a shared memory module under :class:`MetaRlCfg.memory`.
+            **kwargs: Ignored extra keyword arguments accepted for cfg-class symmetry with other models.
         """
         self.latent_dim = rnn_hidden_dim
 
@@ -64,21 +70,22 @@ class RNNModel(MLPModel):
             obs_groups,
             obs_set,
             output_dim,
-            hidden_dims,
-            activation,
-            obs_normalization,
-            distribution_cfg,
+            hidden_dims=hidden_dims,
+            activation=activation,
+            obs_normalization=obs_normalization,
+            distribution_cfg=distribution_cfg,
+            memory_only=memory_only,
         )
 
         # RNN
         self.rnn = RNN(self.obs_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
 
     def get_latent(
-        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
+        self, obs: TensorDict, *args: torch.Tensor, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
         """Build the model latent by passing normalized observation groups through the RNN."""
         # Extract and concatenate observation groups and normalize
-        latent = super().get_latent(obs)
+        latent = super().get_latent(obs, *args)
         # Pass through the RNN
         latent = self.rnn(latent, masks, hidden_state).squeeze(0)
         return latent
@@ -87,8 +94,22 @@ class RNNModel(MLPModel):
         """Reset the recurrent hidden state of the RNN."""
         self.rnn.reset(dones, hidden_state)
 
-    def get_hidden_state(self) -> HiddenState:
-        """Return the recurrent hidden state of the RNN."""
+    def get_hidden_state(self, batch_size: int | None = None, device: torch.device | None = None) -> HiddenState:
+        """Return the recurrent hidden state of the RNN.
+
+        If the hidden state has not yet been materialized (i.e. the model has never run a
+        forward pass) and ``batch_size`` is provided, lazily allocate a zero hidden state so
+        callers that snapshot the pre-step state (PPO ``act()`` on the first rollout step)
+        get a valid tensor rather than ``None``. This matches the TXL memory module which
+        pre-allocates its memory cache on the first rollout call. Without this, the saved
+        per-trajectory-start hidden buffer is short by ``num_envs`` entries (the step-0
+        entries of the very first rollout are skipped by ``_save_hidden_states``), and PPO's
+        first ``update()`` crashes with a GRU shape mismatch.
+        """
+        if self.rnn.hidden_state is None and batch_size is not None:
+            dev = device if device is not None else next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+            self.rnn._materialize_zero_hidden_state(batch_size, dev, dtype)
         return self.rnn.hidden_state  # type: ignore
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:

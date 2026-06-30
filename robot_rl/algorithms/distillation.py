@@ -9,6 +9,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Any
 
 from robot_rl.env import VecEnv
 from robot_rl.models import MLPModel
@@ -42,7 +43,7 @@ class Distillation:
         device: str = "cpu",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
-        **kwargs: dict,  # handle unused config parameters
+        **kwargs: Any,  # handle unused config parameters
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters

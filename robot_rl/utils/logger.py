@@ -49,14 +49,17 @@ class Logger:
         self.logger_type: str | None = None
 
         # Create buffers
-        self.ep_extras = []
+        self.ep_extras: list[dict] = []
+        self.eval_extras: list[dict] = []
+        self.loss_extras: list[dict] = []
+        self.algo_extras: list[dict] = []
         self.rewbuffer = deque(maxlen=100)
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # Create RND buffers
-        if self.cfg["algorithm"]["rnd_cfg"]:
+        if self.cfg["algorithm"].get("rnd_cfg", None):
             self.erewbuffer = deque(maxlen=100)
             self.irewbuffer = deque(maxlen=100)
             self.cur_ereward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -135,13 +138,26 @@ class Logger:
         dones: torch.Tensor,
         extras: dict,
         intrinsic_rewards: torch.Tensor | None = None,
+        eval_extras: list[dict] | None = None,
+        loss_extras: list[dict] | None = None,
+        algo_extras: list[dict] | None = None,
     ) -> None:
         """Add metrics from the environment step to the buffers."""
         if self.writer is not None:
+            # Store episode extras
             if "episode" in extras:
                 self.ep_extras.append(extras["episode"])
             elif "log" in extras:
                 self.ep_extras.append(extras["log"])
+            # Store evaluation extras
+            if eval_extras:
+                self.eval_extras.extend(eval_extras)
+            # Store loss metrics
+            if loss_extras:
+                self.loss_extras.extend(loss_extras)
+            # Store algo extras
+            if algo_extras:
+                self.algo_extras.extend(algo_extras)
 
             # Update rewards and episode length
             if intrinsic_rewards is not None:
@@ -164,6 +180,20 @@ class Logger:
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
 
+    def reset_all_envs(self) -> None:
+        """Save and clear all logging buffers."""
+        # Skip reset if all episodes are at 0 steps
+        if self.cur_episode_length.any():
+            self.rewbuffer.extend(self.cur_reward_sum.cpu().numpy().tolist())
+            self.lenbuffer.extend(self.cur_episode_length.cpu().numpy().tolist())
+            self.cur_reward_sum[:] = 0
+            self.cur_episode_length[:] = 0
+            if self.cfg["algorithm"].get("rnd_cfg", None):
+                self.erewbuffer.extend(self.cur_ereward_sum.cpu().numpy().tolist())
+                self.irewbuffer.extend(self.cur_ireward_sum.cpu().numpy().tolist())
+                self.cur_ereward_sum[:] = 0
+                self.cur_ireward_sum[:] = 0
+
     def log(
         self,
         it: int,
@@ -171,10 +201,11 @@ class Logger:
         total_it: int,
         collect_time: float,
         learn_time: float,
-        loss_dict: dict,
-        learning_rate: float,
-        action_std: torch.Tensor,
-        rnd_weight: float | None,
+        loss_dict: dict | None = None,
+        learning_rate: float | None = None,
+        action_std: torch.Tensor | None = None,
+        rnd_weight: float | None = None,
+        eval_time: float | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -186,50 +217,48 @@ class Logger:
         if self.writer is not None:
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
+            if eval_time:
+                iteration_time += eval_time
             self.tot_timesteps += collection_size
             self.tot_time += iteration_time
 
             # Log episode extras
-            extras_string = ""
-            if self.ep_extras:
-                # Iterate over all keys in the episode info dictionary
-                for key in {k for ep_info in self.ep_extras for k in ep_info}:
-                    infotensor = torch.tensor([], device=self.device)
-                    # Iterate over all steps
-                    for ep_info in self.ep_extras:
-                        # Handle missing, scalar, and zero dimensional tensors
-                        if key not in ep_info:
-                            continue
-                        if not isinstance(ep_info[key], torch.Tensor):
-                            ep_info[key] = torch.Tensor([ep_info[key]])
-                        if len(ep_info[key].shape) == 0:
-                            ep_info[key] = ep_info[key].unsqueeze(0)
-                        infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                    value = torch.mean(infotensor)
-                    if "/" in key:
-                        self.writer.add_scalar(key, value, it)  # type: ignore
-                        extras_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-                    else:
-                        self.writer.add_scalar("Episode/" + key, value, it)  # type: ignore
-                        extras_string += f"""{f"Mean episode {key}:":>{pad}} {value:.4f}\n"""
-
+            extras_string = self._log_extras(self.ep_extras, it, pad, "Episode", "Mean episode {}")
+            extras_string += self._log_extras(self.algo_extras, it, pad, "Train", "Train/{}")
+            eval_string = self._log_extras(self.eval_extras, it, pad, "Evaluation", "Mean evaluation {}")
             # Log losses
-            for key, value in loss_dict.items():
-                self.writer.add_scalar(f"Loss/{key}", value, it)
-            self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+            if loss_dict:
+                # Use loss dict directly for on-policy (one update per log)
+                loss_string = ""
+                for key, value in loss_dict.items():
+                    # A slash in the key picks its own scalar group (e.g. Train/kl_mean); bare keys -> Loss/.
+                    scalar_key = key if "/" in key else f"Loss/{key}"
+                    label = key.rsplit("/", 1)[-1]
+                    self.writer.add_scalar(scalar_key, value, it)
+                    loss_string += f"""{f"Mean {label} loss:":>{pad}} {value:.4f}\n"""
+                if learning_rate is not None:
+                    self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+            else:
+                # Use loss extras buffer for off-policy (multiple updates per log)
+                loss_string = self._log_extras(
+                    self.loss_extras, it, pad, "Loss", "Mean {}", override_console_format=False
+                )
 
             # Log std
-            self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
+            if action_std is not None:
+                self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
 
             # Log performance
-            fps = int(collection_size / (collect_time + learn_time))
+            fps = int(collection_size / iteration_time)
             self.writer.add_scalar("Perf/total_fps", fps, it)
             self.writer.add_scalar("Perf/collection_time", collect_time, it)
             self.writer.add_scalar("Perf/learning_time", learn_time, it)
+            if eval_time:
+                self.writer.add_scalar("Perf/eval_time", eval_time, it)
 
             # Log rewards and episode length
             if len(self.rewbuffer) > 0:
-                if self.cfg["algorithm"]["rnd_cfg"]:
+                if self.cfg["algorithm"].get("rnd_cfg", None):
                     self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
@@ -258,23 +287,26 @@ class Logger:
                 f"""{"Collection time:":>{pad}} {collect_time:.3f}s \n"""
                 f"""{"Learning time:":>{pad}} {learn_time:.3f}s \n"""
             )
+            if eval_time:
+                log_string += f"""{"Evaluation time:":>{pad}} {eval_time:.3f}s \n"""
 
             # Print losses
-            for key, value in loss_dict.items():
-                log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+            log_string += loss_string
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:
-                if self.cfg["algorithm"]["rnd_cfg"]:
+                if self.cfg["algorithm"].get("rnd_cfg", None):
                     log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
 
             # Print std
-            log_string += f"""{"Mean action std:":>{pad}} {action_std.mean().item():.2f}\n"""
+            if action_std is not None:
+                log_string += f"""{"Mean action std:":>{pad}} {action_std.mean().item():.2f}\n"""
 
-            # Print episode extras
+            # Print extras
+            log_string += eval_string
             if not print_minimal:
                 log_string += extras_string
 
@@ -290,18 +322,19 @@ class Logger:
             )
             print(log_string)
 
-            # Upload available videos to external logging service if supported. Skip the out-of-process
-            # video logger's own dir: it attaches to this same W&B run and logs those clips at their
-            # checkpoint step, so re-uploading here would duplicate each video at the (drifted) current
-            # iteration.
+            # Upload videos, skipping the out-of-process video logger's own dir: it logs those clips to
+            # this same W&B run at their checkpoint step, so re-uploading would duplicate them at the current iter.
             if isinstance(self.writer, LogWriter):
                 for video in pathlib.Path(self.log_dir).rglob("*.mp4"):  # type: ignore
                     if "video_logger" in video.parts:
                         continue
                     self.writer.save_video(video, it)
 
-            # Clear extras buffer
+            # Clear extras buffers
             self.ep_extras.clear()
+            self.eval_extras.clear()
+            self.loss_extras.clear()
+            self.algo_extras.clear()
 
     def save_model(self, path: str, it: int) -> None:
         """Save the model to external logging service if specified."""
@@ -346,3 +379,39 @@ class Logger:
                 # Add the file path to the list of files to be uploaded
                 files_to_upload.append(diff_file_name)
         return files_to_upload
+
+    def _log_extras(
+        self,
+        extras: list,
+        it: int,
+        pad: int,
+        scalar_prefix: str,
+        console_format: str,
+        override_console_format: bool = True,
+    ) -> str:
+        extras_string = ""
+        if extras:
+            # Iterate over all keys in the episode info dictionary
+            for key in {k for info in extras for k in info}:
+                infotensor = torch.tensor([], device=self.device)
+                # Iterate over all steps
+                for info in extras:
+                    # Handle missing, scalar, and zero dimensional tensors
+                    if key not in info:
+                        continue
+                    if not isinstance(info[key], torch.Tensor):
+                        info[key] = torch.Tensor([info[key]])
+                    if len(info[key].shape) == 0:
+                        info[key] = info[key].unsqueeze(0)
+                    infotensor = torch.cat((infotensor, info[key].to(self.device)))
+                value = torch.nan_to_num(torch.mean(infotensor), nan=0.0)
+                if "/" in key:
+                    self.writer.add_scalar(key, value, it)  # type: ignore
+                    if override_console_format:
+                        extras_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+                    else:
+                        extras_string += f"""{f"{console_format.format(key)}:":>{pad}} {value:.4f}\n"""
+                else:
+                    self.writer.add_scalar(f"{scalar_prefix}/" + key, value, it)  # type: ignore
+                    extras_string += f"""{f"{console_format.format(key)}:":>{pad}} {value:.4f}\n"""
+        return extras_string

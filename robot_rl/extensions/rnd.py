@@ -114,8 +114,8 @@ class RandomNetworkDistillation(nn.Module):
             self.weight_scheduler = None
 
         # Create network architecture
-        self.predictor = MLP(num_states, num_outputs, predictor_hidden_dims, activation).to(self.device)
-        self.target = MLP(num_states, num_outputs, target_hidden_dims, activation).to(self.device)
+        self.predictor = MLP(num_states, num_outputs, predictor_hidden_dims, activation=activation).to(self.device)
+        self.target = MLP(num_states, num_outputs, target_hidden_dims, activation=activation).to(self.device)
 
         # Make target network not trainable
         self.target.eval()
@@ -158,7 +158,7 @@ class RandomNetworkDistillation(nn.Module):
         target_embedding = self.target(rnd_state).detach()
         return nn.functional.mse_loss(predicted_embedding, target_embedding)
 
-    def forward(self, *args: Any, **kwargs: dict[str, Any]) -> NoReturn:
+    def forward(self, *args: Any, **kwargs: Any) -> NoReturn:
         """Disallow generic forward calls for this module."""
         raise RuntimeError("Forward method is not implemented. Use get_intrinsic_reward instead.")
 
@@ -188,16 +188,16 @@ class RandomNetworkDistillation(nn.Module):
             rnd_state = self.get_rnd_state(obs)
             self.state_normalizer.update(rnd_state)  # type: ignore
 
-    def _constant_weight_schedule(self, step: int, **kwargs: dict[str, Any]) -> float:
+    def _constant_weight_schedule(self, step: int, **kwargs: Any) -> float:
         """Keep the intrinsic reward weight constant."""
         return self.initial_weight
 
-    def _step_weight_schedule(self, step: int, final_step: int, final_value: float, **kwargs: dict[str, Any]) -> float:
+    def _step_weight_schedule(self, step: int, final_step: int, final_value: float, **kwargs: Any) -> float:
         """Switch the intrinsic reward weight at a configured step."""
         return self.initial_weight if step < final_step else final_value
 
     def _linear_weight_schedule(
-        self, step: int, initial_step: int, final_step: int, final_value: float, **kwargs: dict[str, Any]
+        self, step: int, initial_step: int, final_step: int, final_value: float, **kwargs: Any
     ) -> float:
         """Linearly interpolate the intrinsic reward weight over a step interval."""
         if step < initial_step:

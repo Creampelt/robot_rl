@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 import torch
+from datetime import timedelta
 
 from robot_rl.algorithms import PPO
 from robot_rl.env import VecEnv
@@ -91,7 +92,10 @@ class OnPolicyRunner:
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    new_trial_ids = self.alg.process_env_step(obs, rewards, dones, extras)
+                    # Apply trial reset event to environment
+                    if new_trial_ids is not None and len(new_trial_ids):
+                        self.env.apply("trial", new_trial_ids)
                     # Extract intrinsic rewards if RND is used (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
                     # Book keeping
@@ -143,9 +147,8 @@ class OnPolicyRunner:
         """
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
-        # Persist the cumulative env-step count (per-env steps x effective env count) so a resume can
-        # reconstruct the curriculum clock at the same sample budget regardless of the env/GPU count
-        # this run uses vs. the original (see load()).
+        # Persist cumulative env-steps so a resume reconstructs the curriculum clock at the same
+        # sample budget regardless of this run's env/GPU count (see load()).
         saved_dict["env_step"] = int(self.env.unwrapped.common_step_counter) * self.env.num_envs * self.gpu_world_size
         saved_dict["infos"] = infos
         tmp_path = path + ".tmp"
@@ -170,10 +173,8 @@ class OnPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
-            # Restore the curriculum clock (env.common_step_counter) from the persisted cumulative
-            # env-step count, dividing by THIS run's effective env count. Curriculum step params are
-            # env-scaled per run (train.py), so reconstructing from the iteration alone would make the
-            # curriculum fraction jump on a resume whose env/GPU count differs from the original.
+            # Restore the curriculum clock from the cumulative env-step count / this run's effective
+            # env count, so a resume with a different env/GPU count doesn't jump the curriculum fraction.
             effective_envs = self.env.num_envs * self.gpu_world_size
             env_step = loaded_dict.get("env_step")
             if env_step is not None:
@@ -265,7 +266,13 @@ class OnPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        # Initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        # Long NCCL timeout: an uneven startup (e.g. the meta task's NFS-bound replicate_physics=False
+        # scene build, >10 min on one node) would otherwise trip the default ~10 min watchdog at the first collective.
+        torch.distributed.init_process_group(
+            backend="nccl",
+            rank=self.gpu_global_rank,
+            world_size=self.gpu_world_size,
+            timeout=timedelta(hours=2),
+        )
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)

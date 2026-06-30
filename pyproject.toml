@@ -25,14 +25,19 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.6.0",
-    "torchvision>=0.5.0",
+    # Exact pin = the Isaac Sim container's bundled stack, so every Ray node resolves torch identically (NCCL consistency).
+    "torch==2.7.0",
+    "torchvision==0.22.0",
     "tensordict>=0.7.0",
     "packaging<24",
     "numpy>=1.16.4",
     "GitPython",
     "onnx",
+    "POT==0.9.6",
     "onnxscript>=0.5.4",
+    # The log writers subclass torch.utils.tensorboard.SummaryWriter (imported unconditionally), so
+    # tensorboard is a hard runtime dep regardless of the chosen logger backend.
+    "tensorboard",
 ]
 
 [project.urls]
@@ -62,3 +67,6 @@ reportMissingModuleSource = "none"  # -> most common: prettytable in mdp manager
 reportGeneralTypeIssues = "none"  # -> usage of literal MISSING in dataclasses
 reportOptionalMemberAccess = "none"
 reportPrivateUsage = "warning"
+
+[tool.codespell]
+ignore-words-list = "ot"

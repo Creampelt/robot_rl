@@ -6,20 +6,43 @@
 """Building blocks for neural models."""
 
 from .cnn import CNN
-from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+from .dict_module import DictModule
+from .distribution import (
+    BetaDistribution,
+    Distribution,
+    GaussianDistribution,
+    HeteroscedasticGaussianDistribution,
+    TruncatedGaussianDistribution,
+    VonMisesFisherDistribution,
+)
 from .mlp import MLP
-from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+    ExponentialMovingAverageNormalization,
+)
+from .parallel import ParallelLayerNorm, ParallelLinear
+from .residual import ResMLP
 from .rnn import RNN, HiddenState
+from .transformer_xl import TransformerXL
 
 __all__ = [
     "CNN",
     "MLP",
     "RNN",
     "BetaDistribution",
+    "DictModule",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
+    "ExponentialMovingAverageNormalization",
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "ParallelLayerNorm",
+    "ParallelLinear",
+    "ResMLP",
+    "TransformerXL",
+    "TruncatedGaussianDistribution",
+    "VonMisesFisherDistribution",
 ]

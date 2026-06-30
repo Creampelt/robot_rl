@@ -6,15 +6,27 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import math
 import pkgutil
 import torch
+import torch.nn as nn
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from datetime import timedelta
+from string import Template
 from tensordict import TensorDict
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
+
+import ot
 
 import robot_rl
+
+if TYPE_CHECKING:
+    from robot_rl.modules import ParallelLayerNorm, ParallelLinear
+
+T = TypeVar("T", TensorDict, torch.Tensor)
 
 
 def get_param(param: Any, idx: int) -> Any:
@@ -30,11 +42,27 @@ def get_param(param: Any, idx: int) -> Any:
         return param
 
 
+@contextlib.contextmanager
+def eval_mode(*modules: nn.Module) -> Generator[None, None, None]:
+    """Context manager that temporarily switches modules to eval mode.
+
+    On exit, each module is restored to its previous training state.
+    """
+    prev_states = [m.training for m in modules]
+    try:
+        for m in modules:
+            m.eval()
+        yield
+    finally:
+        for m, was_training in zip(modules, prev_states, strict=True):
+            m.train(was_training)
+
+
 def resolve_nn_activation(act_name: str) -> torch.nn.Module:
     """Resolve the activation function from the name.
 
     Valid activation function names are: ``"elu"``, ``"selu"``, ``"relu"``, ``"crelu"``, ``"lrelu"``, ``"tanh"``,
-    ``"sigmoid"``, ``"softplus"``, ``"gelu"``, ``"swish"``, ``"mish"``, ``"identity"``.
+    ``"sigmoid"``, ``"softplus"``, ``"gelu"``, ``"swish"``, ``"mish"``, ``"ball_norm"``, ``"identity"``.
 
     Args:
         act_name: Name of the activation function.
@@ -57,6 +85,7 @@ def resolve_nn_activation(act_name: str) -> torch.nn.Module:
         "gelu": torch.nn.GELU(),
         "swish": torch.nn.SiLU(),
         "mish": torch.nn.Mish(),
+        "ball_norm": _BallNorm(),
         "identity": torch.nn.Identity(),
     }
 
@@ -67,7 +96,9 @@ def resolve_nn_activation(act_name: str) -> torch.nn.Module:
         raise ValueError(f"Invalid activation function '{act_name}'. Valid activations are: {list(act_dict.keys())}")
 
 
-def resolve_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
+def resolve_optimizer(
+    optimizer_name: str,
+) -> type[torch.optim.Adam | torch.optim.AdamW | torch.optim.SGD | torch.optim.RMSprop]:
     """Resolve the optimizer from the name.
 
     Valid optimizer names are: ``"adam"``, ``"adamw"``, ``"sgd"``, ``"rmsprop"``.
@@ -93,6 +124,24 @@ def resolve_optimizer(optimizer_name: str) -> torch.optim.Optimizer:
         return optimizer_dict[optimizer_name]
     else:
         raise ValueError(f"Invalid optimizer '{optimizer_name}'. Valid optimizers are: {list(optimizer_dict.keys())}")
+
+
+def resolve_dtype(dtype_name: str) -> torch.dtype:
+    """Resolve a torch dtype from a string.
+
+    Valid dtype names are: ``"float16"``, ``"bfloat16"``, ``"float32"``, ``"float64"``.
+    """
+    dtype_dict = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    dtype_name = dtype_name.lower()
+    if dtype_name in dtype_dict:
+        return dtype_dict[dtype_name]
+    else:
+        raise ValueError(f"Invalid dtype '{dtype_name}'. Valid dtypes are: {list(dtype_dict.keys())}")
 
 
 def resolve_callable(callable_or_name: type | Callable | str) -> Callable:
@@ -272,6 +321,59 @@ def resolve_obs_groups(
     return obs_groups
 
 
+def resolve_linear(
+    in_features: int,
+    out_features: int,
+    num_parallel: int,
+    bias: bool = True,
+    device: str | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.nn.Linear | ParallelLinear:
+    """Resolve and initialize linear module based on number of parallel networks.
+
+    Returns:
+        ParallelLinear module if using more than one parallel network; torch.nn.Linear otherwise.
+    """
+    if num_parallel > 1:
+        from robot_rl.modules import ParallelLinear
+
+        return ParallelLinear(in_features, out_features, num_parallel, bias=bias, device=device, dtype=dtype)
+    else:
+        return torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+
+
+def resolve_layer_norm(
+    normalized_shape: int,
+    num_parallel: int,
+    eps: float = 1e-5,
+    elementwise_affine: bool = True,
+    bias: bool = True,
+    device: str | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.nn.LayerNorm | ParallelLayerNorm:
+    """Resolve and initialize layer norm module based on number of parallel networks.
+
+    Returns:
+        ParallelLayerNorm module if using more than one parallel network; torch.nn.LayerNorm otherwise.
+    """
+    if num_parallel > 1:
+        from robot_rl.modules import ParallelLayerNorm
+
+        return ParallelLayerNorm(
+            normalized_shape,
+            num_parallel,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        return torch.nn.LayerNorm(
+            normalized_shape, eps=eps, elementwise_affine=elementwise_affine, bias=bias, device=device, dtype=dtype
+        )
+
+
 def check_nan(obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor) -> None:
     """Raise ``ValueError`` if any environment output contains NaN."""
     for key, tensor in obs.items():
@@ -318,9 +420,7 @@ def compile_model(model: torch.nn.Module, mode: str | None = None) -> torch.nn.M
     return torch.compile(model, mode=mode)  # type: ignore
 
 
-def split_and_pad_trajectories(
-    tensor: torch.Tensor | TensorDict, dones: torch.Tensor
-) -> tuple[torch.Tensor | TensorDict, torch.Tensor]:
+def split_and_pad_trajectories(tensor: T, dones: torch.Tensor) -> tuple[T, torch.Tensor]:
     """Split trajectories at done indices.
 
     Split trajectories, concatenate them and pad with zeros up to the length of the longest trajectory. Return masks
@@ -375,15 +475,135 @@ def split_and_pad_trajectories(
     return padded_trajectories, trajectory_masks
 
 
-def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Tensor) -> torch.Tensor | TensorDict:
-    """Do the inverse operation of `split_and_pad_trajectories()`."""
-    # Select valid steps and flatten to sequence of valid steps
-    valid_steps = trajectories.transpose(1, 0)[masks.transpose(1, 0)]
-    # Reshape back to original dimensions
-    if isinstance(trajectories, TensorDict):
-        # TensorDict.view() only modifies the batch size.
-        # We reshape [valid_steps] -> [number of envs, time] and then transpose back to [time, number of envs]
-        return valid_steps.view(-1, trajectories.shape[0]).transpose(1, 0)
-    else:
-        # For standard Tensors, we must explicitly handle feature dimensions in view()
-        return valid_steps.view(-1, trajectories.shape[0], *trajectories.shape[2:]).transpose(1, 0)
+def unpad_trajectories(trajectories: T, masks: torch.Tensor) -> T:
+    """Do the inverse operation of :meth:`split_and_pad_trajectories`."""
+    # Need to transpose before and after the masking to have proper reshaping. Keep all trailing
+    # feature dims (shape[2:]), not just the last, so >3D trajectories round-trip unchanged.
+    return (
+        trajectories.transpose(1, 0)[masks.transpose(1, 0)]
+        .view(-1, trajectories.shape[0], *trajectories.shape[2:])
+        .transpose(1, 0)
+    )  # type: ignore
+
+
+@torch.jit.script
+def compute_td_targets(data: torch.Tensor, lam: float) -> torch.Tensor:
+    r"""Compute TD targets, i.e.
+
+    .. math::
+
+        mean(x) - \lam / (n^2 - n) * \sum_{i, j} |x_i - x_j|
+    """
+    n = data.shape[0]
+    mean = data.mean(dim=0)
+    uncertainty = torch.abs(data.unsqueeze(dim=0) - data.unsqueeze(dim=1)).sum(dim=(0, 1)) / (n**2 - n)
+    return mean - lam * uncertainty
+
+
+def _compute_distance_matrix(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Compute the distance matrix between two tensors."""
+    x_norm = torch.sum(x**2, dim=-1, keepdim=True)
+    y_norm = torch.sum(y**2, dim=-1, keepdim=True).transpose(-2, -1)
+    mat = x_norm + y_norm - 2 * (x @ y.transpose(-2, -1))
+    # ensure no negative values from numerical imprecision, then take sqrt for Euclidean distance
+    return mat.clamp_(min=0.0).sqrt_()
+
+
+def compute_emd(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Compute the Earth Mover's Distance between two tensors."""
+    if len(x.shape) != 2 or len(y.shape) != 2:
+        raise ValueError(
+            f"Only 2D tensors are supported for EMD computation, but got x with {len(x.shape)} dimensions and y with "
+            f"{len(y.shape)} dimensions."
+        )
+    cost_matrix = _compute_distance_matrix(x, y).detach()
+    x_pot = torch.ones(x.shape[0], device=x.device) / x.shape[0]
+    y_pot = torch.ones(y.shape[0], device=y.device) / y.shape[0]
+    return ot.emd2(x_pot, y_pot, cost_matrix, numItermax=100000)  # type: ignore
+
+
+def pad_to_size(x: torch.Tensor, size: int, dim: int = 0) -> torch.Tensor:
+    """Zero-pad a tensor up to a provided size.
+
+    Args:
+        x: Tensor to pad
+        size: Size of the padded tensor
+        dim: Dimension along which to pad.
+    """
+    shape = list(x.shape)
+    shape[dim] = max(size - shape[dim], 0)
+    return torch.cat([x, torch.zeros(shape, device=x.device)], dim=dim)
+
+
+def forward_sliding_mean(x: torch.Tensor, window_len: int, dim: int = 0) -> torch.Tensor:
+    """Smooth x by averaging within window_len.
+
+    For each position ``t`` along ``dim``, returns the mean of ``x[..., t:t+window_len, ...]``,
+    truncating at the end (so the last entries average over fewer elements).
+    """
+    # Move target dim to position 0 for cumsum
+    perm = [i for i in range(x.dim()) if i != dim]
+    perm.insert(0, dim)
+    x = x.permute(perm)
+
+    cumsum = torch.cumsum(x, dim=0)
+    pad = torch.zeros(1, *cumsum.shape[1:], device=cumsum.device)
+    cumsum = torch.cat([pad, cumsum], dim=0)
+
+    length = x.shape[0]
+    start_idx = torch.arange(length, device=x.device)
+    end_idx = torch.clamp(start_idx + window_len, max=length)
+    lengths = (end_idx - start_idx).view(length, *([1] * (x.dim() - 1)))
+
+    mean = (cumsum[end_idx] - cumsum[start_idx]) / lengths
+    inv_perm = [perm.index(i) for i in range(len(perm))]
+    return mean.permute(inv_perm)
+
+
+class _TimeDeltaTemplate(Template):
+    delimiter = "%"
+
+
+def format_date(fmt: str, time_s: float) -> str:
+    """Convert a duration (in seconds) to the provided format.
+
+    Args:
+        fmt: Date format to use. Can use primitives %D (days), %H (hours), %M (minutes), and %S (seconds).
+        time_s: Time to format, in seconds.
+    """
+    tdelta = timedelta(seconds=time_s)
+    d = {"D": tdelta.days}
+    d["H"], rem = divmod(tdelta.seconds, 3600)
+    d["M"], d["S"] = divmod(rem, 60)
+    # Zero-pad H, M, S
+    d = {k: f"{v:02}" if k in ["H", "M", "S"] else str(v) for k, v in d.items()}
+    t = _TimeDeltaTemplate(fmt)
+    return t.substitute(**d)
+
+
+def soft_update_params(
+    params: tuple[torch.Tensor, ...],
+    target_params: tuple[torch.Tensor, ...],
+    tau: float,
+) -> None:
+    r"""Perform a soft update to target parameters.
+
+    .. math::
+
+        \theta' \leftarrow \tau \theta + (1 - \tau) \theta'
+
+    where :math:`\theta` are the online parameters and :math:`\theta'` are the target parameters. A small ``tau``
+    (e.g. 0.01) produces a slow-moving target network.
+
+    Reference:
+    - Lillicrap et al. "Continuous control with deep reinforcement learning." arXiv preprint arXiv:1509.02971 (2019).
+    """
+    torch._foreach_mul_(target_params, 1.0 - tau)
+    torch._foreach_add_(target_params, params, alpha=tau)
+
+
+class _BallNorm(nn.Module):
+    """Ball norm."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return math.sqrt(x.shape[-1]) * nn.functional.normalize(x, dim=-1)

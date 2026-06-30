@@ -16,15 +16,12 @@ from robot_rl.utils import get_param, resolve_layer_norm, resolve_linear, resolv
 from .parallel import ParallelLinear
 
 
-class MLP(nn.Sequential):
-    """Multi-Layer Perceptron.
+class ResMLP(nn.Sequential):
+    """Residual MLP model.
 
-    The MLP network is a sequence of linear layers and activation functions. The last layer is a linear layer that
-    outputs the desired dimension unless the last activation function is specified.
-
-    It provides additional conveniences:
-    - If the hidden dimensions have a value of ``-1``, the dimension is inferred from the input dimension.
-    - If the output dimension is a tuple, the output is reshaped to the desired shape.
+    The residual network is a sequence of residual blocks consisting of a layer norm, linear layer, and activation
+    function, with a non-residual last layer. The first block may optionally be non-residual. The remaining interface
+    is similar to :class:`MLP`.
     """
 
     def __init__(
@@ -33,12 +30,11 @@ class MLP(nn.Sequential):
         output_dim: int | Sequence[int],
         hidden_dims: Sequence[int],
         num_parallel: int = 1,
-        activation: str = "elu",
-        first_activation: str | None = None,
+        activation: str = "mish",
         last_activation: str | None = None,
-        normalize_first_layer: bool = False,
+        first_residual: bool = True,
     ) -> None:
-        """Initialize the MLP.
+        """Initialize the model.
 
         Args:
             input_dim: Dimension of the input.
@@ -47,50 +43,36 @@ class MLP(nn.Sequential):
                 inferred from the input dimension.
             num_parallel: Number of parallel networks. Defaults to 1.
             activation: Activation function.
-            first_activation: Activation function(s) of the first layer. Can also include `"layer_norm"` for a layer
-                norm layer. None uses the default model activation.
             last_activation: Activation function of the last layer. None results in a linear last layer.
-            normalize_first_layer: Whether to normalize the first layer output with LayerNorm.
+            first_residual: Whether the first block should be residual. Defaults to True.
         """
         super().__init__()
 
         # Store the activation function
         self.activation = activation
-        # Resolve activation functions
-        activation_mod = resolve_nn_activation(activation)
-        first_activation_mod = (
-            resolve_nn_activation(first_activation) if first_activation is not None else activation_mod
-        )
-        last_activation_mod = resolve_nn_activation(last_activation) if last_activation is not None else None
         # Resolve number of hidden dims if they are -1
         hidden_dims_processed = [input_dim if dim == -1 else dim for dim in hidden_dims]
 
         # Create layers sequentially
         layers = []
-        layers.append(resolve_linear(input_dim, hidden_dims_processed[0], num_parallel))
-        if normalize_first_layer:
-            layers.append(resolve_layer_norm(hidden_dims_processed[0], num_parallel))
-        layers.append(first_activation_mod)
-
-        for layer_index in range(len(hidden_dims_processed) - 1):
-            layers.append(
-                resolve_linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1], num_parallel)
+        first_block = _ResidualBlock if first_residual else _Block
+        layers.append(first_block(input_dim, hidden_dims_processed[0], num_parallel, activation))
+        layers.extend([
+            _ResidualBlock(
+                hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1], num_parallel, activation
             )
-            layers.append(activation_mod)
+            for layer_index in range(len(hidden_dims_processed) - 1)
+        ])
 
         # Add last layer
         if isinstance(output_dim, int):
-            layers.append(resolve_linear(hidden_dims_processed[-1], output_dim, num_parallel))
+            layers.append(_Block(hidden_dims_processed[-1], output_dim, num_parallel, last_activation))
         else:
             # Compute the total output dimension
             total_out_dim = reduce(lambda x, y: x * y, output_dim)
             # Add a layer to reshape the output to the desired shape
-            layers.append(resolve_linear(hidden_dims_processed[-1], total_out_dim, num_parallel))
+            layers.append(_Block(hidden_dims_processed[-1], total_out_dim, num_parallel, last_activation))
             layers.append(nn.Unflatten(dim=-1, unflattened_size=output_dim))
-
-        # Add last activation function if specified
-        if last_activation_mod is not None:
-            layers.append(last_activation_mod)
 
         # Register the layers
         for idx, layer in enumerate(layers):
@@ -102,10 +84,12 @@ class MLP(nn.Sequential):
         Args:
             scales: Scale factor for the weights.
         """
-        for idx, module in enumerate(self):
+        idx = 0
+        for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=get_param(scales, idx))
                 nn.init.zeros_(module.bias)
+                idx += 1
             elif isinstance(module, ParallelLinear):
                 weight = module.weight.data
                 n_parallel = weight.size(0)
@@ -131,9 +115,33 @@ class MLP(nn.Sequential):
                     # Apply ReLU gain on parallel layers to match BFM-Zero's parallel-orthogonal init.
                     weight.mul_(get_param(scales, idx) * nn.init.calculate_gain("relu"))
                 module.bias.data.fill_(0.0)
+                idx += 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the MLP."""
+        """Forward pass of the residual MLP."""
         for layer in self:
             x = layer(x)
         return x
+
+
+class _Block(nn.Sequential):
+    def __init__(self, input_dim: int, output_dim: int, num_parallel: int, activation: str | None) -> None:
+        super().__init__()
+        layers = []
+        layers.append(resolve_layer_norm(input_dim, num_parallel))
+        layers.append(resolve_linear(input_dim, output_dim, num_parallel))
+        # Add the activation if specified
+        if activation is not None:
+            layers.append(resolve_nn_activation(activation))
+
+        # Register the layers
+        for idx, layer in enumerate(layers):
+            self.add_module(f"{idx}", layer)
+
+
+class _ResidualBlock(_Block):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res_x = x
+        for layer in self:
+            res_x = layer(res_x)
+        return x + res_x
