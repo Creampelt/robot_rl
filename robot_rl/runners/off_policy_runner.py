@@ -101,11 +101,8 @@ class OffPolicyRunner:
                     # Run evaluation (skip_eval bypasses it entirely — debug-only speed-up)
                     eval_extras = None
                     if not self.cfg.get("skip_eval", False) and (it - start_it) % self.cfg["eval_interval"] == 0:
-                        # Eval runs on rank 0 ONLY: it steps the env and mutates the expert
-                        # buffer's priorities, and only needs to happen once. The other ranks
-                        # skip it and wait at the barrier below so the collective all-reduces in
-                        # update() stay in lockstep (otherwise rank 0 would still be evaluating
-                        # while the others entered update() and hung on the all-reduce).
+                        # Eval runs on rank 0 only (mutates the expert buffer once); other ranks skip
+                        # and wait at the barrier below so update()'s all-reduces stay in lockstep.
                         if self.gpu_global_rank == 0:
                             # Save and clear all logging buffers (environments will reset after eval)
                             self.logger.reset_all_envs()
@@ -286,10 +283,8 @@ class OffPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
-            # Restore the curriculum clock (env.common_step_counter) from the persisted cumulative
-            # env-step count, dividing by THIS run's effective env count. Curriculum step params are
-            # env-scaled per run (train.py), so reconstructing from the iteration alone would make the
-            # curriculum fraction jump on a resume whose env/GPU count differs from the original.
+            # Restore the curriculum clock from the cumulative env-step count / this run's effective
+            # env count, so a resume with a different env/GPU count doesn't jump the curriculum fraction.
             effective_envs = self.env.num_envs * self.gpu_world_size
             env_step = loaded_dict.get("env_step")
             if env_step is not None:

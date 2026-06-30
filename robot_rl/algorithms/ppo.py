@@ -135,18 +135,6 @@ class PPO:
             self.detach_critic_memory = meta_rl_cfg.get("detach_critic_memory", False)
             # Wait to initialize episode counter since we use data shape to get num_envs
             self.ep_counter: torch.Tensor | None = None
-            # Per-trial adaptation-speed metric: for each within-trial episode index ``k`` in
-            # ``[0, num_episodes_per_trial)``, accumulate success rate of episodes that ended at
-            # position ``k`` during the current rollout. Reset every iteration via
-            # :meth:`get_per_trial_success_dict`. Memory-based variants (RNN/TXL) should show
-            # success_episode_k rising with ``k`` (online adaptation); History/Oracle should be flat.
-            #
-            # MUST be allocated here (not lazy in ``process_env_step``): the rollout loop runs
-            # inside ``torch.inference_mode()``, which would turn lazily-allocated buffers into
-            # inference tensors. ``get_per_trial_success_dict`` calls ``zero_()`` from *outside*
-            # inference mode, which is illegal on inference tensors.
-            self.per_trial_success_sums: torch.Tensor = torch.zeros(self.num_episodes_per_trial, device=self.device)
-            self.per_trial_success_counts: torch.Tensor = torch.zeros(self.num_episodes_per_trial, device=self.device)
 
         # PPO components
         self.actor = actor.to(self.device)
@@ -196,13 +184,8 @@ class PPO:
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
-        # Pre-step batch info for lazy-init of recurrent hidden states. ``get_hidden_state`` on the
-        # RNNModel will materialize a zero buffer the first time it is called (the TXL memory
-        # module already does this lazily inside its rollout forward). Without this, the very-first
-        # rollout's step-0 snapshot is ``None`` and ``_save_hidden_states`` skips it, leaving the
-        # saved trajectory-start buffer short by ``num_envs`` entries -> PPO ``update()`` crashes
-        # with a GRU/LSTM "Expected hidden size" shape mismatch on the first iteration. Models that
-        # don't accept these kwargs (MLP, TXL) ignore them.
+        # Pre-step batch info so the RNNModel can lazy-init its hidden states; without it the first
+        # rollout's step-0 snapshot is None and PPO update() crashes on a hidden-size mismatch (MLP/TXL ignore).
         batch_size = obs.batch_size[0]
         device = obs.device
         if self.memory is not None:
@@ -237,14 +220,8 @@ class PPO:
         rewards: torch.Tensor,
         dones: torch.Tensor,
         extras: dict[str, torch.Tensor],
-        successes: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """Record one environment step and update the normalizers.
-
-        ``successes``: optional per-env bool tensor (shape ``(num_envs,)``) indicating which envs
-        terminated successfully *on this step*. Only consumed by the meta-RL per-trial adaptation
-        metric (see :meth:`get_per_trial_success_dict`); pass ``None`` to disable.
-        """
+        """Record one environment step and update the normalizers."""
         # Update the normalizers
         if self.memory is not None:
             self.memory.update_normalization(obs)
@@ -268,16 +245,6 @@ class PPO:
             # Compute whether trial is finished
             trial_dones = (dones.bool() & (self.ep_counter % self.num_episodes_per_trial == 0)).byte()
             self.transition.meta_dones = trial_dones
-            # Per-trial adaptation-speed metric: bucket per-env success by within-trial episode index.
-            # ``ep_counter`` was just incremented above, so ``(ep_counter - 1) % N`` is the index of
-            # the episode that just ended (0-based within the trial). Buffers were allocated in
-            # ``__init__`` to stay outside ``inference_mode`` (see init for why).
-            if successes is not None and len(new_ids) > 0:
-                done_mask = dones > 0
-                within_trial_idx = (self.ep_counter[done_mask] - 1) % self.num_episodes_per_trial
-                succ = successes[done_mask].to(self.per_trial_success_sums.dtype)
-                self.per_trial_success_sums.scatter_add_(0, within_trial_idx, succ)
-                self.per_trial_success_counts.scatter_add_(0, within_trial_idx, torch.ones_like(succ))
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -305,25 +272,6 @@ class PPO:
         self.actor.reset(do_reset)
         self.critic.reset(do_reset)
         return trial_dones.nonzero(as_tuple=False).squeeze(1) if self.meta_rl else None
-
-    def get_per_trial_success_dict(self) -> dict[str, float]:
-        """Return per-within-trial-position success rates, then reset the accumulators.
-
-        Returns a dict ``{f"Per_Trial/success_episode_{k}": rate, ...}`` for each ``k`` in
-        ``[0, num_episodes_per_trial)`` that had at least one episode end during the rollout.
-        The "/" in the key tells the logger to write it as-is (not under the default ``Train/``
-        prefix). For non-meta-RL runs or when no successes have been recorded, returns ``{}``.
-        """
-        if not self.meta_rl or self.per_trial_success_counts is None:
-            return {}
-        out: dict[str, float] = {}
-        for k in range(self.num_episodes_per_trial):
-            count = self.per_trial_success_counts[k].item()
-            if count > 0:
-                out[f"Per_Trial/success_episode_{k}"] = self.per_trial_success_sums[k].item() / count
-        self.per_trial_success_sums.zero_()
-        self.per_trial_success_counts.zero_()
-        return out
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute return and advantage targets from stored transitions."""

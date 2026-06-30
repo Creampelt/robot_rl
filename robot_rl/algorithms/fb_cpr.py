@@ -287,13 +287,8 @@ class FbCpr:
     def compute_gammas(self) -> None:
         """Compute gamma values from stored transitions."""
         st = self.replay_buffer
-        # Write in place into the buffer's pre-allocated (normal) gammas tensor rather than
-        # reassigning it. This is called under torch.inference_mode(), so a reassignment would
-        # make ``st.gammas`` an *inference* tensor; with an on-GPU replay buffer
-        # (storage_device="cuda") sample_mini_batch then returns it without a device copy, and
-        # CUDA-graph capture (compile_mode="reduce-overhead") forbids in-place updates to
-        # inference tensors. Copying values into the existing normal tensor avoids this while
-        # being numerically identical. (With a CPU buffer the prior .to(device) copy hid this.)
+        # Write in place (not reassign): this runs under inference_mode, so reassigning would make
+        # st.gammas an inference tensor, which CUDA-graph capture (reduce-overhead) forbids on a GPU buffer.
         st.gammas.copy_(self.gamma * (1 - st.next_terminated).float())
 
     def update_rollout_z(self, z: torch.Tensor | None, cur_episode_length: torch.Tensor, num_envs: int) -> torch.Tensor:

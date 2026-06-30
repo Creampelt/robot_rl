@@ -44,12 +44,8 @@ class TrajectoryBuffer(ExpertBuffer):
         self.priorities = torch.ones((self.num_motions,), device=device)
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
 
-        # NOTE: mode="default" (inductor only, NO CUDA graphs). This is sampled during the
-        # inference_mode rollout (via update_rollout_z -> sample), so with an on-GPU buffer a
-        # "reduce-overhead" compile would capture a CUDA graph *under inference_mode*, leaving
-        # inference tensors in the process-shared cudagraph pool. The algorithm's own
-        # reduce-overhead update() then reuses that pool and fails to capture with "inplace update
-        # to inference tensor". This fn is tiny (multinomial + arange), so cudagraphs add nothing.
+        # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a
+        # reduce-overhead capture would poison the shared cudagraph pool that update() later reuses.
         self._get_idxs = torch.compile(_get_idxs, mode="default")
 
         print(f"[INFO] Successfully loaded {self.num_motions} motions with length {self.bucket_size}.")

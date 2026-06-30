@@ -91,20 +91,8 @@ class OnPolicyRunner:
                         check_nan(obs, rewards, dones)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Per-env "success" terminator bool for the meta-RL per-trial adaptation
-                    # metric. The IsaacLab TerminationManager records per-term bools each step;
-                    # ``get_term`` returns them by config name. Guard with getattr for envs that
-                    # don't expose a TerminationManager (or wrappers without ``.unwrapped``).
-                    successes = None
-                    if self.alg.meta_rl:
-                        tm = getattr(getattr(self.env, "unwrapped", self.env), "termination_manager", None)
-                        if tm is not None:
-                            try:
-                                successes = tm.get_term("success").to(self.device)
-                            except (KeyError, AttributeError):
-                                successes = None
                     # Process the step
-                    new_trial_ids = self.alg.process_env_step(obs, rewards, dones, extras, successes=successes)
+                    new_trial_ids = self.alg.process_env_step(obs, rewards, dones, extras)
                     # Apply trial reset event to environment
                     if new_trial_ids is not None and len(new_trial_ids):
                         self.env.apply("trial", new_trial_ids)
@@ -126,14 +114,6 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
-
-            # Surface the per-trial adaptation-speed metric to the logger as one dict per iter
-            # (under the ``Per_Trial/`` scalar prefix, written via the existing ``algo_extras``
-            # path; the slash in the key bypasses the default ``Train/`` prefix in ``_log_extras``).
-            if self.alg.meta_rl:
-                per_trial = self.alg.get_per_trial_success_dict()
-                if per_trial:
-                    self.logger.algo_extras.append(per_trial)
 
             # Log information
             self.logger.log(
@@ -194,10 +174,8 @@ class OnPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
-            # Restore the curriculum clock (env.common_step_counter) from the persisted cumulative
-            # env-step count, dividing by THIS run's effective env count. Curriculum step params are
-            # env-scaled per run (train.py), so reconstructing from the iteration alone would make the
-            # curriculum fraction jump on a resume whose env/GPU count differs from the original.
+            # Restore the curriculum clock from the cumulative env-step count / this run's effective
+            # env count, so a resume with a different env/GPU count doesn't jump the curriculum fraction.
             effective_envs = self.env.num_envs * self.gpu_world_size
             env_step = loaded_dict.get("env_step")
             if env_step is not None:
@@ -289,10 +267,8 @@ class OnPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        # Initialize torch distributed. Use a long timeout so the NCCL watchdog tolerates a slow, uneven
-        # startup across nodes -- e.g. the meta task's replicate_physics=False scene build (per-env USD parse,
-        # NFS-bound) can take >10 min on one node while the other waits at the first collective; the default
-        # ~10 min NCCL timeout trips during that window (ALLREDUCE watchdog timeout).
+        # Long NCCL timeout: an uneven startup (e.g. the meta task's NFS-bound replicate_physics=False
+        # scene build, >10 min on one node) would otherwise trip the default ~10 min watchdog at the first collective.
         torch.distributed.init_process_group(
             backend="nccl",
             rank=self.gpu_global_rank,

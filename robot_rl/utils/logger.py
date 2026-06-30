@@ -322,10 +322,8 @@ class Logger:
             )
             print(log_string)
 
-            # Upload available videos to external logging service if supported. Skip the out-of-process
-            # video logger's own dir: it attaches to this same W&B run and logs those clips at their
-            # checkpoint step, so re-uploading here would duplicate each video at the (drifted) current
-            # iteration.
+            # Upload videos, skipping the out-of-process video logger's own dir: it logs those clips to
+            # this same W&B run at their checkpoint step, so re-uploading would duplicate them at the current iter.
             if isinstance(self.writer, LogWriter):
                 for video in pathlib.Path(self.log_dir).rglob("*.mp4"):  # type: ignore
                     if "video_logger" in video.parts:
