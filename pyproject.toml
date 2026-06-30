@@ -40,6 +40,9 @@ dependencies = [
     "onnx",
     "POT==0.9.6",
     "onnxscript>=0.5.4",
+    # The log writers subclass torch.utils.tensorboard.SummaryWriter (imported unconditionally), so
+    # tensorboard is a hard runtime dep regardless of the chosen logger backend.
+    "tensorboard",
 ]
 
 [project.urls]

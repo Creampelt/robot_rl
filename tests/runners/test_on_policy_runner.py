@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import torch
+from collections.abc import Sequence
 from tensordict import TensorDict
 
 from robot_rl.env import VecEnv
@@ -30,6 +31,7 @@ class DummyEnv(VecEnv):
         self.num_actions = NUM_ACTIONS
         self.max_episode_length = MAX_EP_LEN
         self.episode_length_buf = torch.zeros(NUM_ENVS, dtype=torch.long, device=device)
+        self.common_step_counter = 0
         self.device = device
         self.cfg = {}
         self._include_image = include_image
@@ -48,6 +50,13 @@ class DummyEnv(VecEnv):
         rewards = torch.randn(self.num_envs, device=self.device)
         extras = {"time_outs": torch.zeros(self.num_envs, device=self.device)}
         return obs, rewards, dones, extras
+
+    def apply(self, mode: str, env_ids: Sequence[int] | None = None) -> None:  # noqa: D102
+        pass
+
+    @property
+    def unwrapped(self) -> DummyEnv:  # noqa: D102
+        return self
 
 
 def _make_train_cfg(model_type: str = "mlp") -> dict:

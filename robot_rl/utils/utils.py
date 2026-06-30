@@ -477,10 +477,11 @@ def split_and_pad_trajectories(tensor: T, dones: torch.Tensor) -> tuple[T, torch
 
 def unpad_trajectories(trajectories: T, masks: torch.Tensor) -> T:
     """Do the inverse operation of :meth:`split_and_pad_trajectories`."""
-    # Need to transpose before and after the masking to have proper reshaping
+    # Need to transpose before and after the masking to have proper reshaping. Keep all trailing
+    # feature dims (shape[2:]), not just the last, so >3D trajectories round-trip unchanged.
     return (
         trajectories.transpose(1, 0)[masks.transpose(1, 0)]
-        .view(-1, trajectories.shape[0], trajectories.shape[-1])
+        .view(-1, trajectories.shape[0], *trajectories.shape[2:])
         .transpose(1, 0)
     )  # type: ignore
 

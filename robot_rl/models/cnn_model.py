@@ -86,16 +86,17 @@ class CNNModel(MLPModel):
                 raise ValueError("The output of the CNN must be flattened before passing it to the MLP.")
             self.cnn_latent_dim += int(cnn.output_dim)  # type: ignore
 
-        # Initialize the parent MLP model
+        # Initialize the parent MLP model. Pass by keyword: MLPModel.__init__ has interleaved params
+        # (other_input_dims, first/last_activation, ...) so positional args would misalign.
         super().__init__(
             obs,
             obs_groups,
             obs_set,
             output_dim,
-            hidden_dims,
-            activation,
-            obs_normalization,
-            distribution_cfg,
+            hidden_dims=hidden_dims,
+            activation=activation,
+            obs_normalization=obs_normalization,
+            distribution_cfg=distribution_cfg,
         )
 
         # Register CNN encoders
