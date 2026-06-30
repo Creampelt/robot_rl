@@ -61,9 +61,8 @@ class RNN(nn.Module):
             out, _ = self.rnn(input, hidden_state)
             out = unpad_trajectories(out, masks)
         else:
-            # Inference/distillation mode uses hidden state of last step. Lazy-init to zeros on
-            # the first call so any prior ``get_hidden_state`` snapshot is a valid tensor rather
-            # than ``None`` (see :meth:`_materialize_zero_hidden_state`).
+            # Inference/distillation uses the last step's hidden state; lazy-init to zeros so a prior
+            # get_hidden_state snapshot is a valid tensor, not None.
             if self.hidden_state is None:
                 self._materialize_zero_hidden_state(input.shape[0], input.device, input.dtype)
             out, self.hidden_state = self.rnn(input.unsqueeze(0), self.hidden_state)

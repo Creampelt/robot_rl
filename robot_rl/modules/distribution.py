@@ -602,9 +602,8 @@ class VonMisesFisherDistribution(Distribution):
         half = p // 2  # = p/2 ; A_p = r_{p/2} = ratios[half]
         nu = half - 1  # order of the normalizer's Bessel term, I_{p/2-1}
         m = half + self._cf_extra
-        # Downward recurrence: r_k = 1 / (2k/kappa + r_{k+1}). Seed r_{m+1} with the recurrence's fixed point
-        # (the Amos/continued-fraction limit ``sqrt(1 + s^2) - s`` with ``s = (m+1)/kappa``) rather than 0, so it
-        # converges immediately even for large kappa (where the ratios approach 1 and a 0-seed needs many terms).
+        # Downward recurrence r_k = 1/(2k/kappa + r_{k+1}); seed r_{m+1} at the continued-fraction fixed
+        # point (sqrt(1+s^2)-s, s=(m+1)/kappa) so it converges immediately for large kappa.
         ratios: list[torch.Tensor | None] = [None] * (half + 1)
         s = (m + 1) / kappa
         r = torch.sqrt(1.0 + s * s) - s

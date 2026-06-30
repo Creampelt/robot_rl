@@ -256,9 +256,8 @@ class OffPolicyRunner:
         """
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
-        # Persist the cumulative env-step count (per-env steps x effective env count) so a resume can
-        # reconstruct the curriculum clock at the same sample budget regardless of the env/GPU count
-        # this run uses vs. the original (see load()).
+        # Persist cumulative env-steps so a resume reconstructs the curriculum clock at the same
+        # sample budget regardless of this run's env/GPU count (see load()).
         saved_dict["env_step"] = int(self.env.unwrapped.common_step_counter) * self.env.num_envs * self.gpu_world_size
         saved_dict["infos"] = infos
         tmp_path = path + ".tmp"
@@ -351,9 +350,8 @@ class OffPolicyRunner:
                 f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
             )
 
-        # Initialize torch distributed. The timeout must cover the rank-0-only motion eval
-        # (~15 min for the full motion set), during which the other ranks sit at a barrier;
-        # NCCL's default 10-minute watchdog would kill them mid-wait.
+        # Long timeout: covers the rank-0-only motion eval (~15 min) while other ranks wait at a
+        # barrier, which NCCL's default 10-min watchdog would otherwise kill.
         torch.distributed.init_process_group(
             backend="nccl",
             rank=self.gpu_global_rank,

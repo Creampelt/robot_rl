@@ -147,9 +147,8 @@ class OnPolicyRunner:
         """
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
-        # Persist the cumulative env-step count (per-env steps x effective env count) so a resume can
-        # reconstruct the curriculum clock at the same sample budget regardless of the env/GPU count
-        # this run uses vs. the original (see load()).
+        # Persist cumulative env-steps so a resume reconstructs the curriculum clock at the same
+        # sample budget regardless of this run's env/GPU count (see load()).
         saved_dict["env_step"] = int(self.env.unwrapped.common_step_counter) * self.env.num_envs * self.gpu_world_size
         saved_dict["infos"] = infos
         tmp_path = path + ".tmp"

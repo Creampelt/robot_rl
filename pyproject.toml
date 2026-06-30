@@ -25,12 +25,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # Pinned to the Isaac Sim container's exact bundled stack (torch 2.7.0+cu128 / NCCL 2.26.2 cu12,
-    # which the cluster's CUDA-13.1 driver + Blackwell GPUs support). An unpinned or floor spec lets
-    # the Ray cluster's per-node install resolve torch INCONSISTENTLY (hcrl1 2.26.2 vs hcrl2 2.27.3 ->
-    # multi-GPU NCCL version-mismatch crash) or pull a CUDA-13.2 wheel (>=2.9, driver-incompatible).
-    # The exact pin is satisfied by the container's preinstalled 2.7.0+cu128 (no reinstall) and keeps
-    # every node identical. Keep in sync with hcrl_isaaclab/pyproject.toml.
+    # Exact pin = the Isaac Sim container's bundled stack, so every Ray node resolves torch identically (NCCL consistency).
     "torch==2.7.0",
     "torchvision==0.22.0",
     "tensordict>=0.7.0",

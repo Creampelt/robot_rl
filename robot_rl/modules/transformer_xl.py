@@ -48,9 +48,8 @@ class _RelPosMultiheadAttention(nn.Module):
         scale = 1.0 / (self.d_head**0.5)
         scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, S_q, S_kv]
 
-        # Relative-position bias. Query position i aligns to key position (S_kv - S_q + i); key position j is j.
-        # This handles both rollout (S_q=1, S_kv=rollout_mem_len+1 -> query is the newest position) and batch
-        # mode (S_q=S_kv=seq_len -> query/key positions coincide).
+        # Relative-position bias: query i aligns to key (S_kv - S_q + i).
+        # Handles both rollout (S_q=1) and batch (S_q=S_kv) modes.
         q_pos = torch.arange(s_q, device=query.device) + (s_kv - s_q)
         k_pos = torch.arange(s_kv, device=query.device)
         rel = q_pos[:, None] - k_pos[None, :]  # [S_q, S_kv] in [-(S_kv-1), S_q-1]
