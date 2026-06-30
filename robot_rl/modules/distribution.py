@@ -338,7 +338,7 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         output_dim: int,
         init_std: float = 1.0,
         std_type: str = "scalar",
-        fixed_std: bool = True,
+        learn_std: bool = True,
         low: float = -1.0,
         high: float = 1.0,
         eps: float = 1e-6,
@@ -349,7 +349,7 @@ class TruncatedGaussianDistribution(GaussianDistribution):
             output_dim: Dimension of the action/output space.
             init_std: Initial standard deviation.
             std_type: Parameterization of the standard deviation: "scalar" or "log".
-            fixed_std: Whether to use a fixed or adaptable standard deviation.
+            learn_std: Whether the std is learnable. If False, it is held fixed at ``init_std``.
             low: Lower bound for Gaussian output.
             high: Upper bound for Gaussian output.
             eps: A small tolerance to subtract from the upper bound and add to the lower bound.
@@ -358,9 +358,9 @@ class TruncatedGaussianDistribution(GaussianDistribution):
         self.std_type = std_type
 
         if std_type == "scalar":
-            self.std_param = nn.Parameter(init_std * torch.ones(output_dim), requires_grad=not fixed_std)
+            self.std_param = nn.Parameter(init_std * torch.ones(output_dim), requires_grad=learn_std)
         elif std_type == "log":
-            self.log_std_param = nn.Parameter(torch.log(init_std * torch.ones(output_dim)), requires_grad=not fixed_std)
+            self.log_std_param = nn.Parameter(torch.log(init_std * torch.ones(output_dim)), requires_grad=learn_std)
         else:
             raise ValueError(f"Unknown standard deviation type: {std_type}. Should be 'scalar' or 'log'.")
 
