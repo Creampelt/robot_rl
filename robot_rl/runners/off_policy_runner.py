@@ -316,14 +316,19 @@ class OffPolicyRunner:
         return self.alg.get_policy().to(device)  # type: ignore
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
-        """Export the BFM-Zero actor (with its obs normalizer baked in) to a Torch JIT file."""
-        export_model = bake_live_normalizer(self.alg.get_policy(), self.alg.obs_normalizer).to("cpu")
-        save_jit(export_model.as_jit(), path, filename)
+        """Export the actor to a Torch JIT file (baking FbCpr's external obs normalizer in when present)."""
+        save_jit(self._export_model().as_jit(), path, filename)
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
-        """Export the BFM-Zero actor (with its obs normalizer baked in) to an ONNX file."""
-        export_model = bake_live_normalizer(self.alg.get_policy(), self.alg.obs_normalizer).to("cpu")
-        save_onnx(export_model.as_onnx(verbose), path, filename, verbose)
+        """Export the actor to an ONNX file (baking FbCpr's external obs normalizer in when present)."""
+        save_onnx(self._export_model().as_onnx(verbose), path, filename, verbose)
+
+    def _export_model(self) -> MLPModel:
+        """Build the export-ready actor: FbCpr normalizes externally (bake it in); SAC normalizes in-model."""
+        normalizer = getattr(self.alg, "obs_normalizer", None)
+        if normalizer is not None:
+            return bake_live_normalizer(self.alg.get_policy(), normalizer).to("cpu")
+        return self.alg.get_policy().to("cpu")
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""

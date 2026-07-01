@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 from collections.abc import Sequence
+from pathlib import Path
 from tensordict import TensorDict
 
 from robot_rl.algorithms import SAC
@@ -112,3 +113,11 @@ class TestOffPolicyRunnerSAC:
         runner.learn(num_learning_iterations=6)
         changed = any(not torch.allclose(b, a) for b, a in zip(before, runner.alg.actor_parameters, strict=True))
         assert changed
+
+    def test_export_policy_to_jit(self, tmp_path: Path) -> None:
+        """SAC has no external obs normalizer; export must fall back to the in-model path and produce a file."""
+        import os
+
+        runner = OffPolicyRunner(DummyEnv(), _make_cfg(), log_dir=None, device="cpu")
+        runner.export_policy_to_jit(str(tmp_path))
+        assert os.path.isfile(tmp_path / "policy.pt")
