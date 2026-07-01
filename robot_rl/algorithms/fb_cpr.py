@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import math
 import os
 import torch
@@ -10,7 +9,7 @@ from typing import Any
 
 from robot_rl.env import URLVecEnv
 from robot_rl.models import DiscriminatorModel, FuseModel, MLPModel
-from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization
+from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization, TargetNetwork
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
 from robot_rl.utils import (
     compute_emd,
@@ -22,7 +21,6 @@ from robot_rl.utils import (
     resolve_dtype,
     resolve_obs_groups,
     resolve_optimizer,
-    soft_update_params,
 )
 
 
@@ -128,21 +126,12 @@ class FbCpr:
         for model in self.models:
             model.init_weights()
 
-        # Initialize target networks
-        self.target_forward_map = copy.deepcopy(self.forward_map).to(self.device)
-        self.target_backward_map = copy.deepcopy(self.backward_map).to(self.device)
-        self.target_disc_critic = copy.deepcopy(self.disc_critic).to(self.device)
-        self.target_aux_critic = copy.deepcopy(self.aux_critic).to(self.device)
-
-        # Initialize paramlists
-        self._forward_map_paramlist = tuple(x.data for x in self.forward_map.parameters())
-        self._backward_map_paramlist = tuple(x.data for x in self.backward_map.parameters())
-        self._disc_critic_paramlist = tuple(x.data for x in self.disc_critic.parameters())
-        self._aux_critic_paramlist = tuple(x.data for x in self.aux_critic.parameters())
-        self._target_forward_map_paramlist = tuple(x.data for x in self.target_forward_map.parameters())
-        self._target_backward_map_paramlist = tuple(x.data for x in self.target_backward_map.parameters())
-        self._target_disc_critic_paramlist = tuple(x.data for x in self.target_disc_critic.parameters())
-        self._target_aux_critic_paramlist = tuple(x.data for x in self.target_aux_critic.parameters())
+        # Target networks (Polyak copies) via the shared wrapper; fb_tau for the maps, critic_tau for the
+        # critics. TargetNetwork.update reuses soft_update_params, so soft-updates stay byte-identical.
+        self.target_forward_map = TargetNetwork(self.forward_map, tau=fb_tau).to(self.device)
+        self.target_backward_map = TargetNetwork(self.backward_map, tau=fb_tau).to(self.device)
+        self.target_disc_critic = TargetNetwork(self.disc_critic, tau=critic_tau).to(self.device)
+        self.target_aux_critic = TargetNetwork(self.aux_critic, tau=critic_tau).to(self.device)
 
         # Create the optimizers. Adam/AdamW support a fused CUDA kernel that collapses the per-parameter
         # _foreach_add_/_foreach_mul_ ops into a single launch — noticeable speedup at 16 updates/iter.
@@ -497,10 +486,10 @@ class FbCpr:
             "disc_critic_optimizer_state_dict": self.disc_critic_optimizer.state_dict(),
             "aux_critic_optimizer_state_dict": self.aux_critic_optimizer.state_dict(),
             "discriminator_optimizer_state_dict": self.discriminator_optimizer.state_dict(),
-            "target_forward_map_state_dict": self.target_forward_map.state_dict(),
-            "target_backward_map_state_dict": self.target_backward_map.state_dict(),
-            "target_disc_critic_state_dict": self.target_disc_critic.state_dict(),
-            "target_aux_critic_state_dict": self.target_aux_critic.state_dict(),
+            "target_forward_map_state_dict": self.target_forward_map.target.state_dict(),
+            "target_backward_map_state_dict": self.target_backward_map.target.state_dict(),
+            "target_disc_critic_state_dict": self.target_disc_critic.target.state_dict(),
+            "target_aux_critic_state_dict": self.target_aux_critic.target.state_dict(),
             "z_buffer_state": self.z_buffer.state_dict(),
             "expert_buffer_state": self.expert_buffer.state_dict(),
         }
@@ -539,7 +528,7 @@ class FbCpr:
                 (self.disc_critic, self.target_disc_critic, "target_disc_critic_state_dict"),
                 (self.aux_critic, self.target_aux_critic, "target_aux_critic_state_dict"),
             ):
-                target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
+                target.target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
         if "obs_normalizer_state_dict" in loaded_dict:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_normalizer_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
@@ -736,11 +725,11 @@ class FbCpr:
         return z
 
     def _soft_update_targets(self) -> None:
-        """Update params of TD targets from main network params."""
-        soft_update_params(self._forward_map_paramlist, self._target_forward_map_paramlist, self.fb_tau)
-        soft_update_params(self._backward_map_paramlist, self._target_backward_map_paramlist, self.fb_tau)
-        soft_update_params(self._disc_critic_paramlist, self._target_disc_critic_paramlist, self.critic_tau)
-        soft_update_params(self._aux_critic_paramlist, self._target_aux_critic_paramlist, self.critic_tau)
+        """Update params of TD targets from main network params (tau baked into each TargetNetwork)."""
+        self.target_forward_map.update()
+        self.target_backward_map.update()
+        self.target_disc_critic.update()
+        self.target_aux_critic.update()
 
     def _update_discriminator(
         self, batch: ReplayBuffer.Batch, expert_obs: TensorDict, expert_z: torch.Tensor
