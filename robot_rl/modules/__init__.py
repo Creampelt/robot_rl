@@ -12,6 +12,7 @@ from .distribution import (
     Distribution,
     GaussianDistribution,
     HeteroscedasticGaussianDistribution,
+    SquashedTanhGaussianDistribution,
     TruncatedGaussianDistribution,
     VonMisesFisherDistribution,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "ParallelLayerNorm",
     "ParallelLinear",
     "ResMLP",
+    "SquashedTanhGaussianDistribution",
     "TransformerXL",
     "TruncatedGaussianDistribution",
     "VonMisesFisherDistribution",

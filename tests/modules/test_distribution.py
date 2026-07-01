@@ -8,7 +8,12 @@
 import math
 import torch
 
-from robot_rl.modules.distribution import BetaDistribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+from robot_rl.modules.distribution import (
+    BetaDistribution,
+    GaussianDistribution,
+    HeteroscedasticGaussianDistribution,
+    SquashedTanhGaussianDistribution,
+)
 
 
 class TestGaussianDistribution:
@@ -249,6 +254,89 @@ class TestHeteroscedasticGaussianDistribution:
         """The minimum of std_range should be floored to 1e-6 for numerical stability."""
         dist = HeteroscedasticGaussianDistribution(output_dim=2, init_std=1.0, std_type="scalar", std_range=(0.0, 10.0))
         assert dist.std_range[0] == 1e-6
+
+
+class TestSquashedTanhGaussianDistribution:
+    """Tests for ``SquashedTanhGaussianDistribution``."""
+
+    def test_samples_within_bounds(self) -> None:
+        """Squashed samples should lie within [low, high] (tanh may saturate to the bound in float32)."""
+        low, high = -2.0, 2.0
+        dist = SquashedTanhGaussianDistribution(output_dim=4, init_noise_std=1.0, low=low, high=high)
+        dist.update(torch.randn(256, 4) * 5.0)  # large pre-squash means to stress the bounds
+        samples = dist.sample()
+        assert (samples >= low).all() and (samples <= high).all()
+
+    def test_deterministic_output_is_squashed_mean(self) -> None:
+        """deterministic_output() and the `mean` property should equal scale*tanh(mean)+offset."""
+        low, high = -1.0, 1.0
+        dist = SquashedTanhGaussianDistribution(output_dim=3, low=low, high=high)
+        mlp_output = torch.tensor([[0.5, -1.0, 2.0]])
+        dist.update(mlp_output)
+        expected = torch.tanh(mlp_output)  # scale=1, offset=0
+        assert torch.allclose(dist.deterministic_output(mlp_output), expected, atol=1e-6)
+        assert torch.allclose(dist.mean, expected, atol=1e-6)
+        assert torch.allclose(dist.as_deterministic_output_module()(mlp_output), expected, atol=1e-6)
+
+    def test_log_prob_matches_manual_change_of_variables(self) -> None:
+        """log_prob should equal Normal.log_prob(u) minus the tanh+scale Jacobian, summed over dims."""
+        dim, scale = 3, 2.0  # low=-2, high=2 -> scale=2, offset=0
+        dist = SquashedTanhGaussianDistribution(output_dim=dim, init_noise_std=0.7, low=-2.0, high=2.0)
+        mean = torch.randn(5, dim)
+        dist.update(mean)
+        std = dist.std
+        # Pick pre-squash points, map through the squash, and compare log_prob to a manual computation.
+        u = torch.randn(5, dim)
+        actions = scale * torch.tanh(u) + 0.0
+        base = torch.distributions.Normal(mean, std).log_prob(u).sum(dim=-1)
+        jac = (torch.log(1.0 - torch.tanh(u) ** 2) + math.log(scale)).sum(dim=-1)
+        expected = base - jac
+        assert torch.allclose(dist.log_prob(actions), expected, atol=1e-4)
+
+    def test_sample_and_log_prob_consistent(self) -> None:
+        """sample_and_log_prob's log-prob should match log_prob() re-evaluated on the returned action."""
+        dist = SquashedTanhGaussianDistribution(output_dim=4, init_noise_std=0.5)
+        dist.update(torch.randn(16, 4))
+        action, logp = dist.sample_and_log_prob()
+        assert action.shape == (16, 4) and logp.shape == (16,)
+        assert torch.allclose(logp, dist.log_prob(action), atol=1e-3)
+        assert torch.isfinite(logp).all()
+
+    def test_reparameterized_gradient_flows_to_mean_and_std(self) -> None:
+        """sample_and_log_prob is reparameterized: gradients flow to the pre-squash mean and the log-std param."""
+        dim = 3
+        dist = SquashedTanhGaussianDistribution(output_dim=dim, init_noise_std=1.0, learn_std=True)
+        mean = torch.randn(8, dim, requires_grad=True)
+        dist.update(mean)
+        action, logp = dist.sample_and_log_prob()
+        # A loss on the action itself must reach the mean (only possible via rsample).
+        action.sum().backward(retain_graph=True)
+        assert mean.grad is not None and not torch.all(mean.grad == 0)
+        dist.log_std_param.grad = None
+        logp.sum().backward()
+        assert dist.log_std_param.grad is not None and not torch.all(dist.log_std_param.grad == 0)
+
+    def test_log_std_clamped(self) -> None:
+        """The std should be clamped in log-space to [exp(log_std_min), exp(log_std_max)]."""
+        dim = 2
+        dist_hi = SquashedTanhGaussianDistribution(output_dim=dim, init_noise_std=100.0, log_std_max=1.0)
+        dist_hi.update(torch.zeros(1, dim))
+        assert torch.allclose(dist_hi.std, torch.full((1, dim), math.exp(1.0)), atol=1e-5)
+        dist_lo = SquashedTanhGaussianDistribution(output_dim=dim, init_noise_std=1e-6, log_std_min=-3.0)
+        dist_lo.update(torch.zeros(1, dim))
+        assert torch.allclose(dist_lo.std, torch.full((1, dim), math.exp(-3.0)), atol=1e-5)
+
+    def test_learn_std_false_freezes(self) -> None:
+        """learn_std=False should freeze the log-std parameter (no gradient)."""
+        dim = 3
+        dist = SquashedTanhGaussianDistribution(output_dim=dim, init_noise_std=0.4, learn_std=False)
+        assert dist.log_std_param.requires_grad is False
+        mean = torch.randn(4, dim, requires_grad=True)  # grad path through the mean so backward has a target
+        dist.update(mean)
+        _, logp = dist.sample_and_log_prob()
+        logp.sum().backward()
+        assert dist.log_std_param.grad is None
+        assert torch.allclose(dist.log_std_param, torch.log(torch.full((dim,), 0.4)), atol=1e-6)
 
 
 class TestBetaDistribution:

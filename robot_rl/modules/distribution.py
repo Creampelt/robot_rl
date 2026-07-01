@@ -49,6 +49,19 @@ class Distribution(nn.Module):
         """
         raise NotImplementedError
 
+    def sample_and_log_prob(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample and return the sample together with its log probability, summed over the last dimension.
+
+        The default computes the two separately; distributions with a reparameterized sample whose log-prob is
+        best evaluated from the pre-sample latent (e.g. squashed Gaussians) should override this so both are
+        derived from the *same* draw.
+
+        Returns:
+            A tuple ``(sample, log_prob)``.
+        """
+        sample = self.sample(**kwargs)
+        return sample, self.log_prob(sample)
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the deterministic (mean) output from the raw MLP output.
 
@@ -734,6 +747,139 @@ class VonMisesFisherDistribution(Distribution):
         log_norm1, _ = self._bessel_terms(kappa1)
         dot = (mu0 * mu1).sum(dim=-1)
         return (log_norm0 - log_norm1) + a0 * (kappa0 - kappa1 * dot)
+
+
+class SquashedTanhGaussianDistribution(Distribution):
+    r"""Squashed (tanh) diagonal Gaussian for SAC-style reparameterized, bounded actions.
+
+    A diagonal Gaussian in *pre-squash* space (mean = MLP output, state-independent std) is passed through
+    ``tanh`` and affinely mapped onto ``(low, high)``: :math:`a = \text{scale}\cdot\tanh(u) + \text{offset}`.
+    Sampling is reparameterized (``rsample``) so gradients flow through the action, and :meth:`log_prob`
+    includes the tanh change-of-variables (Jacobian) correction. The scalar std is learnable or fixed and is
+    clamped in log-space to ``[log_std_min, log_std_max]``.
+
+    Use :meth:`sample_and_log_prob` for the SAC actor update: it derives the action and its log-prob from the
+    *same* pre-squash draw (numerically stable). :meth:`log_prob` on an arbitrary action inverts the squash
+    with ``atanh`` and is less precise near the bounds.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        init_noise_std: float = 1.0,
+        log_std_min: float = -20.0,
+        log_std_max: float = 2.0,
+        learn_std: bool = True,
+        low: float = -1.0,
+        high: float = 1.0,
+        eps: float = 1e-6,
+    ) -> None:
+        """Initialize the squashed-tanh Gaussian distribution module.
+
+        Args:
+            output_dim: Dimension of the action/output space.
+            init_noise_std: Initial (pre-squash) standard deviation.
+            log_std_min: Lower clamp on the log standard deviation.
+            log_std_max: Upper clamp on the log standard deviation.
+            learn_std: Whether the std is learnable. If False it is held fixed at ``init_noise_std``.
+            low: Lower bound of the squashed action range.
+            high: Upper bound of the squashed action range.
+            eps: Small tolerance for the ``atanh`` inversion in :meth:`log_prob`.
+        """
+        super().__init__(output_dim)
+        self.log_std_param = nn.Parameter(
+            torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std
+        )
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
+        self._eps = eps
+        self._scale = (high - low) / 2
+        self._offset = (high + low) / 2
+
+        self._mean_pre: torch.Tensor | None = None  # pre-squash mean (MLP output)
+        self._std: torch.Tensor | None = None
+        self._distribution: Normal | None = None
+
+        Normal.set_default_validate_args(False)
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the pre-squash Gaussian from MLP output (mean = output; std = clamped log-std param)."""
+        self._mean_pre = mlp_output
+        log_std = self.log_std_param.clamp(self.log_std_min, self.log_std_max)
+        self._std = torch.exp(log_std).expand_as(mlp_output)
+        self._distribution = Normal(self._mean_pre, self._std)
+
+    def _squash(self, pre_tanh: torch.Tensor) -> torch.Tensor:
+        """Map a pre-squash sample into ``(low, high)`` via tanh + affine scaling."""
+        return self._scale * torch.tanh(pre_tanh) + self._offset
+
+    def _log_prob_from_pre_tanh(self, pre_tanh: torch.Tensor) -> torch.Tensor:
+        """Log-prob of the squashed action derived from its pre-squash sample, summed over the last dim.
+
+        Applies the tanh Jacobian correction with the numerically stable identity
+        ``log(1 - tanh(u)^2) = 2 (log 2 - u - softplus(-2u))`` plus ``log(scale)`` for the affine map.
+        """
+        base = self._distribution.log_prob(pre_tanh)  # type: ignore
+        jac = 2.0 * (math.log(2.0) - pre_tanh - torch.nn.functional.softplus(-2.0 * pre_tanh))
+        return (base - jac - math.log(self._scale)).sum(dim=-1)
+
+    def sample(self, std_clip: float | None = None) -> torch.Tensor:
+        """Reparameterized sample of a squashed action (``std_clip`` accepted for interface compat, unused)."""
+        return self._squash(self._distribution.rsample())  # type: ignore
+
+    def sample_and_log_prob(self, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized ``(action, log_prob)`` from a single pre-squash draw (the SAC actor-update path)."""
+        pre_tanh = self._distribution.rsample()  # type: ignore
+        return self._squash(pre_tanh), self._log_prob_from_pre_tanh(pre_tanh)
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Log-prob of an arbitrary squashed action, inverting the squash with ``atanh`` (less precise)."""
+        t = ((outputs - self._offset) / self._scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
+        pre_tanh = torch.atanh(t)
+        return self._log_prob_from_pre_tanh(pre_tanh)
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Return the squashed mean action (the deterministic policy output)."""
+        return self._squash(mlp_output)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Return an export-friendly module that squashes the MLP output into ``[low, high]``."""
+        return _TanhScaledDeterministicOutput(self._scale, self._offset)
+
+    @property
+    def input_dim(self) -> int:
+        """Return the input dimension required by the distribution (the MLP outputs the pre-squash mean)."""
+        return self.output_dim
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Return the squashed mean action."""
+        return self._squash(self._mean_pre)  # type: ignore
+
+    @property
+    def std(self) -> torch.Tensor:
+        """Return the pre-squash standard deviation (used for logging the exploration scale)."""
+        return self._std  # type: ignore
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """Return the *pre-squash* Gaussian entropy summed over the last dim.
+
+        The true squashed entropy has no closed form (SAC uses ``-log_prob`` instead); this exposes the
+        pre-squash Gaussian entropy so generic entropy consumers keep working.
+        """
+        return self._distribution.entropy().sum(dim=-1)  # type: ignore
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        """Return ``(pre_squash_mean, std)`` of the current distribution."""
+        return (self._mean_pre, self._std)  # type: ignore
+
+    def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Compute KL between the *pre-squash* Gaussians (SAC does not use this; provided for completeness)."""
+        old_mean, old_std = old_params
+        new_mean, new_std = new_params
+        return torch.distributions.kl_divergence(Normal(old_mean, old_std), Normal(new_mean, new_std)).sum(dim=-1)
 
 
 class _IdentityDeterministicOutput(nn.Module):
