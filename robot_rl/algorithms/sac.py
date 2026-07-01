@@ -309,6 +309,42 @@ class SAC:
         """Return the actor (policy) model."""
         return self.actor
 
+    def eval(
+        self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
+    ) -> list[dict]:
+        """Roll out the policy for ``max_steps`` env steps (each ``env.step`` renders a frame for a video wrapper).
+
+        Args:
+            env: Vectorized environment to roll out in.
+            max_steps: Number of environment steps to run.
+            stochastic: Act with the deterministic squashed mean when False; sample the action when True.
+            action_repeat: Hold each queried action for this many ``env.step`` calls before re-querying the actor.
+
+        Returns:
+            An empty list (this rollout collects no eval metrics); present for parity with the other algorithms
+            so the out-of-process video recorder can drive SAC the same way.
+        """
+        was_training = self.actor.training
+        self.eval_mode()
+        if hasattr(env, "eval_mode"):
+            env.eval_mode()
+
+        obs = env.get_observations() if hasattr(env, "get_observations") else env.reset()[0]
+        action_repeat = max(1, action_repeat)
+
+        with torch.inference_mode():
+            actions = self.actor(obs, stochastic_output=stochastic)
+            for step in range(max_steps):
+                if step > 0 and step % action_repeat == 0:
+                    actions = self.actor(obs, stochastic_output=stochastic)
+                obs, _, _, _ = env.step(actions)
+
+        if was_training:
+            self.train_mode()
+            if hasattr(env, "train_mode"):
+                env.train_mode()
+        return []
+
     def save(self) -> dict:
         """Return a dict of model/optimizer/temperature states for checkpointing."""
         saved = {
