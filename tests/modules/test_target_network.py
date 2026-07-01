@@ -5,10 +5,12 @@
 
 """Tests for the TargetNetwork wrapper."""
 
+import copy
 import torch
 import torch.nn as nn
 
 from robot_rl.modules import TargetNetwork
+from robot_rl.utils import soft_update_params
 
 
 def _make_net() -> nn.Module:
@@ -69,6 +71,26 @@ class TestTargetNetwork:
             online.running_stat.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
         tn.update()
         assert torch.allclose(tn.target.get_buffer("running_stat"), torch.tensor([1.0, 2.0, 3.0, 4.0]))
+
+    def test_update_byte_identical_to_soft_update_params(self) -> None:
+        """update(tau) is byte-for-byte identical to the shared ``soft_update_params`` (buffer-less module).
+
+        This is the invariant that lets FbCpr's target nets move onto this wrapper without perturbing training:
+        both must apply the exact same foreach mul+add so a wrapped FbCpr trains bit-for-bit as before.
+        """
+        torch.manual_seed(0)
+        online = nn.Sequential(nn.Linear(6, 12), nn.ReLU(), nn.Linear(12, 3))  # buffer-less, like the FB maps
+        tn = TargetNetwork(online, tau=0.01)
+        ref_target = copy.deepcopy(online)  # identical starting target, updated via the raw util
+        for p in ref_target.parameters():
+            p.requires_grad_(False)  # targets are frozen (as TargetNetwork freezes its own)
+        with torch.no_grad():
+            for p in online.parameters():
+                p.add_(torch.randn_like(p))
+        tn.update(tau=0.01)
+        soft_update_params(tuple(online.parameters()), tuple(ref_target.parameters()), 0.01)
+        for tp, rp in zip(tn.target.parameters(), ref_target.parameters(), strict=True):
+            assert torch.equal(tp, rp)
 
     def test_forward_is_target_and_detached(self) -> None:
         """Calling the wrapper evaluates the target and returns a tensor with no gradient graph."""

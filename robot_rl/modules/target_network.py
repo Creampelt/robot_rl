@@ -54,9 +54,12 @@ class TargetNetwork(nn.Module):
         Args:
             tau: Override for the interpolation coefficient; defaults to the value set at construction.
         """
+        from robot_rl.utils import soft_update_params
+
         t = self.tau if tau is None else float(tau)
-        for tp, op in zip(self.target.parameters(), self.online.parameters(), strict=True):
-            tp.lerp_(op.detach(), t)  # tp <- tp + t * (op - tp) = (1 - t) * tp + t * op
+        # Reuse the shared foreach mul+add so target updates are byte-identical to FbCpr's, which drives
+        # this wrapper too (a per-param lerp_ would round differently and break FbCpr parity).
+        soft_update_params(tuple(self.online.parameters()), tuple(self.target.parameters()), t)
         # Buffers (e.g. normalization running stats) are not gradient-updated; hard-copy them each step.
         for tb, ob in zip(self.target.buffers(), self.online.buffers(), strict=True):
             tb.copy_(ob)
