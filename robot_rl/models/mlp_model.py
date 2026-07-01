@@ -241,6 +241,21 @@ class MLPModel(nn.Module):
         """Return raw parameters of the current output distribution."""
         return self.distribution.params
 
+    def act_and_log_prob(
+        self, obs: TensorDict, *args: torch.Tensor, std_clip: float | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample a stochastic action and its log-prob from a single (reparameterized) draw.
+
+        Updates the output distribution from a forward pass and returns ``(action, log_prob)`` derived from the
+        same draw. Used by off-policy algorithms (e.g. SAC) that need the action and its log-prob together for the
+        entropy term; requires a distribution implementing :meth:`sample_and_log_prob`
+        (e.g. ``SquashedTanhGaussianDistribution``).
+        """
+        latent = self.get_latent(obs, *args)
+        mlp_output = self.mlp(latent)
+        self.distribution.update(mlp_output)  # type: ignore
+        return self.distribution.sample_and_log_prob(std_clip=std_clip)  # type: ignore
+
     def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
         """Compute log-probabilities of outputs under the current distribution."""
         return self.distribution.log_prob(outputs)
