@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 import time
 import torch
@@ -44,11 +45,15 @@ class OffPolicyRunner:
         # Query observations from the environment for algorithm construction
         obs = self.env.get_observations()
 
-        # Create the algorithm
+        # Create the algorithm. FbCpr's construct_algorithm takes build_expert_buffer; simpler off-policy
+        # algorithms (e.g. SAC) use the plain (obs, env, cfg, device) factory signature.
         alg_class: type[FbCpr] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
-        self.alg = alg_class.construct_algorithm(
-            obs, self.env, self.cfg, self.device, build_expert_buffer=build_expert_buffer
-        )
+        if "build_expert_buffer" in inspect.signature(alg_class.construct_algorithm).parameters:
+            self.alg = alg_class.construct_algorithm(
+                obs, self.env, self.cfg, self.device, build_expert_buffer=build_expert_buffer
+            )
+        else:
+            self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
         # Create the logger
         self.logger = Logger(
@@ -65,7 +70,14 @@ class OffPolicyRunner:
         self.current_learning_iteration = 0
 
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
-        """Run the learning loop for the specified number of iterations."""
+        """Run the learning loop for the specified number of iterations.
+
+        Dispatches to a generic off-policy loop for algorithms without FbCpr's expert-buffer machinery
+        (e.g. SAC); otherwise runs the FbCpr loop below unchanged.
+        """
+        if not hasattr(self.alg, "expert_buffer"):
+            return self._learn_simple(num_learning_iterations)
+
         # Add expert buffer to environment, then re-reset so the initial state is RSI'd from the expert buffer rather
         # than the default-pose state produced by the env wrapper's first reset (which ran before attach).
         self.env.set_expert_buffer(self.alg.expert_buffer)
@@ -201,6 +213,68 @@ class OffPolicyRunner:
                     prof.step()
 
         # Save the final model after training and stop the logging writer
+        if self.logger.writer is not None:
+            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
+            self.logger.stop_logging_writer()
+
+    def _learn_simple(self, num_learning_iterations: int) -> None:
+        """Run a generic off-policy loop: collect ``num_steps_per_env`` steps, then ``update`` after ``start_training``.
+
+        Used by algorithms (e.g. SAC) whose per-step behavior lives entirely in ``act``/``process_env_step``/
+        ``update`` -- no expert buffer, latent z, seed phase, or eval. The replay buffer is owned by the algorithm.
+        """
+        obs = self.env.get_observations().to(self.device)
+        self.alg.train_mode()
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
+        self.logger.init_logging_writer()
+
+        start_it = self.current_learning_iteration
+        total_it = start_it + num_learning_iterations
+        start_training = self.cfg.get("start_training", 0)
+        num_steps_per_env = self.cfg.get("num_steps_per_env", 1)
+        collect_time = 0.0
+        learn_time = 0.0
+
+        for it in range(start_it, total_it):
+            start = time.time()
+            with torch.inference_mode():
+                for _ in range(num_steps_per_env):
+                    actions = self.alg.act(obs)
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+            stop = time.time()
+            collect_time = stop - start
+            start = stop
+
+            loss_dict: dict = {}
+            if it >= start_training:
+                loss_dict = self.alg.update()
+
+            stop = time.time()
+            learn_time = stop - start
+            self.current_learning_iteration = it
+
+            if it % self.cfg.get("log_interval", 1) == 0:
+                self.logger.log(
+                    it=it,
+                    start_it=start_it,
+                    total_it=total_it,
+                    collect_time=collect_time,
+                    learn_time=learn_time,
+                    loss_dict=loss_dict,
+                    learning_rate=self.alg.actor_learning_rate,
+                    action_std=self.alg.get_policy().output_std,
+                    rnd_weight=self.alg.rnd.weight if self.alg.rnd else None,
+                )
+
+            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
+                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+
         if self.logger.writer is not None:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
             self.logger.stop_logging_writer()
