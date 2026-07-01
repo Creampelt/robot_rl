@@ -25,6 +25,7 @@ from .normalization import (
 from .parallel import ParallelLayerNorm, ParallelLinear
 from .residual import ResMLP
 from .rnn import RNN, HiddenState
+from .target_network import TargetNetwork
 from .transformer_xl import TransformerXL
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "ParallelLinear",
     "ResMLP",
     "SquashedTanhGaussianDistribution",
+    "TargetNetwork",
     "TransformerXL",
     "TruncatedGaussianDistribution",
     "VonMisesFisherDistribution",
