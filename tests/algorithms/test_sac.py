@@ -29,11 +29,11 @@ class _DummyVecEnv:
     def get_observations(self) -> TensorDict:
         return self._obs()
 
-    def step(self, actions: torch.Tensor):
+    def step(self, actions: torch.Tensor) -> tuple:
         next_obs = self._obs()
         rewards = torch.randn(self.num_envs)
-        terminated = (torch.rand(self.num_envs) < 0.05)
-        timed_out = (torch.rand(self.num_envs) < 0.05)
+        terminated = torch.rand(self.num_envs) < 0.05
+        timed_out = torch.rand(self.num_envs) < 0.05
         dones = terminated | timed_out
         extras = {
             "time_outs": timed_out,
@@ -136,10 +136,10 @@ class TestSAC:
         target_before = copy.deepcopy([p.detach().clone() for p in alg.critic_1_target.target.parameters()])
         for _ in range(3):
             alg.update()
-        actor_changed = any(not torch.allclose(b, a) for b, a in zip(actor_before, alg.actor_parameters))
+        actor_changed = any(not torch.allclose(b, a) for b, a in zip(actor_before, alg.actor_parameters, strict=True))
         target_moved = any(
             not torch.allclose(b, t)
-            for b, t in zip(target_before, alg.critic_1_target.target.parameters())
+            for b, t in zip(target_before, alg.critic_1_target.target.parameters(), strict=True)
         )
         assert actor_changed, "actor parameters should update"
         assert target_moved, "target critic should track the online critic via soft update"
@@ -150,9 +150,9 @@ class TestSAC:
         _collect(alg, env, steps=8)
         alg.update()
         state = alg.save()
-        alg2, env2 = _build()
+        alg2, _ = _build()
         alg2.load(state)
-        for p1, p2 in zip(alg.actor.parameters(), alg2.actor.parameters()):
+        for p1, p2 in zip(alg.actor.parameters(), alg2.actor.parameters(), strict=True):
             assert torch.allclose(p1, p2)
         assert abs(alg.alpha - alg2.alpha) < 1e-6
 

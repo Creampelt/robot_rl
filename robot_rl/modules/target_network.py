@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import torch
 import torch.nn as nn
+from typing import Any
 
 
 class TargetNetwork(nn.Module):
@@ -54,21 +55,21 @@ class TargetNetwork(nn.Module):
             tau: Override for the interpolation coefficient; defaults to the value set at construction.
         """
         t = self.tau if tau is None else float(tau)
-        for tp, op in zip(self.target.parameters(), self.online.parameters()):
+        for tp, op in zip(self.target.parameters(), self.online.parameters(), strict=True):
             tp.lerp_(op.detach(), t)  # tp <- tp + t * (op - tp) = (1 - t) * tp + t * op
         # Buffers (e.g. normalization running stats) are not gradient-updated; hard-copy them each step.
-        for tb, ob in zip(self.target.buffers(), self.online.buffers()):
+        for tb, ob in zip(self.target.buffers(), self.online.buffers(), strict=True):
             tb.copy_(ob)
 
     @torch.no_grad()
     def hard_sync(self) -> None:
         """Copy the online parameters and buffers into the target exactly (equivalent to ``update(tau=1)``)."""
-        for tp, op in zip(self.target.parameters(), self.online.parameters()):
+        for tp, op in zip(self.target.parameters(), self.online.parameters(), strict=True):
             tp.copy_(op)
-        for tb, ob in zip(self.target.buffers(), self.online.buffers()):
+        for tb, ob in zip(self.target.buffers(), self.online.buffers(), strict=True):
             tb.copy_(ob)
 
-    def forward(self, *args, **kwargs):  # noqa: ANN002, ANN003
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Evaluate the target model under ``no_grad`` (targets never propagate gradients)."""
         with torch.no_grad():
             return self.target(*args, **kwargs)

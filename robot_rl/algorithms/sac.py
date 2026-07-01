@@ -133,9 +133,7 @@ class SAC:
         self.transition.actions = action
         return action
 
-    def process_env_step(
-        self, next_obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict
-    ) -> None:
+    def process_env_step(self, next_obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
         """Record a step and insert the transition into the replay buffer.
 
         Handles the off-policy timeout distinction: on a *timeout* the true (pre-reset) next observation comes
@@ -153,7 +151,7 @@ class SAC:
                 true_next_obs = TensorDict(
                     {
                         key: torch.where(mask, extras["time_outs_obs"][key].to(self.device), next_obs[key])
-                        for key in next_obs.keys()
+                        for key in next_obs.keys()  # noqa: SIM118 -- TensorDict iterates its batch dim, not keys
                     },
                     batch_size=next_obs.batch_size,
                 )

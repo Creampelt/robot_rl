@@ -25,7 +25,7 @@ class TestTargetNetwork:
         """Target starts as an exact copy with all parameters frozen; the wrapper exposes only target params."""
         online = _make_net()
         tn = TargetNetwork(online, tau=0.01)
-        for tp, op in zip(tn.target.parameters(), online.parameters()):
+        for tp, op in zip(tn.target.parameters(), online.parameters(), strict=True):
             assert torch.equal(tp, op)
             assert tp.requires_grad is False
         # The online net is a plain reference, not a registered submodule -> wrapper params == target params only.
@@ -43,7 +43,7 @@ class TestTargetNetwork:
                 p.add_(torch.randn_like(p))
         before = [tp.clone() for tp in tn.target.parameters()]
         tn.update()  # tau=0.25
-        for b, tp, op in zip(before, tn.target.parameters(), online.parameters()):
+        for b, tp, op in zip(before, tn.target.parameters(), online.parameters(), strict=True):
             expected = 0.75 * b + 0.25 * op
             assert torch.allclose(tp, expected, atol=1e-6)
 
@@ -57,7 +57,7 @@ class TestTargetNetwork:
                     p.add_(torch.randn_like(p))
                 online.running_stat.copy_(torch.arange(4, dtype=torch.float))
             tn.hard_sync() if use_hard else tn.update(tau=1.0)
-            for tp, op in zip(tn.target.parameters(), online.parameters()):
+            for tp, op in zip(tn.target.parameters(), online.parameters(), strict=True):
                 assert torch.allclose(tp, op, atol=1e-7)
             assert torch.allclose(tn.target.get_buffer("running_stat"), online.get_buffer("running_stat"))
 

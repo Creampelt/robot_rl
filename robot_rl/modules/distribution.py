@@ -787,9 +787,7 @@ class SquashedTanhGaussianDistribution(Distribution):
             eps: Small tolerance for the ``atanh`` inversion in :meth:`log_prob`.
         """
         super().__init__(output_dim)
-        self.log_std_param = nn.Parameter(
-            torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std
-        )
+        self.log_std_param = nn.Parameter(torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std)
         self.log_std_min = float(log_std_min)
         self.log_std_max = float(log_std_max)
         self._eps = eps
