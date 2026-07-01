@@ -63,6 +63,7 @@ class ReplayBuffer:
             rewards: torch.Tensor,
             gammas: torch.Tensor,
             context: torch.Tensor,
+            next_terminated: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict = observations
@@ -83,6 +84,9 @@ class ReplayBuffer:
             self.context: torch.Tensor = context
             """Batch of latent context (z) vectors."""
 
+            self.next_terminated: torch.Tensor | None = next_terminated
+            """Batch of terminated flags after the step (true termination only; used by SAC to gate the bootstrap)."""
+
     def __init__(
         self,
         num_envs: int,
@@ -92,12 +96,28 @@ class ReplayBuffer:
         z_dim: int,
         batch_size: int,
         device: str = "cpu",
+        keep_terminal: bool = False,
     ) -> None:
-        """Initialize the buffer storage."""
+        """Initialize the buffer storage.
+
+        Args:
+            num_envs: Number of parallel environments feeding the buffer.
+            capacity_per_env: Stored transitions per environment (total capacity = ``capacity_per_env * num_envs``).
+            obs: A representative observation TensorDict used to size the obs/next-obs storage.
+            actions_shape: Shape of a single environment's action.
+            z_dim: Latent-context dimension (use ``0`` for algorithms without a latent, e.g. SAC).
+            batch_size: Mini-batch size returned by :meth:`sample_mini_batch`.
+            device: Storage device.
+            keep_terminal: If ``False`` (default; FbCpr) transitions whose ``dones`` is set are dropped, since the
+                stored next-obs would be a post-reset state. If ``True`` (SAC) *all* transitions are kept -- the
+                caller must set ``next_observations`` to the true pre-reset next-obs (via ``time_outs_obs``) and
+                ``next_terminated`` to gate the bootstrap.
+        """
         # store inputs
         self.num_envs = num_envs
         self.capacity = capacity_per_env * num_envs
         self.device = device
+        self.keep_terminal = keep_terminal
 
         # Core
         # We only take value.shape[1:] to ignore num_envs dimension
@@ -129,9 +149,9 @@ class ReplayBuffer:
 
     def add_transitions(self, transition: Transition) -> None:
         """Add a transition to the buffer."""
-        # Only include transitions that haven't terminated (otherwise next_obs is state after reset)
-        # if dones is None, all are valid
-        if transition.dones is None:
+        # Drop transitions whose next_obs is a post-reset state (dones set), unless keep_terminal is set (SAC,
+        # where next_obs is the true pre-reset obs). If dones is None, all are valid.
+        if transition.dones is None or self.keep_terminal:
             valid_idxs = torch.arange(self.num_envs, device=self.device)
         else:
             valid_idxs = torch.argwhere(~transition.dones.view(-1)).flatten()
@@ -174,4 +194,5 @@ class ReplayBuffer:
             self.rewards[self._indices].to(device),
             self.gammas[self._indices].to(device),
             self.context[self._indices].to(device),
+            self.next_terminated[self._indices].to(device),
         )

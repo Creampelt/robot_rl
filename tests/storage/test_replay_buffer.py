@@ -13,26 +13,29 @@ from robot_rl.storage.replay_buffer import ReplayBuffer
 OBS_DIM, ACT_DIM, Z_DIM = 5, 3, 4
 
 
-def _make_buffer(num_envs: int = 6, capacity_per_env: int = 4, batch_size: int = 8) -> ReplayBuffer:
+def _make_buffer(
+    num_envs: int = 6, capacity_per_env: int = 4, batch_size: int = 8, keep_terminal: bool = False, z_dim: int = Z_DIM
+) -> ReplayBuffer:
     obs = TensorDict({"policy": torch.zeros(num_envs, OBS_DIM)}, batch_size=num_envs)
     return ReplayBuffer(
         num_envs=num_envs,
         capacity_per_env=capacity_per_env,
         obs=obs,
         actions_shape=(ACT_DIM,),
-        z_dim=Z_DIM,
+        z_dim=z_dim,
         batch_size=batch_size,
         device="cpu",
+        keep_terminal=keep_terminal,
     )
 
 
-def _make_transition(num_envs: int, dones: torch.Tensor) -> ReplayBuffer.Transition:
+def _make_transition(num_envs: int, dones: torch.Tensor, z_dim: int = Z_DIM) -> ReplayBuffer.Transition:
     tr = ReplayBuffer.Transition()
     tr.observations = TensorDict({"policy": torch.randn(num_envs, OBS_DIM)}, batch_size=num_envs)
     tr.next_observations = TensorDict({"policy": torch.randn(num_envs, OBS_DIM)}, batch_size=num_envs)
     tr.actions = torch.randn(num_envs, ACT_DIM)
     tr.rewards = torch.randn(num_envs)
-    tr.context = torch.randn(num_envs, Z_DIM)
+    tr.context = torch.randn(num_envs, z_dim)
     tr.dones = dones
     tr.next_terminated = dones.byte()
     return tr
@@ -75,6 +78,21 @@ class TestReplayBuffer:
         assert batch.rewards.shape == (8,)
         assert batch.context.shape == (8, Z_DIM)
         assert batch.gammas.shape == (8, 1)
+        assert batch.next_terminated.shape == (8, 1)
+
+    def test_keep_terminal_stores_all(self) -> None:
+        """With keep_terminal=True (SAC), done transitions are retained instead of dropped."""
+        buf = _make_buffer(num_envs=6, keep_terminal=True, z_dim=0)
+        dones = torch.tensor([0, 1, 0, 1, 1, 0]).bool()  # 3 done, but all kept
+        buf.add_transitions(_make_transition(6, dones, z_dim=0))
+        assert len(buf) == 6
+
+    def test_keep_terminal_records_next_terminated(self) -> None:
+        """The next_terminated flags are stored and recoverable when keeping terminals."""
+        buf = _make_buffer(num_envs=4, keep_terminal=True, z_dim=0, batch_size=64)
+        dones = torch.tensor([0, 1, 0, 1]).bool()
+        buf.add_transitions(_make_transition(4, dones, z_dim=0))
+        assert torch.equal(buf.next_terminated[:4].view(-1).bool(), dones)
 
     def test_stored_values_roundtrip(self) -> None:
         """A single all-valid add should be recoverable (values land in the buffer)."""
