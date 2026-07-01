@@ -97,6 +97,9 @@ class FbCpr:
         device: str = "cpu",
         dtype: str = "float32",
         compile_mode: str | None = "reduce-overhead",
+        # Rollout-state parameters (owned here since act(obs) internalized z/seed-phase/clipping)
+        clip_actions: float | None = None,
+        num_seed_steps_per_env: int = 0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs: Any,
@@ -169,6 +172,15 @@ class FbCpr:
         self.expert_rollout_envs: torch.Tensor | None = None
         self.expert_rollout_z: torch.Tensor | None = None
 
+        # Rollout state (was runner-held): latent z, last dones, per-env episode step, and act count for
+        # the seed phase. Episode lengths are lazily allocated on the first act (num_envs known then).
+        self.clip_actions = clip_actions
+        self.num_seed_steps_per_env = num_seed_steps_per_env
+        self._rollout_z: torch.Tensor | None = None
+        self._last_dones: torch.Tensor | None = None
+        self._cur_episode_length: torch.Tensor | None = None
+        self._act_steps = 0
+
         # FB-CPR parameters
         self.dtype = resolve_dtype(dtype)
         self.discriminator_reward_eps = torch.finfo(self.dtype).resolution
@@ -224,29 +236,32 @@ class FbCpr:
             self.discriminator,
         ]
 
-    def act(
-        self,
-        obs: TensorDict,
-        z: torch.Tensor,
-        dones: torch.Tensor | None,
-        random_sample: bool = False,
-        clip_actions: float | None = None,
-    ) -> torch.Tensor:
-        """Sample actions and store transition data."""
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        """Sample actions and store transition data.
+
+        Owns the rollout state the runner used to thread through: the per-env latent ``z`` (refreshed from
+        episode progress), the previous step's dones, the seed-phase random sampling, and action clipping.
+        """
+        num_envs = obs.batch_size[0]
+        if self._cur_episode_length is None:
+            self._cur_episode_length = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        # Update latent z from episode progress, then sample
+        z = self._rollout_z = self.update_rollout_z(self._rollout_z, self._cur_episode_length, num_envs)
+        random_sample = self._act_steps <= self.num_seed_steps_per_env
+        self._act_steps += 1
         # Normalize observations
         with eval_mode(self.obs_normalizer):
             norm_obs = self.obs_normalizer(obs)
         # compute the actions and values
         self.transition.actions = self.actor(norm_obs, z, stochastic_output=True).detach()
-        # uniformly sample from action space if specified
+        # uniformly sample from action space during the seed phase
         if random_sample:
-            if clip_actions is None:
-                clip_actions = 1.0
+            clip_actions = 1.0 if self.clip_actions is None else self.clip_actions
             self.transition.actions.uniform_(-clip_actions, clip_actions).detach()
         # record obs and dones before env.step()
         self.transition.observations = obs
         # dones is None if this is the first step
-        self.transition.dones = dones
+        self.transition.dones = self._last_dones
         self.transition.context = z
         return self.transition.actions  # type: ignore
 
@@ -272,6 +287,18 @@ class FbCpr:
         # Reset hidden states of all models
         for model in self.models:
             model.reset(dones)
+
+        # Advance the rollout state consumed by the next act(): episode step counters and last dones
+        if self._cur_episode_length is not None:
+            self._cur_episode_length += 1
+            self._cur_episode_length[(dones > 0).nonzero(as_tuple=False)] = 0
+        self._last_dones = dones
+
+    def reset_rollout_state(self) -> None:
+        """Reset the per-env rollout bookkeeping after an external env reset (e.g. post-eval); z is kept."""
+        if self._cur_episode_length is not None:
+            self._cur_episode_length[:] = 0
+        self._last_dones = None
 
     def compute_gammas(self) -> None:
         """Compute gamma values from stored transitions."""
@@ -649,6 +676,9 @@ class FbCpr:
             device=device,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
+            # rollout-state knobs owned by the algorithm since act(obs) internalized z/seed/clipping
+            clip_actions=cfg.get("clip_actions"),
+            num_seed_steps_per_env=cfg.get("num_seed_steps_per_env", 0),
         )
 
         return alg

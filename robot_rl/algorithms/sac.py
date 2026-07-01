@@ -314,9 +314,15 @@ class SAC:
         """Return the actor (policy) model."""
         return self.actor
 
-    def eval(
-        self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
-    ) -> list[dict]:
+    def log_info(self) -> dict:
+        """Extra per-iteration values for the runner's log call (learning rate, action std, RND weight)."""
+        return {
+            "learning_rate": self.actor_learning_rate,
+            "action_std": self.get_policy().output_std,
+            "rnd_weight": self.rnd.weight if self.rnd else None,
+        }
+
+    def eval(self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1) -> list[dict]:
         """Roll out the policy for ``max_steps`` env steps (each ``env.step`` renders a frame for a video wrapper).
 
         Args:

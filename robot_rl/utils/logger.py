@@ -180,6 +180,21 @@ class Logger:
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
 
+    def process_update_extras(
+        self,
+        eval_extras: list[dict] | None = None,
+        loss_extras: list[dict] | None = None,
+        algo_extras: list[dict] | None = None,
+    ) -> None:
+        """Buffer per-iteration extras produced outside env stepping (eval results, update losses)."""
+        if self.writer is not None:
+            if eval_extras:
+                self.eval_extras.extend(eval_extras)
+            if loss_extras:
+                self.loss_extras.extend(loss_extras)
+            if algo_extras:
+                self.algo_extras.extend(algo_extras)
+
     def reset_all_envs(self) -> None:
         """Save and clear all logging buffers."""
         # Skip reset if all episodes are at 0 steps
