@@ -210,7 +210,12 @@ class SAC:
                 q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
                 q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
                 min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
-                discount = self.gamma**self.n_steps
+                # n-step: discount by the per-sample horizon actually aggregated (capped at episode ends);
+                # single-step: gamma^1. The buffer sets effective_n_steps only when n_steps > 1.
+                if batch.effective_n_steps is not None:
+                    discount = self.gamma ** batch.effective_n_steps.view(-1).float()
+                else:
+                    discount = self.gamma**self.n_steps
                 target_q = rewards_b + discount * not_terminated * min_q_t
 
             q1 = self.critic_1(obs_b, actions_b).view(-1)
@@ -449,6 +454,8 @@ class SAC:
             batch_size=cfg["algorithm"].get("mini_batch_size", 256),
             device=storage_device,
             keep_terminal=True,
+            n_steps=cfg["algorithm"].get("n_steps", 1),
+            gamma=cfg["algorithm"].get("gamma", 0.99),
         )
 
         return alg_class(

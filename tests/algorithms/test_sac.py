@@ -156,6 +156,18 @@ class TestSAC:
             assert torch.allclose(p1, p2)
         assert abs(alg.alpha - alg2.alpha) < 1e-6
 
+    def test_nstep_update(self) -> None:
+        """SAC trains end-to-end with n-step returns (per-sample effective horizon)."""
+        env = _DummyVecEnv()
+        cfg = _make_cfg()
+        cfg["algorithm"]["n_steps"] = 3
+        alg = SAC.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
+        assert alg.replay_buffer.n_steps == 3
+        _collect(alg, env, steps=12)
+        losses = alg.update()
+        for key in ("critic_1", "critic_2", "actor", "alpha_value"):
+            assert torch.isfinite(torch.tensor(losses[key]))
+
     def test_fixed_alpha(self) -> None:
         """With auto_alpha=False the temperature is fixed and has no optimizer."""
         env = _DummyVecEnv()
