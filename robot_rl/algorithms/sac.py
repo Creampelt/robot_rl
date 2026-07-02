@@ -124,12 +124,12 @@ class SAC:
         self.actor_optimizer = resolve_optimizer(actor_optimizer)(self.actor_parameters, lr=actor_learning_rate)
         self.critic_optimizer = resolve_optimizer(critic_optimizer)(self.critic_parameters, lr=critic_learning_rate)
 
-        # Apply torch.compile to the hot per-minibatch update methods (mirrors FbCpr; keeps checkpoints
-        # compatible since modules themselves stay uncompiled). "eager"/"none" sentinels disable it, since
-        # configclass cannot hydra-override a None default with a string.
+        # Apply torch.compile to the forward+loss+backward hot paths (single unbroken graphs; optimizer
+        # steps stay eager -- a graph break at step() invalidates cudagraph outputs under reduce-overhead).
+        # "eager"/"none" sentinels disable it, since configclass cannot hydra-override a None default.
         if compile_mode not in (None, "eager", "none"):
-            self._update_critics = torch.compile(self._update_critics, mode=compile_mode)
-            self._update_actor = torch.compile(self._update_actor, mode=compile_mode)
+            self._critic_losses_and_backward = torch.compile(self._critic_losses_and_backward, mode=compile_mode)
+            self._actor_loss_and_backward = torch.compile(self._actor_loss_and_backward, mode=compile_mode)
 
     # -- rollout ---------------------------------------------------------------------------------------------
 
@@ -279,6 +279,26 @@ class SAC:
         not_terminated: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One twin-critic gradient step; returns the two critic losses."""
+        self.critic_optimizer.zero_grad()
+        critic_1_loss, critic_2_loss = self._critic_losses_and_backward(
+            batch, obs_b, next_obs_b, actions_b, rewards_b, not_terminated
+        )
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.critic_parameters)
+        nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
+        self.critic_optimizer.step()
+        return critic_1_loss, critic_2_loss
+
+    def _critic_losses_and_backward(
+        self,
+        batch: ReplayBuffer.Batch,
+        obs_b: TensorDict,
+        next_obs_b: TensorDict,
+        actions_b: torch.Tensor,
+        rewards_b: torch.Tensor,
+        not_terminated: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compiled region: twin-critic losses + backward (no optimizer ops, no graph breaks)."""
         with torch.no_grad():
             next_actions, next_logp = self.actor.act_and_log_prob(next_obs_b)
             q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
@@ -297,28 +317,28 @@ class SAC:
         critic_1_loss = nn.functional.mse_loss(q1, target_q)
         critic_2_loss = nn.functional.mse_loss(q2, target_q)
         critic_loss = critic_1_loss + critic_2_loss
-
-        self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        if self.is_multi_gpu:
-            self.reduce_parameters(self.critic_parameters)
-        nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
-        self.critic_optimizer.step()
-        # clone out of the cudagraph pool: another compiled call may overwrite these buffers before .item()
+        # clone out of the cudagraph pool: another graph replay may overwrite these buffers before .item()
         return critic_1_loss.detach().clone(), critic_2_loss.detach().clone()
 
     def _update_actor(self, obs_b: TensorDict, new_actions: torch.Tensor, logp: torch.Tensor) -> torch.Tensor:
         """One actor gradient step against the frozen critics; returns the actor loss."""
-        q1_pi = self.critic_1(obs_b, new_actions).view(-1)
-        q2_pi = self.critic_2(obs_b, new_actions).view(-1)
-        actor_loss = (self.log_alpha.exp().detach() * logp - torch.min(q1_pi, q2_pi)).mean()
-
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        actor_loss = self._actor_loss_and_backward(obs_b, new_actions, logp)
         if self.is_multi_gpu:
             self.reduce_parameters(self.actor_parameters)
         nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
         self.actor_optimizer.step()
+        return actor_loss
+
+    def _actor_loss_and_backward(
+        self, obs_b: TensorDict, new_actions: torch.Tensor, logp: torch.Tensor
+    ) -> torch.Tensor:
+        """Compiled region: actor loss + backward (no optimizer ops, no graph breaks)."""
+        q1_pi = self.critic_1(obs_b, new_actions).view(-1)
+        q2_pi = self.critic_2(obs_b, new_actions).view(-1)
+        actor_loss = (self.log_alpha.exp().detach() * logp - torch.min(q1_pi, q2_pi)).mean()
+        actor_loss.backward()
         return actor_loss.detach().clone()
 
     # -- mode / persistence ----------------------------------------------------------------------------------
