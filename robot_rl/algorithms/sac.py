@@ -125,8 +125,9 @@ class SAC:
         self.critic_optimizer = resolve_optimizer(critic_optimizer)(self.critic_parameters, lr=critic_learning_rate)
 
         # Apply torch.compile to the hot per-minibatch update methods (mirrors FbCpr; keeps checkpoints
-        # compatible since modules themselves stay uncompiled)
-        if compile_mode is not None:
+        # compatible since modules themselves stay uncompiled). "eager"/"none" sentinels disable it, since
+        # configclass cannot hydra-override a None default with a string.
+        if compile_mode not in (None, "eager", "none"):
             self._update_critics = torch.compile(self._update_critics, mode=compile_mode)
             self._update_actor = torch.compile(self._update_actor, mode=compile_mode)
 
