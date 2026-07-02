@@ -54,6 +54,7 @@ class SAC:
         max_grad_norm: float = 1.0,
         policy_frequency: int = 1,
         n_steps: int = 1,
+        compile_mode: str | None = None,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
         symmetry_cfg: dict | None = None,
@@ -122,6 +123,12 @@ class SAC:
         ]
         self.actor_optimizer = resolve_optimizer(actor_optimizer)(self.actor_parameters, lr=actor_learning_rate)
         self.critic_optimizer = resolve_optimizer(critic_optimizer)(self.critic_parameters, lr=critic_learning_rate)
+
+        # Apply torch.compile to the hot per-minibatch update methods (mirrors FbCpr; keeps checkpoints
+        # compatible since modules themselves stay uncompiled)
+        if compile_mode is not None:
+            self._update_critics = torch.compile(self._update_critics, mode=compile_mode)
+            self._update_actor = torch.compile(self._update_actor, mode=compile_mode)
 
     # -- rollout ---------------------------------------------------------------------------------------------
 
@@ -205,31 +212,9 @@ class SAC:
             not_terminated = 1.0 - batch.next_terminated.view(-1).float()
 
             # 1) Critic update -- bootstrapped target with entropy and (n-step) discount.
-            with torch.no_grad():
-                next_actions, next_logp = self.actor.act_and_log_prob(next_obs_b)
-                q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
-                q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
-                min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
-                # n-step: discount by the per-sample horizon actually aggregated (capped at episode ends);
-                # single-step: gamma^1. The buffer sets effective_n_steps only when n_steps > 1.
-                if batch.effective_n_steps is not None:
-                    discount = self.gamma ** batch.effective_n_steps.view(-1).float()
-                else:
-                    discount = self.gamma**self.n_steps
-                target_q = rewards_b + discount * not_terminated * min_q_t
-
-            q1 = self.critic_1(obs_b, actions_b).view(-1)
-            q2 = self.critic_2(obs_b, actions_b).view(-1)
-            critic_1_loss = nn.functional.mse_loss(q1, target_q)
-            critic_2_loss = nn.functional.mse_loss(q2, target_q)
-            critic_loss = critic_1_loss + critic_2_loss
-
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            if self.is_multi_gpu:
-                self.reduce_parameters(self.critic_parameters)
-            nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
-            self.critic_optimizer.step()
+            critic_1_loss, critic_2_loss = self._update_critics(
+                batch, obs_b, next_obs_b, actions_b, rewards_b, not_terminated
+            )
 
             # 2) Alpha + 3) actor (delayed by policy_frequency).
             new_actions, logp = self.actor.act_and_log_prob(obs_b)
@@ -248,16 +233,7 @@ class SAC:
             if self.update_step % self.policy_frequency == 0:
                 for p in self.critic_parameters:
                     p.requires_grad_(False)
-                q1_pi = self.critic_1(obs_b, new_actions).view(-1)
-                q2_pi = self.critic_2(obs_b, new_actions).view(-1)
-                actor_loss = (self.log_alpha.exp().detach() * logp - torch.min(q1_pi, q2_pi)).mean()
-
-                self.actor_optimizer.zero_grad()
-                actor_loss.backward()
-                if self.is_multi_gpu:
-                    self.reduce_parameters(self.actor_parameters)
-                nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
-                self.actor_optimizer.step()
+                actor_loss = self._update_actor(obs_b, new_actions, logp)
                 for p in self.critic_parameters:
                     p.requires_grad_(True)
                 mean_actor_loss += actor_loss.item()
@@ -291,6 +267,57 @@ class SAC:
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss / n_updates
         return loss_dict
+
+    def _update_critics(
+        self,
+        batch: ReplayBuffer.Batch,
+        obs_b: TensorDict,
+        next_obs_b: TensorDict,
+        actions_b: torch.Tensor,
+        rewards_b: torch.Tensor,
+        not_terminated: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One twin-critic gradient step; returns the two critic losses."""
+        with torch.no_grad():
+            next_actions, next_logp = self.actor.act_and_log_prob(next_obs_b)
+            q1_t = self.critic_1_target(next_obs_b, next_actions).view(-1)
+            q2_t = self.critic_2_target(next_obs_b, next_actions).view(-1)
+            min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+            # n-step: discount by the per-sample horizon actually aggregated (capped at episode ends);
+            # single-step: gamma^1. The buffer sets effective_n_steps only when n_steps > 1.
+            if batch.effective_n_steps is not None:
+                discount = self.gamma ** batch.effective_n_steps.view(-1).float()
+            else:
+                discount = self.gamma**self.n_steps
+            target_q = rewards_b + discount * not_terminated * min_q_t
+
+        q1 = self.critic_1(obs_b, actions_b).view(-1)
+        q2 = self.critic_2(obs_b, actions_b).view(-1)
+        critic_1_loss = nn.functional.mse_loss(q1, target_q)
+        critic_2_loss = nn.functional.mse_loss(q2, target_q)
+        critic_loss = critic_1_loss + critic_2_loss
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.critic_parameters)
+        nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
+        self.critic_optimizer.step()
+        return critic_1_loss, critic_2_loss
+
+    def _update_actor(self, obs_b: TensorDict, new_actions: torch.Tensor, logp: torch.Tensor) -> torch.Tensor:
+        """One actor gradient step against the frozen critics; returns the actor loss."""
+        q1_pi = self.critic_1(obs_b, new_actions).view(-1)
+        q2_pi = self.critic_2(obs_b, new_actions).view(-1)
+        actor_loss = (self.log_alpha.exp().detach() * logp - torch.min(q1_pi, q2_pi)).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        if self.is_multi_gpu:
+            self.reduce_parameters(self.actor_parameters)
+        nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
+        self.actor_optimizer.step()
+        return actor_loss
 
     # -- mode / persistence ----------------------------------------------------------------------------------
 
