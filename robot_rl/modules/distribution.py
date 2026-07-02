@@ -558,9 +558,10 @@ class VonMisesFisherDistribution(Distribution):
     radius-:math:`\sqrt{p}` sphere expected by the pretrained low-level policy.
 
     .. note::
-        Sampling uses Wood's rejection algorithm and is **not** reparameterized — this distribution targets PPO, where
-        actions are detached and only ``log_prob``/``entropy`` need to carry gradients (w.r.t. :math:`\hat{\mu}` and
-        :math:`\kappa`). It is therefore unsuitable as-is for algorithms that backpropagate through the sampled action.
+        Sampling uses Wood's rejection algorithm. :meth:`sample_and_log_prob` is reparameterized for SAC-style
+        updates that backpropagate through the action: the rejection noise is drawn without gradient, then the
+        sample is rebuilt as a differentiable transform of :math:`(\hat{\mu}, \kappa)`; the :math:`\kappa`-dependence
+        of the acceptance probability is ignored (as in Davidson et al., 2018).
 
     .. note::
         ``init_std`` is interpreted as an (asymptotic) tangent-space standard deviation: the concentration is
@@ -645,33 +646,58 @@ class VonMisesFisherDistribution(Distribution):
         for the per-row rejection sampler, then restored. ``std_clip`` is accepted for interface compatibility
         but unused (vMF spread is set by the concentration).
         """
+        with torch.no_grad():
+            return self._rsample()
+
+    def sample_and_log_prob(self, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized ``(sample, log_prob)`` from a single draw (the SAC actor-update path).
+
+        Gradients flow to the mean direction and concentration through both the sample and its log-prob;
+        the acceptance probability's kappa-dependence is ignored (Davidson et al., 2018).
+        """
+        x = self._rsample()
+        return x, self.log_prob(x)
+
+    def _rsample(self) -> torch.Tensor:
+        """Sample unit vectors, differentiably w.r.t. ``(mu, kappa)`` when grad is enabled.
+
+        The rejection noise (accepted Beta draws) is sampled without gradient; the tangential component
+        ``w = mu . x`` is then rebuilt from it as a differentiable function of the concentration, and the
+        orthogonal-projection construction keeps the sample differentiable in the mean direction.
+        """
         mu = self._mu  # [..., p]
         p = mu.shape[-1]
         lead = mu.shape[:-1]
         flat_mu = mu.reshape(-1, p)  # [N, p]
         n = flat_mu.shape[0]
         device = mu.device
-        kappa = float(self._kappa.item())
-
-        # Component along the mean direction, w = mu . x, drawn from its marginal density on [-1, 1].
-        w = self._sample_weight(n, p, kappa, device)  # [N]
+        d = float(p - 1)
+        kappa = self._kappa.squeeze()
+        with torch.no_grad():
+            z = self._sample_weight_noise(n, p, float(kappa.item()), device)  # [N]
+        b = (-2.0 * kappa + torch.sqrt(4.0 * kappa * kappa + d * d)) / d
+        w = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
         # Direction orthogonal to mu, uniform on the (p-2)-subsphere.
         v = torch.randn(n, p, device=device)
         v = v - (v * flat_mu).sum(dim=-1, keepdim=True) * flat_mu
         v = torch.nn.functional.normalize(v, dim=-1)
-        x = w.unsqueeze(-1) * flat_mu + torch.sqrt((1.0 - w * w).clamp_min(0.0)).unsqueeze(-1) * v
+        x = w.unsqueeze(-1) * flat_mu + torch.sqrt((1.0 - w * w).clamp_min(1e-12)).unsqueeze(-1) * v
         x = torch.nn.functional.normalize(x, dim=-1)  # defensive re-normalization
         return x.reshape(*lead, p)
 
-    def _sample_weight(self, batch: int, p: int, kappa: float, device: torch.device) -> torch.Tensor:
-        """Sample the tangential component ``w`` of a vMF sample (Wood, 1994), vectorized with rejection refill."""
+    def _sample_weight_noise(self, batch: int, p: int, kappa: float, device: torch.device) -> torch.Tensor:
+        """Rejection-sample the Beta noise behind the tangential component ``w`` (Wood, 1994), with refill.
+
+        Returns the accepted ``Beta(d/2, d/2)`` draws; rows still unaccepted after the retry cap (should not
+        happen) keep the initial ``z = 0.5``, which maps exactly to the mode ``w = x0``.
+        """
         d = float(p - 1)
         b = (-2.0 * kappa + math.sqrt(4.0 * kappa * kappa + d * d)) / d
         x0 = (1.0 - b) / (1.0 + b)
         c = kappa * x0 + d * math.log(max(1.0 - x0 * x0, 1e-300))
         beta = Beta(torch.tensor(d / 2.0, device=device), torch.tensor(d / 2.0, device=device))
 
-        w = torch.empty(batch, device=device)
+        z = torch.full((batch,), 0.5, device=device)
         done = torch.zeros(batch, dtype=torch.bool, device=device)
         # Refill only the not-yet-accepted entries each round until all are accepted.
         for _ in range(100):
@@ -679,17 +705,14 @@ class VonMisesFisherDistribution(Distribution):
             n = todo.numel()
             if n == 0:
                 break
-            z = beta.sample((n,))
-            w_prop = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
+            z_prop = beta.sample((n,))
+            w_prop = (1.0 - (1.0 + b) * z_prop) / (1.0 - (1.0 - b) * z_prop)
             u = torch.rand(n, device=device)
             accept = kappa * w_prop + d * torch.log((1.0 - x0 * w_prop).clamp_min(1e-300)) - c >= torch.log(u)
             acc_idx = todo[accept]
-            w[acc_idx] = w_prop[accept]
+            z[acc_idx] = z_prop[accept]
             done[acc_idx] = True
-        # Any stragglers (should not happen): fall back to the mode.
-        if not bool(done.all()):
-            w[~done] = x0
-        return w
+        return z
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the unit mean direction (the deterministic action is the mode of the vMF)."""
