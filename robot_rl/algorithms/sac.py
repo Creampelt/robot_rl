@@ -283,6 +283,9 @@ class SAC:
         critic_1_loss, critic_2_loss = self._critic_losses_and_backward(
             batch, obs_b, next_obs_b, actions_b, rewards_b, not_terminated
         )
+        # clone in EAGER context: compiled outputs live in the cudagraph pool and are invalidated by the
+        # next replay of any graph (the in-graph clone does not escape the pool)
+        critic_1_loss, critic_2_loss = critic_1_loss.clone(), critic_2_loss.clone()
         if self.is_multi_gpu:
             self.reduce_parameters(self.critic_parameters)
         nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
@@ -318,13 +321,12 @@ class SAC:
         critic_2_loss = nn.functional.mse_loss(q2, target_q)
         critic_loss = critic_1_loss + critic_2_loss
         critic_loss.backward()
-        # clone out of the cudagraph pool: another graph replay may overwrite these buffers before .item()
-        return critic_1_loss.detach().clone(), critic_2_loss.detach().clone()
+        return critic_1_loss.detach(), critic_2_loss.detach()
 
     def _update_actor(self, obs_b: TensorDict, new_actions: torch.Tensor, logp: torch.Tensor) -> torch.Tensor:
         """One actor gradient step against the frozen critics; returns the actor loss."""
         self.actor_optimizer.zero_grad()
-        actor_loss = self._actor_loss_and_backward(obs_b, new_actions, logp)
+        actor_loss = self._actor_loss_and_backward(obs_b, new_actions, logp).clone()
         if self.is_multi_gpu:
             self.reduce_parameters(self.actor_parameters)
         nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
@@ -339,7 +341,7 @@ class SAC:
         q2_pi = self.critic_2(obs_b, new_actions).view(-1)
         actor_loss = (self.log_alpha.exp().detach() * logp - torch.min(q1_pi, q2_pi)).mean()
         actor_loss.backward()
-        return actor_loss.detach().clone()
+        return actor_loss.detach()
 
     # -- mode / persistence ----------------------------------------------------------------------------------
 
