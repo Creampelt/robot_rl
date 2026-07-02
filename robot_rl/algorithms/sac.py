@@ -304,7 +304,8 @@ class SAC:
             self.reduce_parameters(self.critic_parameters)
         nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
         self.critic_optimizer.step()
-        return critic_1_loss, critic_2_loss
+        # clone out of the cudagraph pool: another compiled call may overwrite these buffers before .item()
+        return critic_1_loss.detach().clone(), critic_2_loss.detach().clone()
 
     def _update_actor(self, obs_b: TensorDict, new_actions: torch.Tensor, logp: torch.Tensor) -> torch.Tensor:
         """One actor gradient step against the frozen critics; returns the actor loss."""
@@ -318,7 +319,7 @@ class SAC:
             self.reduce_parameters(self.actor_parameters)
         nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
         self.actor_optimizer.step()
-        return actor_loss
+        return actor_loss.detach().clone()
 
     # -- mode / persistence ----------------------------------------------------------------------------------
 
