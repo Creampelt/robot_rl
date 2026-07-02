@@ -102,9 +102,11 @@ class WandbLogWriter(SummaryWriter, LogWriter):
     ) -> None:
         """Log a scalar to both TensorBoard and W&B."""
         super().add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime, new_style=new_style)
+        # Pin _step to the training iteration (also in shared mode) so a resumed run continues at the
+        # checkpoint's iteration instead of restarting _step at 0; secondary writers keep their own sequence.
         self.run.log(
             {tag: scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs},
-            step=global_step if not self.shared else None,
+            step=global_step,
         )
 
     def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
@@ -128,7 +130,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         if video.name not in self.logged_videos:
             self.run.log(
                 {"video": wandb.Video(str(video), format="mp4"), "local_step": it, "env_step": it * self.num_envs},
-                step=it if not self.shared else None,
+                step=it,
             )
             self.logged_videos.add(video.name)
 
