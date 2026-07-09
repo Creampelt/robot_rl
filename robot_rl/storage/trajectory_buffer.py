@@ -43,6 +43,8 @@ class TrajectoryBuffer(ExpertBuffer):
         self.num_motions, self.bucket_size = self.motions.shape
         self.priorities = torch.ones((self.num_motions,), device=device)
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
+        # optional: restrict eval (get_batch_motions) to these motion indices; None = all
+        self.eval_motion_indices: torch.Tensor | None = None
 
         # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a
         # reduce-overhead capture would poison the shared cudagraph pool that update() later reuses.
@@ -104,8 +106,13 @@ class TrajectoryBuffer(ExpertBuffer):
         *obs_size). Note that the final batch may be truncated.
         """
         # Randomize order since rigid body DR is fixed per-environment
-        self._eval_order = torch.randperm(self.num_motions, device=self.device)
-        for idx in range(0, self.num_motions, mini_batch_size):
+        order = (
+            self.eval_motion_indices
+            if self.eval_motion_indices is not None
+            else torch.arange(self.num_motions, device=self.device)
+        )
+        self._eval_order = order[torch.randperm(len(order), device=self.device)]
+        for idx in range(0, len(self._eval_order), mini_batch_size):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
             yield self.motions[eval_idxs].to(device)
 
