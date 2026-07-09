@@ -214,6 +214,7 @@ class OffPolicyRunner:
                 # Save model
                 if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
                     self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+                    self._demote_old_checkpoint(it)
 
                 if prof is not None:
                     prof.step()
@@ -222,6 +223,36 @@ class OffPolicyRunner:
         if self.logger.writer is not None:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
             self.logger.stop_logging_writer()
+
+    def _demote_old_checkpoint(self, it: int) -> None:
+        """Strip the checkpoint that just fell out of the keep-full window down to policy-only state.
+
+        Only the last ``keep_full_checkpoints`` checkpoints stay fully training-resumable; older ones
+        are rewritten as slim (actor/backward/normalizer only) — still playable/eval'able/exportable,
+        but not resumable — to bound checkpoint storage. The overwrite is atomic and re-uploaded so the
+        external logger's live-sync (e.g. W&B) replaces the full copy with the slim one.
+        """
+        keep = self.cfg.get("keep_full_checkpoints")
+        if not keep or not hasattr(self.alg, "policy_state_keys"):
+            return
+        demote_it = it - keep * self.cfg["save_interval"]
+        if demote_it < 0:
+            return
+        path = os.path.join(self.logger.log_dir, f"model_{demote_it}.pt")  # type: ignore
+        if not os.path.exists(path):
+            return
+        # mmap so only the small policy tensors are read; the large resume-only tensors are never materialized
+        ckpt = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        if ckpt.get("_policy_only"):
+            return
+        keep_keys = set(self.alg.policy_state_keys()) | {"iter", "env_step", "infos"}
+        slim = {k: v for k, v in ckpt.items() if k in keep_keys}
+        slim["_policy_only"] = True
+        tmp_path = path + ".tmp"
+        torch.save(slim, tmp_path)
+        os.replace(tmp_path, path)
+        # re-register so the logger's live-sync replaces the full remote copy with the slim one
+        self.logger.save_model(path, demote_it)
 
     def _get_profile_context(self) -> contextlib.AbstractContextManager[torch.profiler.profile | None]:
         """Build a profiler context manager.
