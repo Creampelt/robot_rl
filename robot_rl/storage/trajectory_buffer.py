@@ -48,6 +48,9 @@ class TrajectoryBuffer(ExpertBuffer):
         # motion rows of the most recent get_batch_motions mini-batch, env-ordered (env i replays row
         # [i]); envs read it in reset_to for eval-side routing (e.g. family-matched terrain tiles)
         self.current_eval_motion_indices: torch.Tensor | None = None
+        # (motion rows, frame cols) of the most recent sample_states batch, env-ordered; envs read it
+        # in reset events for per-frame spawn fitting (e.g. the RSI foot-raycast z-fit)
+        self.current_sample_indices: tuple[torch.Tensor, torch.Tensor] | None = None
 
         # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a
         # reduce-overhead capture would poison the shared cudagraph pool that update() later reuses.
@@ -95,6 +98,7 @@ class TrajectoryBuffer(ExpertBuffer):
         """
         ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
         motion_indices = torch.randint(0, self.bucket_size, (num_envs,), device=self.device)
+        self.current_sample_indices = (ep_indices, motion_indices)
         motions = self.motions[ep_indices, motion_indices]
         return self.get_expert_state(motions, device=device)
 
