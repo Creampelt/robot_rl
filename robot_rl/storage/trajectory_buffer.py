@@ -45,6 +45,9 @@ class TrajectoryBuffer(ExpertBuffer):
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
         # optional: restrict eval (get_batch_motions) to these motion indices; None = all
         self.eval_motion_indices: torch.Tensor | None = None
+        # motion rows of the most recent get_batch_motions mini-batch, env-ordered (env i replays row
+        # [i]); envs read it in reset_to for eval-side routing (e.g. family-matched terrain tiles)
+        self.current_eval_motion_indices: torch.Tensor | None = None
 
         # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a
         # reduce-overhead capture would poison the shared cudagraph pool that update() later reuses.
@@ -114,6 +117,7 @@ class TrajectoryBuffer(ExpertBuffer):
         self._eval_order = order[torch.randperm(len(order), device=self.device)]
         for idx in range(0, len(self._eval_order), mini_batch_size):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
+            self.current_eval_motion_indices = eval_idxs
             yield self.motions[eval_idxs].to(device)
 
     def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:
