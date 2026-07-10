@@ -129,7 +129,11 @@ _FBCPR_MODELS = {
     "disc_critic": ("disc_critic", "critic", "ResidualFuseModel", 1, ("z_dim", "num_actions")),
     "aux_critic": ("aux_critic", "critic", "ResidualFuseModel", 1, ("z_dim", "num_actions")),
     "discriminator": ("discriminator", "discriminator", "DiscriminatorModel", 1, ("z_dim",)),
+    "encoder": ("encoder", "encoder", "MLPModel", "c_dim", ()),
 }
+
+# Models that take the context latent c as an extra trailing input on encoder runs
+_FBCPR_CONTEXT_CONSUMERS = ("policy", "forward", "disc_critic", "aux_critic")
 
 
 def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
@@ -137,6 +141,12 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     nsd = ckpt["obs_normalizer_state_dict"]
     obs = {group: torch.zeros(1, dim) for group, dim in _group_dims(nsd).items()}
     dims = {"z_dim": cfg["algorithm"]["z_dim"], "num_actions": _num_actions(ckpt["actor_state_dict"])}
+    # Optional context encoder: exports as encoder.pt (raw scan -> c, normalizer baked); the consumer
+    # models gain c as a trailing side input. policy.pt + encoder.pt = the HL-distillation contract.
+    encoder_cfg = cfg["algorithm"].get("encoder_cfg")
+    if encoder_cfg is not None:
+        dims["c_dim"] = int(encoder_cfg["output_dim"])
+        cfg["encoder"] = dict(encoder_cfg["model"])
 
     def build(name: str) -> nn.Module:
         cfg_key, obs_set, default_class, out_spec, other_spec = _FBCPR_MODELS[name]
@@ -149,10 +159,13 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
             dist_cfg.setdefault("high", cfg["clip_actions"])
         out_dim = dims[out_spec] if isinstance(out_spec, str) else out_spec
         other_dims = tuple(dims[k] for k in other_spec)
+        if encoder_cfg is not None and name in _FBCPR_CONTEXT_CONSUMERS:
+            other_dims = (*other_dims, dims["c_dim"])
         bn = _load_bn(nsd, cfg["obs_groups"][obs_set])
         if name == "policy":
-            model = model_class(obs, cfg["obs_groups"], obs_set, (other_dims[0], 0), out_dim, **model_cfg)
-        elif name in ("backward", "discriminator"):
+            input_dims = (other_dims[0], 0, *other_dims[1:])  # (z, obs-only[, c]) fused branches
+            model = model_class(obs, cfg["obs_groups"], obs_set, input_dims, out_dim, **model_cfg)
+        elif name in ("backward", "discriminator", "encoder"):
             model = model_class(obs, cfg["obs_groups"], obs_set, out_dim, other_input_dims=other_dims, **model_cfg)
             # MLPModel exports take ONE concatenated input (obs + side inputs): extend the baked
             # normalizer with identity stats over the side-input dims
@@ -163,7 +176,9 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
         model.load_state_dict(ckpt[f"{cfg_key}_state_dict"], strict=True)
         return bake_normalizer(model, bn)
 
-    names = list(_FBCPR_MODELS) if all_models else ["policy"]
+    names = list(_FBCPR_MODELS) if all_models else ["policy", "encoder"]
+    if encoder_cfg is None:
+        names = [name for name in names if name != "encoder"]
     return {name: build(name) for name in names}
 
 

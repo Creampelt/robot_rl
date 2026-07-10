@@ -62,11 +62,19 @@ class EncoderInferencePolicy(nn.Module):
 
     is_recurrent: bool = False
 
-    def __init__(self, encoder: nn.Module, actor: MLPModel) -> None:
-        """Wrap the encoder module and the actor consuming its latent."""
+    def __init__(self, encoder: nn.Module, actor: MLPModel, latent_first: bool = True) -> None:
+        """Wrap the encoder module and the actor consuming its latent.
+
+        Args:
+            encoder: The shared observation encoder.
+            actor: The actor model taking the encoder latent as an extra input.
+            latent_first: Whether the latent precedes the other extra inputs (PPO/SAC convention) or trails
+                them (FB-CPR convention: ``actor(obs, z, c)``).
+        """
         super().__init__()
         self.encoder = encoder
         self.actor = actor
+        self.latent_first = latent_first
 
     @property
     def output_mean(self) -> torch.Tensor:
@@ -90,7 +98,9 @@ class EncoderInferencePolicy(nn.Module):
 
     def forward(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Run the actor with the encoder latent as an extra input."""
-        return self.actor(obs, self.encoder(obs), *args, **kwargs)
+        latent = self.encoder(obs)
+        inputs = (latent, *args) if self.latent_first else (*args, latent)
+        return self.actor(obs, *inputs, **kwargs)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         """Reset the actor state (the encoder is stateless)."""

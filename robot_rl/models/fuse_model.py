@@ -80,7 +80,10 @@ class FuseModel(MLPModel):
         self.num_parallel = num_parallel
 
         trunk_input_dim = hidden_dims[0] if hidden_dims else output_dim
-        embedding_output_dim = trunk_input_dim // len(input_dims)
+        # Split the trunk width across branches; the last branch absorbs any remainder so the concatenated
+        # embeddings always total trunk_input_dim (residual trunks require the exact width).
+        embedding_output_dims = [trunk_input_dim // len(input_dims)] * len(input_dims)
+        embedding_output_dims[-1] += trunk_input_dim - sum(embedding_output_dims)
 
         # construct modules for each embedding term
         self.embeddings = nn.ModuleList([
@@ -93,7 +96,7 @@ class FuseModel(MLPModel):
                 first_activation,
                 normalize_first_layer,
             )
-            for dim in input_dims
+            for dim, embedding_output_dim in zip(input_dims, embedding_output_dims, strict=True)
         ])
         self.input_dims = input_dims
         self.num_inputs = int(np.sum(np.greater(self.input_dims, 0)))

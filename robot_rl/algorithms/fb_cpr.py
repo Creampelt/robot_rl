@@ -8,7 +8,7 @@ from tensordict import TensorDict
 from typing import Any
 
 from robot_rl.env import URLVecEnv
-from robot_rl.models import DiscriminatorModel, FuseModel, MLPModel
+from robot_rl.models import DiscriminatorModel, EncoderInferencePolicy, FuseModel, MLPModel
 from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization, TargetNetwork
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
 from robot_rl.utils import (
@@ -49,6 +49,13 @@ class FbCpr:
 
     discriminator: DiscriminatorModel
     """The discriminator model"""
+
+    encoder: MLPModel | None
+    """Optional context encoder over ``obs_groups["encoder"]`` (e.g. heightscan -> latent ``c``).
+
+    Its output ``c`` is an extra trailing input to the actor, forward map, and both critics. The backward
+    map and the (blind) discriminator never see ``c``, so ``z`` stays terrain-agnostic. ``None`` disables it.
+    """
 
     def __init__(
         self,
@@ -100,6 +107,9 @@ class FbCpr:
         # Rollout-state parameters (owned here since act(obs) internalized z/seed-phase/clipping)
         clip_actions: float | None = None,
         num_seed_steps_per_env: int = 0,
+        # Optional context encoder (built from encoder_cfg over obs_groups["encoder"])
+        encoder: MLPModel | None = None,
+        encoder_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs: Any,
@@ -124,6 +134,7 @@ class FbCpr:
         self.aux_critic = aux_critic.to(self.device)
         self.discriminator = discriminator.to(self.device)
         self.obs_normalizer = obs_normalizer.to(self.device)
+        self.encoder = encoder.to(self.device) if encoder is not None else None
 
         # Initialize model weights
         for model in self.models:
@@ -158,6 +169,18 @@ class FbCpr:
         self.discriminator_optimizer = optimizer_cls(
             self.discriminator.parameters(), lr=discriminator_learning_rate, **optimizer_kwargs
         )
+        # The encoder owns its optimizer; gradients accumulate from every consumer loss (forward-backward,
+        # both critics, actor) before one step per update(). learning_rate=0 freezes it (finetune contract).
+        encoder_cfg = encoder_cfg or {}
+        self._detach_actor_context = bool(encoder_cfg.get("detach_actor_gradients", False))
+        self.encoder_optimizer = None
+        if self.encoder is not None:
+            encoder_lr = encoder_cfg.get("learning_rate")
+            encoder_lr = forward_learning_rate if encoder_lr is None else encoder_lr
+            if encoder_lr > 0:
+                self.encoder_optimizer = optimizer_cls(self.encoder.parameters(), lr=encoder_lr, **optimizer_kwargs)
+            else:
+                self.encoder.requires_grad_(False)
 
         # Add storage
         self.replay_buffer = replay_buffer
@@ -227,7 +250,7 @@ class FbCpr:
     @property
     def models(self) -> list[MLPModel]:
         """Return a list of the algorithm's trainable models."""
-        return [
+        models = [
             self.actor,
             self.forward_map,
             self.backward_map,
@@ -235,6 +258,9 @@ class FbCpr:
             self.aux_critic,
             self.discriminator,
         ]
+        if self.encoder is not None:
+            models.append(self.encoder)
+        return models
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data.
@@ -253,7 +279,9 @@ class FbCpr:
         with eval_mode(self.obs_normalizer):
             norm_obs = self.obs_normalizer(obs)
         # compute the actions and values
-        self.transition.actions = self.actor(norm_obs, z, stochastic_output=True).detach()
+        with torch.no_grad():
+            cargs = self._context_args(norm_obs)
+        self.transition.actions = self.actor(norm_obs, z, *cargs, stochastic_output=True).detach()
         # uniformly sample from action space during the seed phase
         if random_sample:
             clip_actions = 1.0 if self.clip_actions is None else self.clip_actions
@@ -339,6 +367,25 @@ class FbCpr:
 
         return z
 
+    def _context_args(self, norm_obs: TensorDict, detach: bool = False) -> tuple[torch.Tensor, ...]:
+        """Return the context latent ``c`` as a trailing model-input tuple; empty when no encoder is configured.
+
+        Every call runs a fresh encoder forward in eager mode: each consumer loss backprops through its own
+        self-contained graph (no retain_graph), gradients accumulate on the encoder across consumers, and the
+        corruption seam stays outside the compiled update regions.
+        """
+        if self.encoder is None:
+            return ()
+        c = self._corrupt_context(self.encoder(norm_obs))
+        return (c.detach(),) if detach else (c,)
+
+    def _corrupt_context(self, c: torch.Tensor) -> torch.Tensor:
+        """Latent-corruption seam (dropout/noise/zeroed context on ``c``); identity until Phase D lands.
+
+        Only ever called from eager code so future corruption RNG never enters a compiled region.
+        """
+        return c
+
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         """Run optimization epochs over stored batches and return mean losses."""
         batch = self.replay_buffer.sample_mini_batch(self.device)
@@ -374,11 +421,35 @@ class FbCpr:
         # Normalize aux rewards (TODO: move to reward manager?)
         batch.rewards = self.aux_reward_normalizer(batch.rewards)
 
+        # Context latent c, computed eagerly and threaded into the consumer updates (fresh forward per
+        # consumer, see _context_args); next_c only feeds no-grad target sections, so one forward suffices.
+        if self.encoder_optimizer is not None:
+            self.encoder_optimizer.zero_grad()
+        next_cargs: tuple[torch.Tensor, ...] = ()
+        if self.encoder is not None:
+            with torch.no_grad():
+                next_cargs = self._context_args(batch.next_observations)
+
         # Update other models
-        fb_loss_dict, fb_extras = self._update_forward_backward(batch)
-        disc_critic_loss_dict, disc_critic_extras = self._update_disc_critic(batch)
-        aux_critic_loss_dict, aux_critic_extras = self._update_aux_critic(batch)
-        actor_loss_dict, actor_extras = self._update_actor(batch)
+        fb_loss_dict, fb_extras = self._update_forward_backward(
+            batch, self._context_args(batch.observations), next_cargs
+        )
+        disc_critic_loss_dict, disc_critic_extras = self._update_disc_critic(
+            batch, self._context_args(batch.observations), next_cargs
+        )
+        aux_critic_loss_dict, aux_critic_extras = self._update_aux_critic(
+            batch, self._context_args(batch.observations), next_cargs
+        )
+        actor_cargs = self._context_args(batch.observations, detach=self._detach_actor_context)
+        actor_loss_dict, actor_extras = self._update_actor(batch, actor_cargs)
+
+        # One encoder step on the gradients accumulated from all consumer losses (critics + actor)
+        if self.encoder_optimizer is not None:
+            if self.is_multi_gpu:
+                self.reduce_parameters(self.encoder)
+            if self.max_grad_norm is not None:
+                nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
+            self.encoder_optimizer.step()
 
         # Prepare logging dicts
         loss_dict = {}
@@ -453,7 +524,7 @@ class FbCpr:
             # Run rollouts for each trajectory latent task and save the emd terms at each step
             for it in range(rollout_steps):
                 obs = self.obs_normalizer(obs)
-                actions = self.actor(obs, eval_zs[:, it, :])
+                actions = self.actor(obs, eval_zs[:, it, :], *self._context_args(obs))
                 # Pad out remaining envs with zeros
                 actions = pad_to_size(actions, env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
@@ -519,6 +590,10 @@ class FbCpr:
             "z_buffer_state": self.z_buffer.state_dict(),
             "expert_buffer_state": self.expert_buffer.state_dict(),
         }
+        if self.encoder is not None:
+            saved_dict["encoder_state_dict"] = self.encoder.state_dict()
+            if self.encoder_optimizer is not None:
+                saved_dict["encoder_optimizer_state_dict"] = self.encoder_optimizer.state_dict()
         return saved_dict
 
     @staticmethod
@@ -527,9 +602,9 @@ class FbCpr:
 
         A checkpoint keeping only these can be played, video-rendered, and exported, but NOT resumed
         for training (critics/optimizers/buffers are absent). Used by the runner to demote old
-        checkpoints to a policy-only slim form.
+        checkpoints to a policy-only slim form. ``encoder_state_dict`` only exists on encoder runs.
         """
-        return ("actor_state_dict", "backward_map_state_dict", "obs_normalizer_state_dict")
+        return ("actor_state_dict", "backward_map_state_dict", "obs_normalizer_state_dict", "encoder_state_dict")
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         """Load specified models from a saved dict.
@@ -582,15 +657,21 @@ class FbCpr:
             ):
                 target.target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
         _load(self.obs_normalizer, "obs_normalizer_state_dict")
+        # The encoder is policy-critical (the actor is useless without c): load it whenever present
+        if self.encoder is not None:
+            _load(self.encoder, "encoder_state_dict")
         if load_cfg.get("optimizer"):
-            for opt, key in (
+            optimizers = [
                 (self.actor_optimizer, "actor_optimizer_state_dict"),
                 (self.forward_optimizer, "forward_optimizer_state_dict"),
                 (self.backward_optimizer, "backward_optimizer_state_dict"),
                 (self.disc_critic_optimizer, "disc_critic_optimizer_state_dict"),
                 (self.aux_critic_optimizer, "aux_critic_optimizer_state_dict"),
                 (self.discriminator_optimizer, "discriminator_optimizer_state_dict"),
-            ):
+            ]
+            if self.encoder_optimizer is not None:
+                optimizers.append((self.encoder_optimizer, "encoder_optimizer_state_dict"))
+            for opt, key in optimizers:
                 if key in loaded_dict:
                     opt.load_state_dict(loaded_dict[key])
         if load_cfg.get("buffer"):
@@ -600,8 +681,10 @@ class FbCpr:
                 self.expert_buffer.load_state_dict(loaded_dict["expert_buffer_state"])
         return load_cfg.get("iteration", False)
 
-    def get_policy(self) -> MLPModel:
-        """Get the policy model."""
+    def get_policy(self) -> nn.Module:
+        """Get the policy model (wrapped with the context encoder when configured, since the actor needs c)."""
+        if self.encoder is not None:
+            return EncoderInferencePolicy(self.encoder, self.actor, latent_first=False)
         return self.actor
 
     @staticmethod
@@ -623,8 +706,11 @@ class FbCpr:
         aux_critic_class: type[FuseModel] = resolve_callable(cfg["aux_critic"].pop("class_name"))  # type: ignore
         discriminator_class: type[DiscriminatorModel] = resolve_callable(cfg["discriminator"].pop("class_name"))  # type: ignore
 
-        # Resolve observation groups
+        # Resolve observation groups ("encoder" resolves only on encoder runs, so plain runs are untouched)
+        encoder_cfg = cfg["algorithm"].pop("encoder_cfg", None)
         default_sets = ["actor", "critic", "backward", "discriminator", "expert"]
+        if encoder_cfg is not None:
+            default_sets.append("encoder")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
 
         # Match TruncatedGaussianDistribution bounds with clip_action bounds.
@@ -634,14 +720,26 @@ class FbCpr:
             actor_dist_cfg["low"] = -clip_actions
             actor_dist_cfg["high"] = clip_actions
 
+        # Optional context encoder over the "encoder" obs set (e.g. a heightscan): its latent c is an extra
+        # trailing fused input to the actor/forward map/critics -- never the backward map or discriminator.
+        encoder: MLPModel | None = None
+        c_dims: tuple[int, ...] = ()
+        if encoder_cfg is not None:
+            encoder_model_cfg = dict(encoder_cfg["model"])
+            encoder_class: type[MLPModel] = resolve_callable(encoder_model_cfg.pop("class_name"))  # type: ignore
+            c_dim = int(encoder_cfg["output_dim"])
+            encoder = encoder_class(obs, cfg["obs_groups"], "encoder", c_dim, **encoder_model_cfg).to(device)
+            print(f"Encoder Model: {encoder}")
+            c_dims = (c_dim,)
+
         # Initialize the policy
         z_dim = cfg["algorithm"]["z_dim"]
-        actor: FuseModel = actor_class(obs, cfg["obs_groups"], "actor", (z_dim, 0), env.num_actions, **cfg["actor"]).to(
-            device
-        )
+        actor: FuseModel = actor_class(
+            obs, cfg["obs_groups"], "actor", (z_dim, 0, *c_dims), env.num_actions, **cfg["actor"]
+        ).to(device)
         print(f"Actor Model: {actor}")
         forward_map: FuseModel = forward_map_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), z_dim, **cfg["forward_map"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions, *c_dims), z_dim, **cfg["forward_map"]
         ).to(device)
         print(f"Forward Map Model: {forward_map}")
         backward_map: MLPModel = backward_map_class(
@@ -649,11 +747,11 @@ class FbCpr:
         ).to(device)
         print(f"Backward Map Model: {backward_map}")
         disc_critic: FuseModel = disc_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **cfg["disc_critic"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions, *c_dims), 1, **cfg["disc_critic"]
         ).to(device)
         print(f"Discriminator Critic Model: {disc_critic}")
         aux_critic: FuseModel = aux_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **cfg["aux_critic"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions, *c_dims), 1, **cfg["aux_critic"]
         ).to(device)
         print(f"Auxiliary Critic Model: {aux_critic}")
         discriminator: DiscriminatorModel = discriminator_class(
@@ -709,6 +807,8 @@ class FbCpr:
             # rollout-state knobs owned by the algorithm since act(obs) internalized z/seed/clipping
             clip_actions=cfg.get("clip_actions"),
             num_seed_steps_per_env=cfg.get("num_seed_steps_per_env", 0),
+            encoder=encoder,
+            encoder_cfg=encoder_cfg,
         )
 
         return alg
@@ -834,20 +934,29 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def _update_forward_backward(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
+    def _update_forward_backward(
+        self,
+        batch: ReplayBuffer.Batch,
+        cargs: tuple[torch.Tensor, ...] = (),
+        next_cargs: tuple[torch.Tensor, ...] = (),
+    ) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             # Forward-Backward loss
             with torch.no_grad():
                 # Compute successor measure from target networks
                 next_actions = self.actor(
-                    batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                    batch.next_observations,
+                    batch.context,
+                    *next_cargs,
+                    stochastic_output=True,
+                    std_clip=self.clip_actor_std,
                 )
-                target_Fs = self.target_forward_map(batch.next_observations, batch.context, next_actions)
+                target_Fs = self.target_forward_map(batch.next_observations, batch.context, next_actions, *next_cargs)
                 target_B = self.target_backward_map(batch.next_observations)
                 target_Ms = torch.matmul(target_Fs, target_B.T)
                 target_M = compute_td_targets(target_Ms, self.forward_backward_pessimism)
-            # Compute successor measure
-            Fs = self.forward_map(batch.observations, batch.context, batch.actions)
+            # Compute successor measure (B never sees the context latent c)
+            Fs = self.forward_map(batch.observations, batch.context, batch.actions, *cargs)
             B = self.backward_map(batch.next_observations)
             Ms = torch.matmul(Fs, B.T)
 
@@ -918,23 +1027,32 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def _update_disc_critic(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    def _update_disc_critic(
+        self,
+        batch: ReplayBuffer.Batch,
+        cargs: tuple[torch.Tensor, ...] = (),
+        next_cargs: tuple[torch.Tensor, ...] = (),
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             with torch.no_grad():
-                # Compute discriminator reward
+                # Compute discriminator reward (the discriminator is blind: never sees c)
                 logits = self.discriminator(batch.observations, batch.context).clamp_(
                     self.discriminator_reward_eps, 1 - self.discriminator_reward_eps
                 )
                 discriminator_reward = torch.log(logits) - torch.log(1 - logits)
                 # Compute target value
                 next_actions = self.actor(
-                    batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                    batch.next_observations,
+                    batch.context,
+                    *next_cargs,
+                    stochastic_output=True,
+                    std_clip=self.clip_actor_std,
                 )
-                next_Qs = self.target_disc_critic(batch.next_observations, batch.context, next_actions)
+                next_Qs = self.target_disc_critic(batch.next_observations, batch.context, next_actions, *next_cargs)
                 target_Q = discriminator_reward + batch.gammas * compute_td_targets(next_Qs, self.disc_critic_pessimism)
                 target_Q = target_Q.expand(self.disc_critic.num_parallel, -1, -1)
             # Compute critic loss
-            Qs = self.disc_critic(batch.observations, batch.context, batch.actions)
+            Qs = self.disc_critic(batch.observations, batch.context, batch.actions, *cargs)
             loss = 0.5 * self.disc_critic.num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
@@ -961,20 +1079,29 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
-    def _update_aux_critic(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    def _update_aux_critic(
+        self,
+        batch: ReplayBuffer.Batch,
+        cargs: tuple[torch.Tensor, ...] = (),
+        next_cargs: tuple[torch.Tensor, ...] = (),
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             with torch.no_grad():
                 # Compute target value
                 next_actions = self.actor(
-                    batch.next_observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                    batch.next_observations,
+                    batch.context,
+                    *next_cargs,
+                    stochastic_output=True,
+                    std_clip=self.clip_actor_std,
                 )
-                next_Qs = self.target_aux_critic(batch.next_observations, batch.context, next_actions)
+                next_Qs = self.target_aux_critic(batch.next_observations, batch.context, next_actions, *next_cargs)
                 target_Q = batch.rewards.unsqueeze(1) + batch.gammas * compute_td_targets(
                     next_Qs, self.aux_critic_pessimism
                 )
                 target_Q = target_Q.expand(self.aux_critic.num_parallel, -1, -1)
             # Compute critic loss
-            Qs = self.aux_critic(batch.observations, batch.context, batch.actions)
+            Qs = self.aux_critic(batch.observations, batch.context, batch.actions, *cargs)
             loss = 0.5 * self.aux_critic.num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
@@ -1000,21 +1127,23 @@ class FbCpr:
 
         return loss_dict, extras_dict
 
-    def _update_actor(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
+    def _update_actor(
+        self, batch: ReplayBuffer.Batch, cargs: tuple[torch.Tensor, ...] = ()
+    ) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             actions = self.actor(
-                batch.observations, batch.context, stochastic_output=True, std_clip=self.clip_actor_std
+                batch.observations, batch.context, *cargs, stochastic_output=True, std_clip=self.clip_actor_std
             )
             # Compute discriminator value loss
-            Qs_discriminator = self.disc_critic(batch.observations, batch.context, actions)
+            Qs_discriminator = self.disc_critic(batch.observations, batch.context, actions, *cargs)
             Q_discriminator = (
                 -self.discriminator_reg_coef * compute_td_targets(Qs_discriminator, self.actor_pessimism).mean()
             )
             # Compute auxiliary value loss
-            Qs_aux = self.aux_critic(batch.observations, batch.context, actions)
+            Qs_aux = self.aux_critic(batch.observations, batch.context, actions, *cargs)
             Q_aux = -self.aux_reg_coef * compute_td_targets(Qs_aux, self.actor_pessimism).mean()
             # Compute forward value loss
-            Fs = self.forward_map(batch.observations, batch.context, actions)
+            Fs = self.forward_map(batch.observations, batch.context, actions, *cargs)
             Qs_fb = (Fs * batch.context).sum(dim=-1)
             Q_fb = compute_td_targets(Qs_fb, self.actor_pessimism)
             # Weigh auxiliary and discriminator values by forward value

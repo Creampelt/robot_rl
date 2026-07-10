@@ -356,10 +356,13 @@ class OffPolicyRunner:
 
     def _export_model(self) -> MLPModel:
         """Build the export-ready actor: FbCpr normalizes externally (bake it in); SAC normalizes in-model."""
+        policy = self.alg.get_policy()
+        # unwrap inference adapters (encoder runs): the raw actor exports; the encoder exports separately
+        policy = getattr(policy, "actor", policy)
         normalizer = getattr(self.alg, "obs_normalizer", None)
         if normalizer is not None:
-            return bake_live_normalizer(self.alg.get_policy(), normalizer).to("cpu")
-        return self.alg.get_policy().to("cpu")
+            return bake_live_normalizer(policy, normalizer).to("cpu")
+        return policy.to("cpu")
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""
