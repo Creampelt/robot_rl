@@ -412,7 +412,7 @@ class FbCpr:
 
             2^\{4 * \min(2, \max(0.5, x))}
 
-        where x is the Earth Mover's Distance between the actual and expert joint positions for each trajectory.
+        where x is the Earth Mover's Distance between the actual and expert ``eval`` obs group per trajectory.
 
         Args:
             env: Vectorized environment to replay the expert motions in.
@@ -447,27 +447,26 @@ class FbCpr:
             # Zero-pad motions to full number of environments (in case batch is truncated)
             first_motions = {k: pad_to_size(v[:, 0, :], env.num_envs, dim=0) for k, v in eval_motions.items()}
             obs, _ = env.reset_to({"articulation": {"robot": first_motions}}, is_relative=True)
-            num_joints = first_motions["joint_position"].shape[1]
-            actual_qpos = torch.zeros((mini_batch_size, rollout_steps, num_joints), device=self.device)
-            # Run rollouts for each trajectory latent task and save qpos at each step
+            # the env's `eval` obs group defines what the priority metric compares (env-cfg, not here)
+            emd_dim = eval_obs["eval"].shape[-1]
+            actual_emd = torch.zeros((mini_batch_size, rollout_steps, emd_dim), device=self.device)
+            # Run rollouts for each trajectory latent task and save the emd terms at each step
             for it in range(rollout_steps):
                 obs = self.obs_normalizer(obs)
                 actions = self.actor(obs, eval_zs[:, it, :])
                 # Pad out remaining envs with zeros
                 actions = pad_to_size(actions, env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
-                actual_qpos[:, it, :] = self.expert_buffer.get_expert_state(obs)["joint_position"][:mini_batch_size].to(
-                    self.device
-                )
+                actual_emd[:, it, :] = obs["eval"][:mini_batch_size].to(self.device)
                 steps_done += 1
                 if max_steps is not None and steps_done >= max_steps:
                     break
             # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
-            # Compare against frames 1..bucket_size-1 since actual_qpos[:, t] is the pose after targeting frame t+1.
-            eval_qpos = eval_motions["joint_position"][:, 1:]
+            # Compare against frames 1..bucket_size-1 since actual_emd[:, t] is the pose after targeting frame t+1.
+            eval_emd = eval_obs["eval"][:, 1:].to(self.device)
             emds = torch.empty((mini_batch_size,), device=self.device)
             for i in range(mini_batch_size):
-                emds[i] = compute_emd(actual_qpos[i], eval_qpos[i])
+                emds[i] = compute_emd(actual_emd[i], eval_emd[i])
             priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
             # Save priorities to expert buffer
             self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
@@ -522,8 +521,22 @@ class FbCpr:
         }
         return saved_dict
 
+    @staticmethod
+    def policy_state_keys() -> tuple[str, ...]:
+        """State-dict keys sufficient to run/eval/export the policy (all other keys are resume-only).
+
+        A checkpoint keeping only these can be played, video-rendered, and exported, but NOT resumed
+        for training (critics/optimizers/buffers are absent). Used by the runner to demote old
+        checkpoints to a policy-only slim form.
+        """
+        return ("actor_state_dict", "backward_map_state_dict", "obs_normalizer_state_dict")
+
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """Load specified models from a saved dict."""
+        """Load specified models from a saved dict.
+
+        Missing keys are skipped, so a policy-only (slim) checkpoint loads its actor/backward/normalizer
+        and leaves the resume-only nets at their constructed init (fine for play/eval/export).
+        """
         # If no load_cfg is provided, load all models and states
         if load_cfg is None:
             load_cfg = {
@@ -537,17 +550,29 @@ class FbCpr:
                 "iteration": True,
             }
 
-        # Load the specified models
+        # Warn loudly if a resume was requested but this is a policy-only checkpoint (training state absent)
+        wants_resume = any(load_cfg.get(k) for k in ("critic", "optimizer", "buffer"))
+        if wants_resume and "forward_map_state_dict" not in loaded_dict:
+            print(
+                "[WARNING] FbCpr.load: policy-only (slim) checkpoint — critics/optimizers/buffers were NOT"
+                " restored; this checkpoint is playable/exportable but not training-resumable."
+            )
+
+        def _load(module: torch.nn.Module, key: str) -> None:
+            if key in loaded_dict:
+                module.load_state_dict(loaded_dict[key], strict=strict)
+
+        # Load the specified models (each guarded so slim checkpoints skip absent keys)
         if load_cfg.get("actor"):
-            self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+            _load(self.actor, "actor_state_dict")
         if load_cfg.get("backward"):
-            self.backward_map.load_state_dict(loaded_dict["backward_map_state_dict"], strict=strict)
+            _load(self.backward_map, "backward_map_state_dict")
         if load_cfg.get("critic"):
-            self.forward_map.load_state_dict(loaded_dict["forward_map_state_dict"], strict=strict)
-            self.disc_critic.load_state_dict(loaded_dict["disc_critic_state_dict"], strict=strict)
-            self.aux_critic.load_state_dict(loaded_dict["aux_critic_state_dict"], strict=strict)
+            _load(self.forward_map, "forward_map_state_dict")
+            _load(self.disc_critic, "disc_critic_state_dict")
+            _load(self.aux_critic, "aux_critic_state_dict")
         if load_cfg.get("discriminator"):
-            self.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"], strict=strict)
+            _load(self.discriminator, "discriminator_state_dict")
         if load_cfg.get("target"):
             for online, target, target_key in (
                 (self.forward_map, self.target_forward_map, "target_forward_map_state_dict"),
@@ -556,18 +581,23 @@ class FbCpr:
                 (self.aux_critic, self.target_aux_critic, "target_aux_critic_state_dict"),
             ):
                 target.target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
-        if "obs_normalizer_state_dict" in loaded_dict:
-            self.obs_normalizer.load_state_dict(loaded_dict["obs_normalizer_state_dict"], strict=strict)
+        _load(self.obs_normalizer, "obs_normalizer_state_dict")
         if load_cfg.get("optimizer"):
-            self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
-            self.forward_optimizer.load_state_dict(loaded_dict["forward_optimizer_state_dict"])
-            self.backward_optimizer.load_state_dict(loaded_dict["backward_optimizer_state_dict"])
-            self.disc_critic_optimizer.load_state_dict(loaded_dict["disc_critic_optimizer_state_dict"])
-            self.aux_critic_optimizer.load_state_dict(loaded_dict["aux_critic_optimizer_state_dict"])
-            self.discriminator_optimizer.load_state_dict(loaded_dict["discriminator_optimizer_state_dict"])
+            for opt, key in (
+                (self.actor_optimizer, "actor_optimizer_state_dict"),
+                (self.forward_optimizer, "forward_optimizer_state_dict"),
+                (self.backward_optimizer, "backward_optimizer_state_dict"),
+                (self.disc_critic_optimizer, "disc_critic_optimizer_state_dict"),
+                (self.aux_critic_optimizer, "aux_critic_optimizer_state_dict"),
+                (self.discriminator_optimizer, "discriminator_optimizer_state_dict"),
+            ):
+                if key in loaded_dict:
+                    opt.load_state_dict(loaded_dict[key])
         if load_cfg.get("buffer"):
-            self.z_buffer.load_state_dict(loaded_dict["z_buffer_state"])
-            self.expert_buffer.load_state_dict(loaded_dict["expert_buffer_state"])
+            if "z_buffer_state" in loaded_dict:
+                self.z_buffer.load_state_dict(loaded_dict["z_buffer_state"])
+            if "expert_buffer_state" in loaded_dict:
+                self.expert_buffer.load_state_dict(loaded_dict["expert_buffer_state"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
