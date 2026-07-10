@@ -62,7 +62,9 @@ class EncoderInferencePolicy(nn.Module):
 
     is_recurrent: bool = False
 
-    def __init__(self, encoder: nn.Module, actor: MLPModel, latent_first: bool = True) -> None:
+    def __init__(
+        self, encoder: nn.Module, actor: MLPModel, latent_first: bool = True, zero_latent: bool = False
+    ) -> None:
         """Wrap the encoder module and the actor consuming its latent.
 
         Args:
@@ -70,11 +72,13 @@ class EncoderInferencePolicy(nn.Module):
             actor: The actor model taking the encoder latent as an extra input.
             latent_first: Whether the latent precedes the other extra inputs (PPO/SAC convention) or trails
                 them (FB-CPR convention: ``actor(obs, z, c)``).
+            zero_latent: Feed the actor a zero latent instead of the encoder output (blind-degradation eval).
         """
         super().__init__()
         self.encoder = encoder
         self.actor = actor
         self.latent_first = latent_first
+        self.zero_latent = zero_latent
 
     @property
     def output_mean(self) -> torch.Tensor:
@@ -99,6 +103,8 @@ class EncoderInferencePolicy(nn.Module):
     def forward(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Run the actor with the encoder latent as an extra input."""
         latent = self.encoder(obs)
+        if self.zero_latent:
+            latent = torch.zeros_like(latent)
         inputs = (latent, *args) if self.latent_first else (*args, latent)
         return self.actor(obs, *inputs, **kwargs)
 

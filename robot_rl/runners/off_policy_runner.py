@@ -141,6 +141,12 @@ class OffPolicyRunner:
                             start = time.time()
                             with torch.profiler.record_function("eval"):
                                 eval_extras = self.alg.eval(self.env)
+                                # Blind-gap canary: second pass with c=0 logs emd_zero_context next to
+                                # emd (perceptive-vs-blind gap); priorities stay from the perceptive pass
+                                if self.cfg.get("zero_context_eval", False):
+                                    eval_extras = eval_extras + self.alg.eval(
+                                        self.env, zero_context=True, update_priorities=False
+                                    )
                             stop = time.time()
                             eval_time += stop - start
 

@@ -110,6 +110,11 @@ class FbCpr:
         # Optional context encoder (built from encoder_cfg over obs_groups["encoder"])
         encoder: MLPModel | None = None,
         encoder_cfg: dict | None = None,
+        # Context-latent corruption (training-time only) and the blind-degradation inference toggle
+        context_zero_prob: float = 0.0,
+        context_noise_std: float = 0.0,
+        context_dropout_prob: float = 0.0,
+        zero_context: bool = False,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs: Any,
@@ -181,6 +186,19 @@ class FbCpr:
                 self.encoder_optimizer = optimizer_cls(self.encoder.parameters(), lr=encoder_lr, **optimizer_kwargs)
             else:
                 self.encoder.requires_grad_(False)
+
+        # Context corruption knobs (train-mode only); all-zero defaults keep the seam an RNG-free identity
+        self.context_zero_prob = context_zero_prob
+        self.context_noise_std = context_noise_std
+        self.context_dropout_prob = context_dropout_prob
+        self.zero_context = zero_context
+        self._corruption_enabled = max(context_zero_prob, context_noise_std, context_dropout_prob) > 0.0
+        # Realized-rate accumulators (allocated outside inference_mode so act() can add_ into them)
+        self._corruption_stats = {
+            "context_zero_fraction": torch.zeros((), device=self.device),
+            "context_dropout_fraction": torch.zeros((), device=self.device),
+            "calls": torch.zeros((), device=self.device),
+        }
 
         # Add storage
         self.replay_buffer = replay_buffer
@@ -367,24 +385,52 @@ class FbCpr:
 
         return z
 
-    def _context_args(self, norm_obs: TensorDict, detach: bool = False) -> tuple[torch.Tensor, ...]:
+    def _context_args(self, norm_obs: TensorDict, detach: bool = False, zero: bool = False) -> tuple[torch.Tensor, ...]:
         """Return the context latent ``c`` as a trailing model-input tuple; empty when no encoder is configured.
 
         Every call runs a fresh encoder forward in eager mode: each consumer loss backprops through its own
         self-contained graph (no retain_graph), gradients accumulate on the encoder across consumers, and the
-        corruption seam stays outside the compiled update regions.
+        corruption seam stays outside the compiled update regions. ``zero`` (or the ``zero_context`` cfg
+        toggle) forces ``c = 0`` uncorrupted -- the blind-degradation contract.
         """
         if self.encoder is None:
             return ()
-        c = self._corrupt_context(self.encoder(norm_obs))
+        c = self.encoder(norm_obs)
+        c = torch.zeros_like(c) if (zero or self.zero_context) else self._corrupt_context(c)
         return (c.detach(),) if detach else (c,)
 
     def _corrupt_context(self, c: torch.Tensor) -> torch.Tensor:
-        """Latent-corruption seam (dropout/noise/zeroed context on ``c``); identity until Phase D lands.
+        """Latent-corruption seam on ``c``: identity in eval mode or with all knobs at 0 (no RNG consumed).
 
-        Only ever called from eager code so future corruption RNG never enters a compiled region.
+        Order is noise -> per-dim dropout (no rescale) -> per-sample zeroing, so dropped dims and zeroed
+        samples end at exactly 0, matching the c=0 blind fallback the corruption trains for. Fresh masks per
+        call (each consumer forward corrupts independently). Only ever called from eager code so the
+        corruption RNG never enters a compiled region.
         """
+        if not self._corruption_enabled or not self.encoder.training:
+            return c
+        stats = self._corruption_stats
+        if self.context_noise_std > 0.0:
+            c = c + self.context_noise_std * torch.randn_like(c)
+        if self.context_dropout_prob > 0.0:
+            dropped = torch.rand_like(c) < self.context_dropout_prob
+            c = torch.where(dropped, torch.zeros_like(c), c)
+            stats["context_dropout_fraction"] += dropped.float().mean()
+        if self.context_zero_prob > 0.0:
+            zeroed = torch.rand(*c.shape[:-1], 1, device=c.device) < self.context_zero_prob
+            c = torch.where(zeroed, torch.zeros_like(c), c)
+            stats["context_zero_fraction"] += zeroed.float().mean()
+        stats["calls"] += 1
         return c
+
+    def _pop_corruption_stats(self) -> dict[str, torch.Tensor]:
+        """Mean realized corruption rates accumulated since the last call; resets the accumulators."""
+        stats = self._corruption_stats
+        calls = stats["calls"].clamp(min=1.0)
+        out = {k: v / calls for k, v in stats.items() if k != "calls"}
+        for v in stats.values():
+            v.zero_()
+        return out
 
     def update(self) -> tuple[dict[str, torch.Tensor], dict]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -465,6 +511,9 @@ class FbCpr:
         extras.update(disc_critic_extras)
         extras.update(aux_critic_extras)
         extras.update(actor_extras)
+        # Realized corruption rates since the last update (rollout act()s + this update's consumer forwards)
+        if self._corruption_enabled:
+            extras.update(self._pop_corruption_stats())
 
         with torch.no_grad():
             self._soft_update_targets()
@@ -474,7 +523,14 @@ class FbCpr:
 
         return loss_dict, extras
 
-    def eval(self, env: URLVecEnv, max_steps: int | None = None, **kwargs: Any) -> list[dict[str, torch.Tensor]]:
+    def eval(
+        self,
+        env: URLVecEnv,
+        max_steps: int | None = None,
+        zero_context: bool = False,
+        update_priorities: bool = True,
+        **kwargs: Any,
+    ) -> list[dict[str, torch.Tensor]]:
         r"""Evaluate motions and update priorities in expert buffer.
 
         Priorities are updated according to:
@@ -490,6 +546,10 @@ class FbCpr:
             max_steps: When provided, ``env.step`` is called at most this many times across all motion
                 mini-batches and the loop breaks early -- intended for the video logger, which only needs a
                 bounded-length clip rather than the full priorities update. ``None`` runs every mini-batch.
+            zero_context: Force ``c = 0`` for this pass (blind-degradation canary); the returned metric is
+                keyed ``emd_zero_context`` so it logs alongside the perceptive ``emd``.
+            update_priorities: When False, leave the expert-buffer priorities untouched -- required for
+                diagnostic second passes so they don't clobber the perceptive pass's priorities.
             **kwargs: Extra keyword eval arguments (e.g. ``stochastic``, ``action_repeat``) are accepted and
                 ignored, so this method tolerates a uniform eval call signature.
 
@@ -503,6 +563,7 @@ class FbCpr:
         env.eval_mode()
 
         eval_infos: list[dict[str, torch.Tensor]] = []
+        emd_key = "emd_zero_context" if (zero_context or self.zero_context) else "emd"
         bucket_size = self.expert_buffer.bucket_size
         idx = 0
         steps_done = 0
@@ -524,7 +585,7 @@ class FbCpr:
             # Run rollouts for each trajectory latent task and save the emd terms at each step
             for it in range(rollout_steps):
                 obs = self.obs_normalizer(obs)
-                actions = self.actor(obs, eval_zs[:, it, :], *self._context_args(obs))
+                actions = self.actor(obs, eval_zs[:, it, :], *self._context_args(obs, zero=zero_context))
                 # Pad out remaining envs with zeros
                 actions = pad_to_size(actions, env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
@@ -540,13 +601,15 @@ class FbCpr:
                 emds[i] = compute_emd(actual_emd[i], eval_emd[i])
             priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
             # Save priorities to expert buffer
-            self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
-            eval_infos.append({"emd": emds.detach().cpu()})
+            if update_priorities:
+                self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
+            eval_infos.append({emd_key: emds.detach().cpu()})
 
             idx += mini_batch_size
             if max_steps is not None and steps_done >= max_steps:
                 break
-        self.expert_buffer.normalize_priorities()
+        if update_priorities:
+            self.expert_buffer.normalize_priorities()
 
         # Revert to train mode
         self.train_mode()
@@ -684,7 +747,7 @@ class FbCpr:
     def get_policy(self) -> nn.Module:
         """Get the policy model (wrapped with the context encoder when configured, since the actor needs c)."""
         if self.encoder is not None:
-            return EncoderInferencePolicy(self.encoder, self.actor, latent_first=False)
+            return EncoderInferencePolicy(self.encoder, self.actor, latent_first=False, zero_latent=self.zero_context)
         return self.actor
 
     @staticmethod
