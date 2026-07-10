@@ -567,6 +567,9 @@ class FbCpr:
         bucket_size = self.expert_buffer.bucket_size
         idx = 0
         steps_done = 0
+        # context-capacity probe: c subsamples across the perceptive pass -> effective rank (skipped on c=0 passes)
+        c_samples: list[torch.Tensor] = []
+        probe_context = self.encoder is not None and not (zero_context or self.zero_context)
         for eval_obs in self.expert_buffer.get_batch_motions(env.num_envs, device=self.device):
             mini_batch_size = eval_obs.shape[0]
             eval_motions = self.expert_buffer.get_expert_state(eval_obs)
@@ -585,7 +588,10 @@ class FbCpr:
             # Run rollouts for each trajectory latent task and save the emd terms at each step
             for it in range(rollout_steps):
                 obs = self.obs_normalizer(obs)
-                actions = self.actor(obs, eval_zs[:, it, :], *self._context_args(obs, zero=zero_context))
+                context = self._context_args(obs, zero=zero_context)
+                if probe_context and it % 10 == 0:
+                    c_samples.append(context[0][:mini_batch_size].detach())
+                actions = self.actor(obs, eval_zs[:, it, :], *context)
                 # Pad out remaining envs with zeros
                 actions = pad_to_size(actions, env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
@@ -610,6 +616,14 @@ class FbCpr:
                 break
         if update_priorities:
             self.expert_buffer.normalize_priorities()
+
+        if c_samples:
+            # effective rank (Roy & Vetterli): exp(entropy of normalized singular values) of centered c.
+            # Pinned near c_dim = width-limited (widen next run); well below = headroom, not the bottleneck.
+            c_mat = torch.cat([c.reshape(-1, c.shape[-1]) for c in c_samples]).float()
+            sv = torch.linalg.svdvals(c_mat - c_mat.mean(0, keepdim=True))
+            p = (sv / sv.sum().clamp_min(1e-12)).clamp_min(1e-12)
+            eval_infos.append({"encoder_effective_rank": torch.exp(-(p * p.log()).sum()).cpu().view(1)})
 
         # Revert to train mode
         self.train_mode()
