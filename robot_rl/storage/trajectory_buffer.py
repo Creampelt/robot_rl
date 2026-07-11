@@ -129,13 +129,13 @@ class TrajectoryBuffer(ExpertBuffer):
         Returns iterator containing batched observations as TensorDict with shape (mini_batch_size, bucket_size,
         *obs_size). Note that the final batch may be truncated.
         """
-        # Randomize order since rigid body DR is fixed per-environment
-        order = (
-            self.eval_motion_indices
-            if self.eval_motion_indices is not None
-            else torch.arange(self.num_motions, device=self.device)
-        )
-        self._eval_order = order[torch.randperm(len(order), device=self.device)]
+        if self.eval_motion_indices is not None:
+            # pinned eval sets (e.g. video views) keep caller order: consecutive rows = clip segments in order
+            self._eval_order = self.eval_motion_indices
+        else:
+            # randomize order since rigid body DR is fixed per-environment
+            order = torch.arange(self.num_motions, device=self.device)
+            self._eval_order = order[torch.randperm(len(order), device=self.device)]
         for idx in range(0, len(self._eval_order), mini_batch_size):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
             self.current_eval_motion_indices = eval_idxs
