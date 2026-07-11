@@ -178,6 +178,10 @@ class FbCpr:
         # both critics, actor) before one step per update(). learning_rate=0 freezes it (finetune contract).
         encoder_cfg = encoder_cfg or {}
         self._detach_actor_context = bool(encoder_cfg.get("detach_actor_gradients", False))
+        # Latent-spectrum regularizer (VICReg-style) on the clean c; all-zero = disabled
+        self.context_variance_coef = float(encoder_cfg.get("variance_coef", 0.0))
+        self.context_covariance_coef = float(encoder_cfg.get("covariance_coef", 0.0))
+        self.context_l2_coef = float(encoder_cfg.get("l2_coef", 0.0))
         self.encoder_optimizer = None
         if self.encoder is not None:
             encoder_lr = encoder_cfg.get("learning_rate")
@@ -489,6 +493,30 @@ class FbCpr:
         actor_cargs = self._context_args(batch.observations, detach=self._detach_actor_context)
         actor_loss_dict, actor_extras = self._update_actor(batch, actor_cargs)
 
+        # Latent-spectrum regularizer on the CLEAN c (no corruption): per-dim variance hinge fights
+        # dimensional collapse, off-diagonal covariance decorrelates dims, L2 bounds magnitudes.
+        # Eager like every encoder forward; grads accumulate with the consumer losses below.
+        encoder_reg_dict: dict[str, torch.Tensor] = {}
+        if self.encoder_optimizer is not None and (
+            self.context_variance_coef > 0.0 or self.context_covariance_coef > 0.0 or self.context_l2_coef > 0.0
+        ):
+            c = self.encoder(batch.observations)
+            centered = c - c.mean(dim=0)
+            var_loss = torch.relu(1.0 - torch.sqrt(centered.var(dim=0) + 1e-4)).mean()
+            cov = (centered.T @ centered) / (centered.shape[0] - 1)
+            cov_loss = (cov.pow(2).sum() - cov.diagonal().pow(2).sum()) / c.shape[-1]
+            l2_loss = c.pow(2).mean()
+            (
+                self.context_variance_coef * var_loss
+                + self.context_covariance_coef * cov_loss
+                + self.context_l2_coef * l2_loss
+            ).backward()
+            encoder_reg_dict = {
+                "encoder_variance_loss": var_loss.detach(),
+                "encoder_covariance_loss": cov_loss.detach(),
+                "encoder_l2_loss": l2_loss.detach(),
+            }
+
         # One encoder step on the gradients accumulated from all consumer losses (critics + actor)
         if self.encoder_optimizer is not None:
             if self.is_multi_gpu:
@@ -504,6 +532,7 @@ class FbCpr:
         loss_dict.update(disc_critic_loss_dict)
         loss_dict.update(aux_critic_loss_dict)
         loss_dict.update(actor_loss_dict)
+        loss_dict.update(encoder_reg_dict)
 
         extras = {}
         extras.update(disc_extras)
