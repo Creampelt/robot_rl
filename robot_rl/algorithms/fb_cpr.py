@@ -614,8 +614,14 @@ class FbCpr:
             # the env's `eval` obs group defines what the priority metric compares (env-cfg, not here)
             emd_dim = eval_obs["eval"].shape[-1]
             actual_emd = torch.zeros((mini_batch_size, rollout_steps, emd_dim), device=self.device)
+            # Trim the rollout to the batch's longest un-padded row (+0.5 s settle margin): the EMD is
+            # masked past valid lengths anyway, and videos skip long frozen hold-final-pose tails.
+            batch_lengths = getattr(self.expert_buffer, "current_eval_motion_lengths", None)
+            batch_steps = (
+                rollout_steps if batch_lengths is None else min(rollout_steps, int(batch_lengths.max()) - 1 + 25)
+            )
             # Run rollouts for each trajectory latent task and save the emd terms at each step
-            for it in range(rollout_steps):
+            for it in range(batch_steps):
                 obs = self.obs_normalizer(obs)
                 context = self._context_args(obs, zero=zero_context)
                 if probe_context and it % 10 == 0:
