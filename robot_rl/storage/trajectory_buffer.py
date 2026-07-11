@@ -7,13 +7,20 @@ from .expert_buffer import ExpertBuffer
 
 def _get_idxs(
     priorities: torch.Tensor,
+    valid_lengths: torch.Tensor,
     num_slices: int,
     seq_length: int,
     bucket_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate ``(episode, frame)`` indices for sampling consecutive windows from a trajectory buffer."""
+    """Generate ``(episode, frame)`` indices for sampling consecutive windows from a trajectory buffer.
+
+    Windows always START inside a row's valid (un-padded) frames: rows longer than the window yield
+    fully-real windows; shorter rows start at 0 and run into the hold-final-frame padding (a
+    track-then-settle target). Upper bound keeps ``+1`` headroom for the caller's next-frame lookup.
+    """
     ep_indices = torch.multinomial(priorities, num_slices, replacement=True)
-    starts = torch.randint(0, bucket_size - seq_length, (num_slices,), device=priorities.device)
+    start_max = torch.clamp(valid_lengths[ep_indices] - seq_length, min=1, max=bucket_size - seq_length)
+    starts = (torch.rand(num_slices, device=priorities.device) * start_max).long()
     offsets = torch.arange(seq_length, device=priorities.device)
     seq_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
     ep_flat = ep_indices.unsqueeze(1).expand(num_slices, seq_length).reshape(-1)
@@ -41,6 +48,12 @@ class TrajectoryBuffer(ExpertBuffer):
                 f"{self.motions.shape}."
             )
         self.num_motions, self.bucket_size = self.motions.shape
+        # per-row un-padded frame count ("length" key, written by play_dataset --convert); bundles
+        # without it (e.g. LAFAN, fully-real buckets) fall back to bucket_size = legacy behavior
+        if "length" in self.motions:
+            self.valid_lengths = self.motions["length"][:, 0].long().clamp(1, self.bucket_size)
+        else:
+            self.valid_lengths = torch.full((self.num_motions,), self.bucket_size, dtype=torch.long, device=device)
         self.priorities = torch.ones((self.num_motions,), device=device)
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
         # optional: restrict eval (get_batch_motions) to these motion indices; None = all
@@ -48,6 +61,7 @@ class TrajectoryBuffer(ExpertBuffer):
         # motion rows of the most recent get_batch_motions mini-batch, env-ordered (env i replays row
         # [i]); envs read it in reset_to for eval-side routing (e.g. family-matched terrain tiles)
         self.current_eval_motion_indices: torch.Tensor | None = None
+        self.current_eval_motion_lengths: torch.Tensor | None = None
         # (motion rows, frame cols) of the most recent sample_states batch, env-ordered; envs read it
         # in reset events for per-frame spawn fitting (e.g. the RSI foot-raycast z-fit)
         self.current_sample_indices: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -85,7 +99,9 @@ class TrajectoryBuffer(ExpertBuffer):
         if seq_length >= self.bucket_size:
             raise ValueError(f"seq_length ({seq_length}) must be less than bucket_size ({self.bucket_size}).")
         num_slices = batch_size // seq_length
-        ep_flat, seq_indices = self._get_idxs(self.priorities, num_slices, seq_length, self.bucket_size)
+        ep_flat, seq_indices = self._get_idxs(
+            self.priorities, self.valid_lengths, num_slices, seq_length, self.bucket_size
+        )
         return (
             self.motions[ep_flat, seq_indices].to(device),
             self.motions[ep_flat, seq_indices + 1].to(device),
@@ -97,7 +113,8 @@ class TrajectoryBuffer(ExpertBuffer):
         See :meth:`get_expert_state` for full state dictionary format.
         """
         ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
-        motion_indices = torch.randint(0, self.bucket_size, (num_envs,), device=self.device)
+        # spawn frames only from real (un-padded) motion
+        motion_indices = (torch.rand(num_envs, device=self.device) * self.valid_lengths[ep_indices]).long()
         self.current_sample_indices = (ep_indices, motion_indices)
         motions = self.motions[ep_indices, motion_indices]
         return self.get_expert_state(motions, device=device)
@@ -122,6 +139,8 @@ class TrajectoryBuffer(ExpertBuffer):
         for idx in range(0, len(self._eval_order), mini_batch_size):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
             self.current_eval_motion_indices = eval_idxs
+            # per-row un-padded lengths of this mini-batch (eval-side EMD masking)
+            self.current_eval_motion_lengths = self.valid_lengths[eval_idxs]
             yield self.motions[eval_idxs].to(device)
 
     def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:

@@ -630,10 +630,13 @@ class FbCpr:
                     break
             # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
             # Compare against frames 1..bucket_size-1 since actual_emd[:, t] is the pose after targeting frame t+1.
+            # Rows are masked to their un-padded length so hold-final-frame padding never enters the metric.
             eval_emd = eval_obs["eval"][:, 1:].to(self.device)
+            lengths = getattr(self.expert_buffer, "current_eval_motion_lengths", None)
             emds = torch.empty((mini_batch_size,), device=self.device)
             for i in range(mini_batch_size):
-                emds[i] = compute_emd(actual_emd[i], eval_emd[i])
+                v = rollout_steps if lengths is None else max(1, min(int(lengths[i]) - 1, rollout_steps))
+                emds[i] = compute_emd(actual_emd[i, :v], eval_emd[i, :v])
             priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
             # Save priorities to expert buffer
             if update_priorities:
