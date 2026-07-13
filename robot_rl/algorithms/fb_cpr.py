@@ -379,6 +379,7 @@ class FbCpr:
                 num_expert_updates * self.expert_rollout_length,
                 device=self.device,
                 seq_length=self.expert_rollout_length,
+                ep_indices=self._expert_rollout_rows(num_expert_updates),
             )
             with eval_mode(self.obs_normalizer):
                 expert_next_obs = self.obs_normalizer(expert_next_obs)
@@ -388,6 +389,37 @@ class FbCpr:
         z[self.expert_rollout_envs] = self.expert_rollout_z[:, rollout_idx]
 
         return z
+
+    def _auxiliary_losses(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
+        """Extra losses to fold into the shared encoder step. No-op in the base; subclasses override.
+
+        Called from :meth:`update` after every consumer loss has accumulated encoder gradients and before
+        ``encoder_optimizer.step()``, so anything backwarded here rides the same step. Runs EAGER (like the
+        latent-spectrum block) -- do not put it inside a compiled region: several ``reduce-overhead`` regions
+        share one CUDA-graph pool, and a tensor crossing that boundary is silently overwritten, which would
+        look exactly like "the context is being ignored" rather than like a bug.
+
+        Args:
+            batch: The (normalized, z-relabeled) minibatch used by the consumer updates.
+
+        Returns:
+            Scalar tensors to merge into the logged loss dict.
+        """
+        return {}
+
+    def _expert_rollout_rows(self, num_rows: int) -> torch.Tensor | None:
+        """Motion rows for the expert-rollout z draw. ``None`` (the base) = the buffer's weighted draw.
+
+        Called from :meth:`update_rollout_z` once ``expert_rollout_envs`` is assigned, so a subclass can
+        condition the draw on those envs' state (e.g. the terrain tile they are CURRENTLY standing on).
+
+        Args:
+            num_rows: How many motion rows to return.
+
+        Returns:
+            A ``(num_rows,)`` tensor of motion indices, or None to defer to the buffer.
+        """
+        return None
 
     def _zc(self, z: torch.Tensor, cargs: tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Build the single fused ``[z; c]`` model input (early z x c fusion); identity without an encoder.
@@ -526,6 +558,12 @@ class FbCpr:
                 "encoder_l2_loss": l2_loss.detach(),
             }
 
+        # Subclass hook, deliberately OUTSIDE the coef guard above and BEFORE the encoder step below:
+        # every consumer loss has now accumulated its encoder gradients, and encoder_optimizer.step()
+        # has not fired, so an auxiliary encoder objective rides the SAME step (no second step, no
+        # doubled effective LR). No-op in the base.
+        aux_loss_dict = self._auxiliary_losses(batch)
+
         # One encoder step on the gradients accumulated from all consumer losses (critics + actor)
         if self.encoder_optimizer is not None:
             if self.is_multi_gpu:
@@ -542,6 +580,7 @@ class FbCpr:
         loss_dict.update(aux_critic_loss_dict)
         loss_dict.update(actor_loss_dict)
         loss_dict.update(encoder_reg_dict)
+        loss_dict.update(aux_loss_dict)
 
         extras = {}
         extras.update(disc_extras)
@@ -713,6 +752,9 @@ class FbCpr:
             "target_aux_critic_state_dict": self.target_aux_critic.target.state_dict(),
             "z_buffer_state": self.z_buffer.state_dict(),
             "expert_buffer_state": self.expert_buffer.state_dict(),
+            # act-step counter: any anneal driven off it (e.g. a terrain-coning ramp) would otherwise
+            # silently restart at 0 on resume, while the buffer is already full of annealed data
+            "act_steps": self._act_steps,
         }
         if self.encoder is not None:
             saved_dict["encoder_state_dict"] = self.encoder.state_dict()
@@ -803,6 +845,8 @@ class FbCpr:
                 self.z_buffer.load_state_dict(loaded_dict["z_buffer_state"])
             if "expert_buffer_state" in loaded_dict:
                 self.expert_buffer.load_state_dict(loaded_dict["expert_buffer_state"])
+        if "act_steps" in loaded_dict:
+            self._act_steps = int(loaded_dict["act_steps"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> nn.Module:

@@ -5,26 +5,51 @@ from tensordict import TensorDict
 from .expert_buffer import ExpertBuffer
 
 
-def _get_idxs(
-    priorities: torch.Tensor,
+def _window_idxs(
+    ep_indices: torch.Tensor,
     valid_lengths: torch.Tensor,
-    num_slices: int,
     seq_length: int,
     bucket_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate ``(episode, frame)`` indices for sampling consecutive windows from a trajectory buffer.
+    """Draw a start frame per given row and expand to ``(episode, frame)`` window indices.
 
     Windows always START inside a row's valid (un-padded) frames: rows longer than the window yield
     fully-real windows; shorter rows start at 0 and run into the hold-final-frame padding (a
     track-then-settle target). Upper bound keeps ``+1`` headroom for the caller's next-frame lookup.
     """
-    ep_indices = torch.multinomial(priorities, num_slices, replacement=True)
+    num_slices = ep_indices.shape[0]
     start_max = torch.clamp(valid_lengths[ep_indices] - seq_length, min=1, max=bucket_size - seq_length)
-    starts = (torch.rand(num_slices, device=priorities.device) * start_max).long()
-    offsets = torch.arange(seq_length, device=priorities.device)
+    starts = (torch.rand(num_slices, device=ep_indices.device) * start_max).long()
+    offsets = torch.arange(seq_length, device=ep_indices.device)
     seq_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
     ep_flat = ep_indices.unsqueeze(1).expand(num_slices, seq_length).reshape(-1)
     return ep_flat, seq_indices
+
+
+def _get_idxs(
+    weights: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    num_slices: int,
+    seq_length: int,
+    bucket_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample rows from ``weights``, then a consecutive window inside each."""
+    ep_indices = torch.multinomial(weights, num_slices, replacement=True)
+    return _window_idxs(ep_indices, valid_lengths, seq_length, bucket_size)
+
+
+def _get_idxs_for_eps(
+    ep_indices: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    seq_length: int,
+    bucket_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Window indices for CALLER-CHOSEN rows (terrain-coned expert-rollout draws): no multinomial.
+
+    A separate compiled entry point rather than an optional tensor arg on ``_get_idxs`` -- the latter
+    would change that function's guards, and it runs on the hot rollout path.
+    """
+    return _window_idxs(ep_indices, valid_lengths, seq_length, bucket_size)
 
 
 class TrajectoryBuffer(ExpertBuffer):
@@ -55,6 +80,18 @@ class TrajectoryBuffer(ExpertBuffer):
         else:
             self.valid_lengths = torch.full((self.num_motions,), self.bucket_size, dtype=torch.long, device=device)
         self.priorities = torch.ones((self.num_motions,), device=device)
+        # Family softening (alpha) and the held-out split live in their OWN persistent tensors, never in
+        # `priorities`: eval() overwrites priorities wholesale every eval_interval and renormalizes, so
+        # anything baked in there survives until the first eval and then vanishes silently -- and in a
+        # plausible-looking direction (priorities become pure EMD difficulty). Both samplers compose them
+        # at draw time via `sample_weights`.
+        self.base_weights = torch.ones((self.num_motions,), device=device)
+        self.train_mask = torch.ones((self.num_motions,), device=device)
+        if "heldout" in self.motions:
+            # pinned in the bundle at conversion, BY CLIP, so a clip's buckets never straddle the split
+            self.train_mask = (self.motions["heldout"][:, 0].reshape(-1) == 0).float().to(device)
+            n_held = int((self.train_mask == 0).sum())
+            print(f"[INFO] Held-out clips: {n_held}/{self.num_motions} (excluded from training).")
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
         # optional: restrict eval (get_batch_motions) to these motion indices; None = all
         self.eval_motion_indices: torch.Tensor | None = None
@@ -69,16 +106,48 @@ class TrajectoryBuffer(ExpertBuffer):
         # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a
         # reduce-overhead capture would poison the shared cudagraph pool that update() later reuses.
         self._get_idxs = torch.compile(_get_idxs, mode="default")
+        self._get_idxs_for_eps = torch.compile(_get_idxs_for_eps, mode="default")
 
         print(f"[INFO] Successfully loaded {self.num_motions} motions with length {self.bucket_size}.")
+
+    @property
+    def sample_weights(self) -> torch.Tensor:
+        """The distribution BOTH samplers draw from: EMD priority x family softening x held-out mask."""
+        return self.priorities * self.base_weights * self.train_mask
+
+    @property
+    def heldout_indices(self) -> torch.Tensor:
+        """Rows excluded from training -- the only instrument that can see clip overfitting."""
+        return torch.nonzero(self.train_mask == 0, as_tuple=False).reshape(-1)
+
+    def set_family_softening(self, alpha: float, weight_clip: float = 32.0) -> None:
+        """Weight each clip by ``n_f^(alpha-1)``, ``n_f`` = the clip count of its family.
+
+        ``alpha = 1`` is the natural corpus (box-dominated: 554 boxes vs 26 stairs). ``alpha = 0`` gives
+        every family equal mass, hammering the rare clips ~21x -- and it COMPOUNDS with the EMD priority,
+        which already favours exactly those hard stairs clips. Normalized to a median of 1 and clipped so
+        the product cannot run away.
+
+        Args:
+            alpha: Softening exponent; 0.5 (sqrt class-balance) is the v3 starting point.
+            weight_clip: Max weight relative to the median.
+        """
+        if "family" not in self.motions:
+            raise KeyError("family softening needs a 'family' key in the motion bundle")
+        fam = self.motions["family"][:, 0].reshape(-1).long()
+        counts = torch.bincount(fam, minlength=int(fam.max().item()) + 1).float()
+        weights = counts[fam].clamp(min=1.0).pow(alpha - 1.0)
+        weights = weights / weights.median()
+        self.base_weights = weights.clamp(max=weight_clip).to(self.device)
 
     def sample(
         self,
         batch_size: int,
         device: str | None = None,
         seq_length: int = 1,
+        ep_indices: torch.Tensor | None = None,
     ) -> tuple[TensorDict, TensorDict]:
-        """Sample current and next expert observations from multinomial distribution weighted by priorities.
+        """Sample current and next expert observations, weighted by :attr:`sample_weights`.
 
         When ``seq_length > 1``, samples are returned as ``batch_size // seq_length`` consecutive windows, each of
         length ``seq_length``, drawn from a single motion starting at a random frame. The flat output is ordered so
@@ -90,6 +159,8 @@ class TrajectoryBuffer(ExpertBuffer):
             device: The device to move the output to. Defaults to None, which keeps the observations on the buffer's
                 device.
             seq_length: Length of each consecutive window. Must be strictly less than ``bucket_size``.
+            ep_indices: Caller-chosen motion rows (one per window), bypassing the weighted draw -- used by the
+                terrain-coned expert-rollout z. Start frames are still valid-length aware.
 
         Returns:
             A tuple containing the expert obs and next obs as TensorDicts. Shape is (batch_size).
@@ -99,9 +170,16 @@ class TrajectoryBuffer(ExpertBuffer):
         if seq_length >= self.bucket_size:
             raise ValueError(f"seq_length ({seq_length}) must be less than bucket_size ({self.bucket_size}).")
         num_slices = batch_size // seq_length
-        ep_flat, seq_indices = self._get_idxs(
-            self.priorities, self.valid_lengths, num_slices, seq_length, self.bucket_size
-        )
+        if ep_indices is None:
+            ep_flat, seq_indices = self._get_idxs(
+                self.sample_weights, self.valid_lengths, num_slices, seq_length, self.bucket_size
+            )
+        else:
+            if ep_indices.shape[0] != num_slices:
+                raise ValueError(f"ep_indices has {ep_indices.shape[0]} rows, expected {num_slices}.")
+            ep_flat, seq_indices = self._get_idxs_for_eps(
+                ep_indices.to(self.device), self.valid_lengths, seq_length, self.bucket_size
+            )
         return (
             self.motions[ep_flat, seq_indices].to(device),
             self.motions[ep_flat, seq_indices + 1].to(device),
@@ -112,7 +190,7 @@ class TrajectoryBuffer(ExpertBuffer):
 
         See :meth:`get_expert_state` for full state dictionary format.
         """
-        ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
+        ep_indices = torch.multinomial(self.sample_weights, num_envs, replacement=True)
         # spawn frames only from real (un-padded) motion
         motion_indices = (torch.rand(num_envs, device=self.device) * self.valid_lengths[ep_indices]).long()
         self.current_sample_indices = (ep_indices, motion_indices)
@@ -149,15 +227,31 @@ class TrajectoryBuffer(ExpertBuffer):
         self.priorities[actual_indices] = priorities.to(self.device)
 
     def normalize_priorities(self) -> None:
-        """Normalize all priorities by dividing by their sum."""
+        """Normalize all priorities by dividing by their sum, then re-zero the held-out rows.
+
+        The re-zero is belt-and-braces -- ``sample_weights`` already masks them -- but ``eval()`` writes a
+        LARGE priority to every row it scores, so a held-out row that ever leaks into a sampler would leak
+        with a big weight. Keeping it zero here means the leak is bounded even if a future caller reads
+        ``priorities`` directly.
+        """
         self.priorities /= self.priorities.sum()
+        self.priorities *= self.train_mask
 
     def state_dict(self) -> dict:
-        """Return the per-motion sampling priorities for checkpointing."""
-        return {"priorities": self.priorities}
+        """Return the per-motion sampling state for checkpointing."""
+        return {
+            "priorities": self.priorities,
+            "base_weights": self.base_weights,
+            "train_mask": self.train_mask,
+        }
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore the per-motion sampling priorities from a checkpoint."""
+        """Restore the per-motion sampling state from a checkpoint.
+
+        ``train_mask`` MUST round-trip: a resume that redraws the split would train on rows it then
+        evaluates as held out, and the overfitting gap -- the only instrument that can see clip
+        memorization -- would silently read ~0.
+        """
         priorities = state["priorities"].to(self.device)
         if priorities.shape != self.priorities.shape:
             raise ValueError(
@@ -165,6 +259,10 @@ class TrajectoryBuffer(ExpertBuffer):
                 f"{tuple(self.priorities.shape)}; the motion dataset likely differs from the checkpointed run."
             )
         self.priorities = priorities
+        # older checkpoints predate these; fall back to the values derived from the bundle at construction
+        for key in ("base_weights", "train_mask"):
+            if key in state:
+                setattr(self, key, state[key].to(self.device))
 
     def get_expert_state(self, obs: TensorDict, device: str | None = None) -> dict[str, torch.Tensor]:
         """Convert the observations TensorDict into a state dictionary of tensors.
