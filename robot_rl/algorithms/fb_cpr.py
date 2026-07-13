@@ -222,7 +222,6 @@ class FbCpr:
         self.clip_actions = clip_actions
         self.num_seed_steps_per_env = num_seed_steps_per_env
         self._rollout_z: torch.Tensor | None = None
-        self._last_dones: torch.Tensor | None = None
         self._cur_episode_length: torch.Tensor | None = None
         self._act_steps = 0
 
@@ -308,10 +307,8 @@ class FbCpr:
         if random_sample:
             clip_actions = 1.0 if self.clip_actions is None else self.clip_actions
             self.transition.actions.uniform_(-clip_actions, clip_actions).detach()
-        # record obs and dones before env.step()
+        # record obs before env.step(); dones is attached in process_env_step, once it is known
         self.transition.observations = obs
-        # dones is None if this is the first step
-        self.transition.dones = self._last_dones
         self.transition.context = z
         return self.transition.actions  # type: ignore
 
@@ -329,6 +326,12 @@ class FbCpr:
         # Terminated is all dones that are not time_outs (used to compute discount factor)
         self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
+        # The buffer's drop filter must see the dones that make THIS transition's next_obs a post-reset
+        # state: the dones from the step we just took. act() used to stage the PREVIOUS step's dones here,
+        # which inverts the filter -- it KEPT the cross-reset pair it exists to drop (and on a time_out,
+        # next_terminated is 0, so that pair was bootstrapped) and DROPPED the first, perfectly valid
+        # transition of the new episode instead.
+        self.transition.dones = dones
 
         # Record the transition
         self.replay_buffer.add_transitions(self.transition)
@@ -338,17 +341,15 @@ class FbCpr:
         for model in self.models:
             model.reset(dones)
 
-        # Advance the rollout state consumed by the next act(): episode step counters and last dones
+        # Advance the rollout state consumed by the next act(): episode step counters
         if self._cur_episode_length is not None:
             self._cur_episode_length += 1
             self._cur_episode_length[(dones > 0).nonzero(as_tuple=False)] = 0
-        self._last_dones = dones
 
     def reset_rollout_state(self) -> None:
         """Reset the per-env rollout bookkeeping after an external env reset (e.g. post-eval); z is kept."""
         if self._cur_episode_length is not None:
             self._cur_episode_length[:] = 0
-        self._last_dones = None
 
     def compute_gammas(self) -> None:
         """Compute gamma values from stored transitions."""

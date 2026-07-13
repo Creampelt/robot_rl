@@ -166,3 +166,44 @@ class TestReplayBuffer:
         # All stored actions should be present among the first len() rows.
         assert torch.allclose(buf.actions[:3], tr.actions)
         assert torch.allclose(buf.context[:3], tr.context)
+
+
+class TestPostResetTransitionIsDropped:
+    """The drop filter keys on the dones of the step that PRODUCED next_obs, not the previous step's.
+
+    With a stale (previous-step) dones the filter inverts: the cross-reset pair (s_t -> post-reset s)
+    is KEPT -- and on a time_out its next_terminated is 0, so it is bootstrapped -- while the first,
+    perfectly valid transition of the new episode is dropped instead. Regression test for that.
+    """
+
+    def test_only_the_cross_reset_pair_is_dropped(self) -> None:
+        """Env 0 ends its episode at step 1; exactly that transition must not be stored."""
+        num_envs = 2
+        buf = _make_buffer(num_envs=num_envs, capacity_per_env=8)
+
+        def step(marker: float, dones: torch.Tensor) -> None:
+            t = ReplayBuffer.Transition()
+            t.observations = TensorDict({"policy": torch.full((num_envs, OBS_DIM), marker)}, batch_size=num_envs)
+            t.next_observations = TensorDict(
+                {"policy": torch.full((num_envs, OBS_DIM), marker + 0.5)}, batch_size=num_envs
+            )
+            t.actions = torch.zeros(num_envs, ACT_DIM)
+            t.rewards = torch.zeros(num_envs)
+            t.context = torch.zeros(num_envs, Z_DIM)
+            t.next_terminated = torch.zeros(num_envs, dtype=torch.uint8)
+            t.dones = dones
+            buf.add_transitions(t)
+
+        no_done = torch.zeros(num_envs, dtype=torch.bool)
+        env0_done = torch.tensor([True, False])
+
+        step(1.0, no_done)  # both envs fine
+        step(2.0, env0_done)  # env 0's next_obs (2.5) IS the post-reset state -> drop env 0 only
+        step(3.0, no_done)  # env 0's first transition of the NEW episode -> must be KEPT
+
+        markers = buf.observations["policy"][: len(buf), 0]
+        # step 1: 2 rows, step 2: 1 row (env 1 only), step 3: 2 rows
+        assert len(buf) == 5, "exactly one transition (the cross-reset pair) should have been dropped"
+        assert sorted(markers.tolist()) == [1.0, 1.0, 2.0, 3.0, 3.0]
+        # the new episode's first transition survived
+        assert (markers == 3.0).sum() == 2
