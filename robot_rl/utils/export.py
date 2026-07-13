@@ -132,7 +132,7 @@ _FBCPR_MODELS = {
     "encoder": ("encoder", "encoder", "MLPModel", "c_dim", ()),
 }
 
-# Models that take the context latent c as an extra trailing input on encoder runs
+# Models whose z slot is FUSED with the context latent c on encoder runs ([z; c] as one input)
 _FBCPR_CONTEXT_CONSUMERS = ("policy", "forward", "disc_critic", "aux_critic")
 
 
@@ -141,8 +141,9 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     nsd = ckpt["obs_normalizer_state_dict"]
     obs = {group: torch.zeros(1, dim) for group, dim in _group_dims(nsd).items()}
     dims = {"z_dim": cfg["algorithm"]["z_dim"], "num_actions": _num_actions(ckpt["actor_state_dict"])}
-    # Optional context encoder: exports as encoder.pt (raw scan -> c, normalizer baked); the consumer
-    # models gain c as a trailing side input. policy.pt + encoder.pt = the HL-distillation contract.
+    # Optional context encoder: exports as encoder.pt (raw scan -> c, normalizer baked). The consumer
+    # models take c FUSED into their z slot, so the exported policy signature is (obs, [z; c]) -- the
+    # deployment consumer concatenates. policy.pt + encoder.pt = the HL-distillation contract.
     encoder_cfg = cfg["algorithm"].get("encoder_cfg")
     if encoder_cfg is not None:
         dims["c_dim"] = int(encoder_cfg["output_dim"])
@@ -160,10 +161,12 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
         out_dim = dims[out_spec] if isinstance(out_spec, str) else out_spec
         other_dims = tuple(dims[k] for k in other_spec)
         if encoder_cfg is not None and name in _FBCPR_CONTEXT_CONSUMERS:
-            other_dims = (*other_dims, dims["c_dim"])
+            # c is fused INTO the z slot (slot 0), not appended as its own branch -- must mirror
+            # construct_algorithm exactly or the strict load below fails on every v3 checkpoint
+            other_dims = (other_dims[0] + dims["c_dim"], *other_dims[1:])
         bn = _load_bn(nsd, cfg["obs_groups"][obs_set])
         if name == "policy":
-            input_dims = (other_dims[0], 0, *other_dims[1:])  # (z, obs-only[, c]) fused branches
+            input_dims = (other_dims[0], 0)  # ([obs; z, c] branch, bare-obs branch)
             model = model_class(obs, cfg["obs_groups"], obs_set, input_dims, out_dim, **model_cfg)
         elif name in ("backward", "discriminator", "encoder"):
             model = model_class(obs, cfg["obs_groups"], obs_set, out_dim, other_input_dims=other_dims, **model_cfg)

@@ -63,7 +63,12 @@ class EncoderInferencePolicy(nn.Module):
     is_recurrent: bool = False
 
     def __init__(
-        self, encoder: nn.Module, actor: MLPModel, latent_first: bool = True, zero_latent: bool = False
+        self,
+        encoder: nn.Module,
+        actor: MLPModel,
+        latent_first: bool = True,
+        zero_latent: bool = False,
+        fuse_latent: bool = False,
     ) -> None:
         """Wrap the encoder module and the actor consuming its latent.
 
@@ -71,14 +76,17 @@ class EncoderInferencePolicy(nn.Module):
             encoder: The shared observation encoder.
             actor: The actor model taking the encoder latent as an extra input.
             latent_first: Whether the latent precedes the other extra inputs (PPO/SAC convention) or trails
-                them (FB-CPR convention: ``actor(obs, z, c)``).
+                them. Ignored when ``fuse_latent`` is set.
             zero_latent: Feed the actor a zero latent instead of the encoder output (blind-degradation eval).
+            fuse_latent: CONCATENATE the latent onto the first extra input rather than passing it as its own
+                (FB-CPR: the actor takes one fused ``[z; c]`` input, so appending would be an arity error).
         """
         super().__init__()
         self.encoder = encoder
         self.actor = actor
         self.latent_first = latent_first
         self.zero_latent = zero_latent
+        self.fuse_latent = fuse_latent
 
     @property
     def output_mean(self) -> torch.Tensor:
@@ -105,7 +113,11 @@ class EncoderInferencePolicy(nn.Module):
         latent = self.encoder(obs)
         if self.zero_latent:
             latent = torch.zeros_like(latent)
-        inputs = (latent, *args) if self.latent_first else (*args, latent)
+        if self.fuse_latent:
+            # one fused input: [z; c]. zero_latent above already zeroes exactly the c slice.
+            inputs = (torch.cat([args[0], latent], dim=-1), *args[1:])
+        else:
+            inputs = (latent, *args) if self.latent_first else (*args, latent)
         return self.actor(obs, *inputs, **kwargs)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:

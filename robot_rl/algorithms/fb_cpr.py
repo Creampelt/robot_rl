@@ -303,7 +303,7 @@ class FbCpr:
         # compute the actions and values
         with torch.no_grad():
             cargs = self._context_args(norm_obs)
-        self.transition.actions = self.actor(norm_obs, z, *cargs, stochastic_output=True).detach()
+        self.transition.actions = self.actor(norm_obs, self._zc(z, cargs), stochastic_output=True).detach()
         # uniformly sample from action space during the seed phase
         if random_sample:
             clip_actions = 1.0 if self.clip_actions is None else self.clip_actions
@@ -388,6 +388,15 @@ class FbCpr:
         z[self.expert_rollout_envs] = self.expert_rollout_z[:, rollout_idx]
 
         return z
+
+    def _zc(self, z: torch.Tensor, cargs: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Build the single fused ``[z; c]`` model input (early z x c fusion); identity without an encoder.
+
+        ``batch.context`` stays PURE z -- the replay buffer sizes it ``z_dim``, and ``Q_fb = (Fs * z).sum(-1)``,
+        ``B_inv_cov @ z`` and ``discriminator(obs, z)`` all assume that. Fuse at the call, never in storage
+        (storing c would also freeze it at collection time -- a stale c).
+        """
+        return torch.cat([z, *cargs], dim=-1) if cargs else z
 
     def _context_args(self, norm_obs: TensorDict, detach: bool = False, zero: bool = False) -> tuple[torch.Tensor, ...]:
         """Return the context latent ``c`` as a trailing model-input tuple; empty when no encoder is configured.
@@ -626,7 +635,7 @@ class FbCpr:
                 context = self._context_args(obs, zero=zero_context)
                 if probe_context and it % 10 == 0:
                     c_samples.append(context[0][:mini_batch_size].detach())
-                actions = self.actor(obs, eval_zs[:, it, :], *context)
+                actions = self.actor(obs, self._zc(eval_zs[:, it, :], context))
                 # Pad out remaining envs with zeros
                 actions = pad_to_size(actions, env.num_envs, dim=0)
                 obs, _, _, _ = env.step(actions.to(env.device))
@@ -799,7 +808,7 @@ class FbCpr:
     def get_policy(self) -> nn.Module:
         """Get the policy model (wrapped with the context encoder when configured, since the actor needs c)."""
         if self.encoder is not None:
-            return EncoderInferencePolicy(self.encoder, self.actor, latent_first=False, zero_latent=self.zero_context)
+            return EncoderInferencePolicy(self.encoder, self.actor, fuse_latent=True, zero_latent=self.zero_context)
         return self.actor
 
     @staticmethod
@@ -835,26 +844,29 @@ class FbCpr:
             actor_dist_cfg["low"] = -clip_actions
             actor_dist_cfg["high"] = clip_actions
 
-        # Optional context encoder over the "encoder" obs set (e.g. a heightscan): its latent c is an extra
-        # trailing fused input to the actor/forward map/critics -- never the backward map or discriminator.
+        # Optional context encoder over the "encoder" obs set (e.g. a heightscan): its latent c is FUSED
+        # WITH z into a single model input -- never given to the backward map or the discriminator.
         encoder: MLPModel | None = None
-        c_dims: tuple[int, ...] = ()
+        c_dim = 0
         if encoder_cfg is not None:
             encoder_model_cfg = dict(encoder_cfg["model"])
             encoder_class: type[MLPModel] = resolve_callable(encoder_model_cfg.pop("class_name"))  # type: ignore
             c_dim = int(encoder_cfg["output_dim"])
             encoder = encoder_class(obs, cfg["obs_groups"], "encoder", c_dim, **encoder_model_cfg).to(device)
             print(f"Encoder Model: {encoder}")
-            c_dims = (c_dim,)
 
-        # Initialize the policy
+        # Initialize the policy. The successor measure is a JOINT function of task x terrain, so z and c
+        # enter as ONE input ([obs; z, c]) rather than as parallel branches that only meet in the trunk.
+        # With no encoder c_dim == 0 and every input_dims below is byte-identical to the pre-fusion build.
+        # NOTE the trailing 0 on the actor is a real bare-obs embedding branch, not an arg placeholder.
         z_dim = cfg["algorithm"]["z_dim"]
+        zc_dim = z_dim + c_dim
         actor: FuseModel = actor_class(
-            obs, cfg["obs_groups"], "actor", (z_dim, 0, *c_dims), env.num_actions, **cfg["actor"]
+            obs, cfg["obs_groups"], "actor", (zc_dim, 0), env.num_actions, **cfg["actor"]
         ).to(device)
         print(f"Actor Model: {actor}")
         forward_map: FuseModel = forward_map_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions, *c_dims), z_dim, **cfg["forward_map"]
+            obs, cfg["obs_groups"], "critic", (zc_dim, env.num_actions), z_dim, **cfg["forward_map"]
         ).to(device)
         print(f"Forward Map Model: {forward_map}")
         backward_map: MLPModel = backward_map_class(
@@ -862,11 +874,11 @@ class FbCpr:
         ).to(device)
         print(f"Backward Map Model: {backward_map}")
         disc_critic: FuseModel = disc_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions, *c_dims), 1, **cfg["disc_critic"]
+            obs, cfg["obs_groups"], "critic", (zc_dim, env.num_actions), 1, **cfg["disc_critic"]
         ).to(device)
         print(f"Discriminator Critic Model: {disc_critic}")
         aux_critic: FuseModel = aux_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions, *c_dims), 1, **cfg["aux_critic"]
+            obs, cfg["obs_groups"], "critic", (zc_dim, env.num_actions), 1, **cfg["aux_critic"]
         ).to(device)
         print(f"Auxiliary Critic Model: {aux_critic}")
         discriminator: DiscriminatorModel = discriminator_class(
@@ -1061,17 +1073,18 @@ class FbCpr:
                 # Compute successor measure from target networks
                 next_actions = self.actor(
                     batch.next_observations,
-                    batch.context,
-                    *next_cargs,
+                    self._zc(batch.context, next_cargs),
                     stochastic_output=True,
                     std_clip=self.clip_actor_std,
                 )
-                target_Fs = self.target_forward_map(batch.next_observations, batch.context, next_actions, *next_cargs)
+                target_Fs = self.target_forward_map(
+                    batch.next_observations, self._zc(batch.context, next_cargs), next_actions
+                )
                 target_B = self.target_backward_map(batch.next_observations)
                 target_Ms = torch.matmul(target_Fs, target_B.T)
                 target_M = compute_td_targets(target_Ms, self.forward_backward_pessimism)
             # Compute successor measure (B never sees the context latent c)
-            Fs = self.forward_map(batch.observations, batch.context, batch.actions, *cargs)
+            Fs = self.forward_map(batch.observations, self._zc(batch.context, cargs), batch.actions)
             B = self.backward_map(batch.next_observations)
             Ms = torch.matmul(Fs, B.T)
 
@@ -1158,16 +1171,17 @@ class FbCpr:
                 # Compute target value
                 next_actions = self.actor(
                     batch.next_observations,
-                    batch.context,
-                    *next_cargs,
+                    self._zc(batch.context, next_cargs),
                     stochastic_output=True,
                     std_clip=self.clip_actor_std,
                 )
-                next_Qs = self.target_disc_critic(batch.next_observations, batch.context, next_actions, *next_cargs)
+                next_Qs = self.target_disc_critic(
+                    batch.next_observations, self._zc(batch.context, next_cargs), next_actions
+                )
                 target_Q = discriminator_reward + batch.gammas * compute_td_targets(next_Qs, self.disc_critic_pessimism)
                 target_Q = target_Q.expand(self.disc_critic.num_parallel, -1, -1)
             # Compute critic loss
-            Qs = self.disc_critic(batch.observations, batch.context, batch.actions, *cargs)
+            Qs = self.disc_critic(batch.observations, self._zc(batch.context, cargs), batch.actions)
             loss = 0.5 * self.disc_critic.num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
@@ -1205,18 +1219,19 @@ class FbCpr:
                 # Compute target value
                 next_actions = self.actor(
                     batch.next_observations,
-                    batch.context,
-                    *next_cargs,
+                    self._zc(batch.context, next_cargs),
                     stochastic_output=True,
                     std_clip=self.clip_actor_std,
                 )
-                next_Qs = self.target_aux_critic(batch.next_observations, batch.context, next_actions, *next_cargs)
+                next_Qs = self.target_aux_critic(
+                    batch.next_observations, self._zc(batch.context, next_cargs), next_actions
+                )
                 target_Q = batch.rewards.unsqueeze(1) + batch.gammas * compute_td_targets(
                     next_Qs, self.aux_critic_pessimism
                 )
                 target_Q = target_Q.expand(self.aux_critic.num_parallel, -1, -1)
             # Compute critic loss
-            Qs = self.aux_critic(batch.observations, batch.context, batch.actions, *cargs)
+            Qs = self.aux_critic(batch.observations, self._zc(batch.context, cargs), batch.actions)
             loss = 0.5 * self.aux_critic.num_parallel * nn.functional.mse_loss(Qs, target_Q)
 
         # Compute the gradients
@@ -1247,18 +1262,21 @@ class FbCpr:
     ) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             actions = self.actor(
-                batch.observations, batch.context, *cargs, stochastic_output=True, std_clip=self.clip_actor_std
+                batch.observations,
+                self._zc(batch.context, cargs),
+                stochastic_output=True,
+                std_clip=self.clip_actor_std,
             )
             # Compute discriminator value loss
-            Qs_discriminator = self.disc_critic(batch.observations, batch.context, actions, *cargs)
+            Qs_discriminator = self.disc_critic(batch.observations, self._zc(batch.context, cargs), actions)
             Q_discriminator = (
                 -self.discriminator_reg_coef * compute_td_targets(Qs_discriminator, self.actor_pessimism).mean()
             )
             # Compute auxiliary value loss
-            Qs_aux = self.aux_critic(batch.observations, batch.context, actions, *cargs)
+            Qs_aux = self.aux_critic(batch.observations, self._zc(batch.context, cargs), actions)
             Q_aux = -self.aux_reg_coef * compute_td_targets(Qs_aux, self.actor_pessimism).mean()
             # Compute forward value loss
-            Fs = self.forward_map(batch.observations, batch.context, actions, *cargs)
+            Fs = self.forward_map(batch.observations, self._zc(batch.context, cargs), actions)
             Qs_fb = (Fs * batch.context).sum(dim=-1)
             Q_fb = compute_td_targets(Qs_fb, self.actor_pessimism)
             # Weigh auxiliary and discriminator values by forward value
