@@ -13,6 +13,7 @@ from robot_rl.algorithms.terrain_fb_cpr import (
     NUM_FAMILIES,
     TRAIN_TILE_CLIP_FAMILIES,
     _BilinearResidualHead,
+    _NormedEncoder,
     _RunningStd,
 )
 
@@ -79,3 +80,24 @@ class TestTrainCompatMap:
         """stairs/boxes/edge tiles draw only their own family (feasibility is the point of coning)."""
         for tile in (3, 4, 5):
             assert TRAIN_TILE_CLIP_FAMILIES[tile] == (tile,)
+
+
+class TestNormedEncoder:
+    """The inference wrapper: always running stats, regardless of batch size or module mode."""
+
+    def test_batch_one_and_no_stat_update(self) -> None:
+        """One deployment frame must normalize like a batch and leave the running stats untouched.
+
+        Train-mode BatchNorm would both crash on batch-1 variance and drift the EMA.
+        """
+        import torch.nn as nn
+
+        norm = nn.BatchNorm1d(4, momentum=0.01, affine=False)
+        norm(torch.randn(256, 4) * 3 + 1)  # seed the running stats in train mode
+        mean, var = norm.running_mean.clone(), norm.running_var.clone()
+        enc = _NormedEncoder(nn.Linear(4, 4), norm)
+        x = torch.randn(1, 4)
+        out_single = enc(x)
+        out_in_batch = enc(x.repeat(8, 1))[0]
+        assert torch.allclose(out_single[0], out_in_batch, atol=1e-6)
+        assert torch.equal(norm.running_mean, mean) and torch.equal(norm.running_var, var)

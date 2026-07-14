@@ -26,7 +26,8 @@ lie (F5).
 
 Implemented as a STAGING RING over replay-buffer rows, never via ``_sample_nstep``: flipping
 ``n_steps`` on the shared buffer would silently hand FB / both critics / D n-step TD targets. The env's
-``terrain`` obs key (invisible to every model) carries ``[family, difficulty, ground_z, root_z]``; when
+``terrain`` obs key (invisible to every model) carries ``[family, difficulty, ground_z, root_z,
+root_lin_vel_h (3)]``; when
 step ``t + n`` arrives, row ``t`` gets a ``future_terrain`` key ``[dground(1), contacts_t+n(10),
 valid(1)]`` written in place. Rows whose episode resets inside the window keep ``valid = 0`` and are
 masked out of the loss -- nothing else in the buffer is touched.
@@ -107,6 +108,21 @@ class _BilinearResidualHead(nn.Module):
         return torch.bmm(w, c.unsqueeze(-1)).squeeze(-1)
 
 
+class _NormedEncoder(nn.Module):
+    """Encoder + output normalizer for INFERENCE: always running stats, never batch statistics."""
+
+    def __init__(self, encoder: nn.Module, norm: nn.BatchNorm1d) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.norm = norm
+
+    def forward(self, obs: TensorDict) -> torch.Tensor:
+        c = self.encoder(obs)
+        return nn.functional.batch_norm(
+            c, self.norm.running_mean, self.norm.running_var, training=False, eps=self.norm.eps
+        )
+
+
 class TerrainFbCpr(FbCpr):
     """FB-CPR + the v3 terrain pieces: encoder dynamics objective, coning, family softening."""
 
@@ -140,21 +156,26 @@ class TerrainFbCpr(FbCpr):
         self._cone_anneal = (int(cone_anneal_start), int(cone_anneal_end))
         self._family_alpha = float(family_alpha)
 
-        # zero-init the trailing c columns of every consumer's fused branch BEFORE super().__init__
-        # copies the online nets into their EMA targets: the consumer starts as a pure [obs; z] tracker
-        # and grows a terrain pathway only where it pays (Perceptive-BFM's identity-init gating,
-        # recovered after the fusion foreclosed the per-branch version). Safe ONLY because consumers
-        # are fully detached from the encoder -- grad into W_c is delta * c^T, nonzero at W_c = 0.
         encoder_cfg = kwargs.get("encoder_cfg")
         c_dim = int(encoder_cfg["output_dim"]) if encoder_cfg else 0
-        if c_dim:
-            for model in (args[0], args[1], args[3], args[4]):  # actor, forward_map, disc_critic, aux_critic
-                self._zero_c_pathway(model.embeddings[0], c_dim)
 
         super().__init__(*args, **kwargs)
 
         if self.encoder is None:
             raise ValueError("TerrainFbCpr requires an encoder (encoder_cfg).")
+
+        # zero-init the trailing c columns of every consumer's fused branch: the consumer starts as a
+        # pure [obs; z] tracker and grows a terrain pathway only where it pays (Perceptive-BFM's
+        # identity-init gating, recovered after the fusion foreclosed the per-branch version). Safe ONLY
+        # because consumers are fully detached from the encoder -- grad into W_c is delta * c^T, nonzero
+        # at W_c = 0. MUST run after super().__init__ (model.init_weights() re-randomizes the projection
+        # columns, so pre-init zeroing is dead code) and the EMA targets must then be re-synced, or they
+        # keep the un-zeroed init for ~1/tau updates. (Adversarial review, confirmed.)
+        if c_dim:
+            for model in (self.actor, self.forward_map, self.disc_critic, self.aux_critic):
+                self._zero_c_pathway(model.embeddings[0], c_dim)
+            for tgt in (self.target_forward_map, self.target_disc_critic, self.target_aux_critic):
+                tgt.hard_sync()
 
         # encoder output normalizer: with VICReg gone nothing constrains ||c||; without this the
         # corruption knobs have drifting semantics and the rank probe is scale-sensitive
@@ -165,10 +186,14 @@ class TerrainFbCpr(FbCpr):
         # information_gain measures g's extra capacity instead of c's information (F5).
         obs_dim = int(self._norm_group_dim("obs"))
         act_dim = int(self.replay_buffer.actions.shape[-1])
-        in_dim = obs_dim + act_dim
-        # targets: [ d(obs) 1-step (obs_dim) | d(root_height) 1-step (1) | dground n-step (1) ] as MSE
-        # blocks, + contacts@t+n (10) as BCE logits. MSE dim = obs_dim + 2.
-        self._dyn_mse_dim = obs_dim + 2
+        # root lin vel (heading-local, terrain[:, 4:7]) joins the input AND the 1-step root block: the
+        # proprio "obs" group has no root translation channel at all (joints + ang vel + gravity), so
+        # without it f(s, a) cannot know the robot is moving INTO the step it is about to hit -- the
+        # single most terrain-predictive 1-step channel. (Adversarial review, confirmed spec drift.)
+        in_dim = obs_dim + 3 + act_dim
+        # targets: [ d(obs) 1-step (obs_dim) | d(root_height) 1-step (1) | d(root_vel_h) 1-step (3) |
+        # dground n-step (1) ] as MSE blocks, + contacts@t+n (10) as BCE logits. MSE dim = obs_dim + 5.
+        self._dyn_mse_dim = obs_dim + 5
         out_dim = self._dyn_mse_dim + 10
         self.dyn_baseline = nn.Sequential(
             nn.Linear(in_dim, 512),
@@ -196,19 +221,22 @@ class TerrainFbCpr(FbCpr):
             self.replay_buffer.capacity, _FUTURE_DIM, device=storage_dev
         )
 
-        # --- coning state
+        # --- coning state (skipped without an expert buffer: play/export construct with
+        # build_expert_buffer=False and never draw expert-rollout z)
         self._tile_family: torch.Tensor | None = None
-        fam_key = self.expert_buffer.motions.get("family") if self.expert_buffer is not None else None
-        if fam_key is None:
-            raise ValueError("TerrainFbCpr needs a 'family' key in the motion bundle (coning + softening).")
-        self._clip_family = fam_key[:, 0].long().to(self.device)
-        compat = torch.zeros(NUM_FAMILIES, len(self._clip_family), dtype=torch.bool, device=self.device)
-        for tile, clips in TRAIN_TILE_CLIP_FAMILIES.items():
-            for cf in clips:
-                compat[tile] |= self._clip_family == cf
-        self._compat = compat
-        self.expert_buffer.set_family_softening(self._family_alpha)
+        self._compat: torch.Tensor | None = None
         self._cone_stats: dict[str, float] = {}
+        if self.expert_buffer is not None:
+            fam_key = self.expert_buffer.motions.get("family")
+            if fam_key is None:
+                raise ValueError("TerrainFbCpr needs a 'family' key in the motion bundle (coning + softening).")
+            self._clip_family = fam_key[:, 0].long().to(self.device)
+            compat = torch.zeros(NUM_FAMILIES, len(self._clip_family), dtype=torch.bool, device=self.device)
+            for tile, clips in TRAIN_TILE_CLIP_FAMILIES.items():
+                for cf in clips:
+                    compat[tile] |= self._clip_family == cf
+            self._compat = compat
+            self.expert_buffer.set_family_softening(self._family_alpha)
 
     # ------------------------------------------------------------------ helpers
 
@@ -270,7 +298,7 @@ class TerrainFbCpr(FbCpr):
 
     def _expert_rollout_rows(self, num_rows: int) -> torch.Tensor | None:
         """Cone the expert-rollout clip draw on the CURRENT tile family (SEAM 4; §2.4)."""
-        if self._tile_family is None:
+        if self._tile_family is None or self._compat is None:
             return None
         assert self.expert_rollout_envs is not None
         fam = self._tile_family[self.expert_rollout_envs.to(self._tile_family.device)].to(self.device)
@@ -306,6 +334,15 @@ class TerrainFbCpr(FbCpr):
         ep_len = self._cur_episode_length.clone() if self._cur_episode_length is not None else None
         if ep_len is None or rows is None:
             return
+        # 🔴 a re-tenanted row must NOT inherit the previous occupant's target: the buffer wraps at
+        # ~capacity_per_env iterations (~5k of a 187k run), and rows whose back-fill never fires
+        # (timeout inside the window, ring cleared by a post-eval reset) would otherwise keep a
+        # FOREIGN [dground, contacts, valid=1] payload forever -- ~4% of "valid" targets, silently
+        # corrupting L_dyn while dyn_future_valid_frac reads healthy. (Adversarial review, confirmed.)
+        fresh = rows[rows >= 0]
+        if fresh.numel():
+            storage = self.replay_buffer.observations[_FUTURE_KEY]
+            storage[fresh.to(storage.device)] = 0.0
         self._ring.append((rows, ground_now.clone(), ep_len))
         if len(self._ring) < self.dyn_horizon:
             return
@@ -356,12 +393,15 @@ class TerrainFbCpr(FbCpr):
         next_obs_n = batch.next_observations["obs"]
         rh = batch.observations["state"][:, 0:1]
         next_rh = batch.next_observations["state"][:, 0:1]
+        vel = batch.observations["terrain"][:, 4:7]  # heading-local root lin vel, never normalized
+        next_vel = batch.next_observations["terrain"][:, 4:7]
         fut = batch.observations[_FUTURE_KEY]
         dground, contacts_fut, valid = fut[:, 0:1], fut[:, 1:11], fut[:, 11:12]
 
-        sa = torch.cat([obs_n, batch.actions], dim=-1)
-        # MSE targets: 1-step deltas (normalized units) + the n-step terrain channel (meters)
-        y_mse = torch.cat([next_obs_n - obs_n, next_rh - rh, dground], dim=-1)
+        sa = torch.cat([obs_n, vel, batch.actions], dim=-1)
+        # MSE targets: 1-step deltas (normalized units; vel raw m/s -- the running std re-scales) + the
+        # n-step terrain channel (meters)
+        y_mse = torch.cat([next_obs_n - obs_n, next_rh - rh, next_vel - vel, dground], dim=-1)
         self.dyn_target_std.update(y_mse)
         y_mse = self.dyn_target_std.scale(y_mse)
 
@@ -372,7 +412,7 @@ class TerrainFbCpr(FbCpr):
         d = self._dyn_mse_dim
         mse_mask = torch.ones_like(y_mse)
         mse_mask[:, d - 1 :] = valid  # dground column
-        obs_dim = d - 2
+        obs_dim = d - 5
 
         def blocks(err2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             proprio = err2[:, :obs_dim].mean()
@@ -429,15 +469,27 @@ class TerrainFbCpr(FbCpr):
             self.dyn_residual_optimizer.step()
 
             with torch.no_grad():
-                # information gain vs the baseline's own residual: 1 - ||r - g||^2 / ||r||^2
+                # information gain vs the baseline's own residual, 1 - ||r - g||^2 / ||r||^2, computed
+                # PER BLOCK under the valid mask: the flat mean is ~32:1 proprio-diluted and counts
+                # never-back-filled dground rows as zero-error, so a terrain-blind c could read as
+                # healthy (or a terrain-seeing one as dead). The TERRAIN gain is the F2 gauge.
+                # (Adversarial review, confirmed.)
                 r_scaled = self.dyn_residual_std.scale(r_target)
-                denom = (r_scaled**2).mean().clamp(min=1e-8)
-                gain = 1.0 - (r_scaled_err**2).mean() / denom
-                # null model: same gain with c ROLLED across the batch (correspondence destroyed).
-                c_roll = torch.roll(c.detach(), 1, dims=0)
+                c_roll = torch.roll(c.detach(), 1, dims=0)  # null model: correspondence destroyed
                 roll_pred = self.dyn_residual(sa, c_roll)[:, : self._dyn_mse_dim]
-                roll_err = r_scaled - self.dyn_residual_std.scale(roll_pred)
-                gain_roll = 1.0 - (roll_err**2).mean() / denom
+                roll_err2 = (r_scaled - self.dyn_residual_std.scale(roll_pred)) ** 2
+
+                def gains(cols: slice) -> tuple[torch.Tensor, torch.Tensor]:
+                    m = mse_mask[:, cols]
+                    denom = (r_scaled[:, cols] ** 2 * m).sum().clamp(min=1e-8)
+                    g = 1.0 - (r_scaled_err[:, cols] ** 2 * m).sum() / denom
+                    g_roll = 1.0 - (roll_err2[:, cols] * m).sum() / denom
+                    return g, g_roll
+
+                gain, gain_roll = gains(slice(None))
+                gain_p, _ = gains(slice(0, obs_dim))
+                gain_r, _ = gains(slice(obs_dim, d - 1))
+                gain_t, roll_t = gains(slice(d - 1, d))
                 enc_grad = (
                     torch.stack([p.grad.norm() for p in self.encoder.parameters() if p.grad is not None]).norm()
                     if any(p.grad is not None for p in self.encoder.parameters())
@@ -446,7 +498,11 @@ class TerrainFbCpr(FbCpr):
                 out.update({
                     "Encoder_Loss/residual": loss_res.detach(),
                     "Metrics/encoder_information_gain": gain.detach(),
+                    "Metrics/encoder_information_gain_proprio": gain_p.detach(),
+                    "Metrics/encoder_information_gain_root": gain_r.detach(),
+                    "Metrics/encoder_information_gain_terrain": gain_t.detach(),
                     "Metrics/encoder_shuffle_gain": gain_roll.detach(),
+                    "Metrics/encoder_shuffle_gain_terrain": roll_t.detach(),
                     "Train/encoder_grad_norm": enc_grad.detach(),
                     "Train/c_std": c.detach().std(dim=0).mean(),
                 })
@@ -460,6 +516,65 @@ class TerrainFbCpr(FbCpr):
             if mf == mf:
                 out["Train/z_terrain_match_frac"] = torch.tensor(mf)
         return out
+
+    def train_mode(self) -> None:
+        """Set train mode for the base models plus the terrain modules."""
+        super().train_mode()
+        self.encoder_norm.train()
+        self.dyn_baseline.train()
+        self.dyn_residual.train()
+
+    def eval_mode(self) -> None:
+        """Set eval mode; encoder_norm MUST switch to running stats here.
+
+        Base eval() calls this -- in train mode every eval batch would normalize with (meaningless,
+        batch-1-degenerate) batch statistics AND pollute the running EMA.
+        """
+        super().eval_mode()
+        self.encoder_norm.eval()
+        self.dyn_baseline.eval()
+        self.dyn_residual.eval()
+
+    # ------------------------------------------------------------------ policy / persistence
+
+    def get_policy(self) -> nn.Module:
+        """Inference policy whose encoder INCLUDES the output normalizer, using RUNNING stats.
+
+        Without this the deployed/played actor receives raw c although it only ever trained on
+        BatchNorm-normalized c -- and at deployment batch sizes train-mode batch statistics are
+        meaningless (batch-1 variance is zero). (Adversarial review, confirmed.)
+        """
+        from robot_rl.models.inference import EncoderInferencePolicy
+
+        return EncoderInferencePolicy(
+            _NormedEncoder(self.encoder, self.encoder_norm),
+            self.actor,
+            fuse_latent=True,
+            zero_latent=self.zero_context,
+        )
+
+    @staticmethod
+    def policy_state_keys() -> tuple[str, ...]:
+        """Return the slim-checkpoint keys: base set + the encoder output normalizer's running stats.
+
+        Checkpoint demotion (keep_full_checkpoints) strips everything else; without encoder_norm here
+        a demoted checkpoint would deploy an actor whose c is scaled by garbage.
+        """
+        return (*FbCpr.policy_state_keys(), "encoder_norm_state_dict")
+
+    def broadcast_parameters(self) -> None:
+        """Broadcast the base models plus the terrain modules.
+
+        F18: ranks otherwise start from different random inits for dyn_baseline/dyn_residual and
+        silently diverge forever (their grads are all-reduced, but grads correct nothing that
+        started different).
+        """
+        super().broadcast_parameters()
+        extra = [self.dyn_baseline.state_dict(), self.dyn_residual.state_dict(), self.encoder_norm.state_dict()]
+        torch.distributed.broadcast_object_list(extra, src=0)
+        self.dyn_baseline.load_state_dict(extra[0])
+        self.dyn_residual.load_state_dict(extra[1])
+        self.encoder_norm.load_state_dict(extra[2])
 
     # ------------------------------------------------------------------ persistence
 
