@@ -333,8 +333,9 @@ class FbCpr:
         # transition of the new episode instead.
         self.transition.dones = dones
 
-        # Record the transition
-        self.replay_buffer.add_transitions(self.transition)
+        # Record the transition; keep the storage rows for subclasses that back-fill per-row data
+        # later (the terrain dynamics target writes into row t when step t+n arrives)
+        self._last_added_rows = self.replay_buffer.add_transitions(self.transition)
         self.transition.clear()
 
         # Reset hidden states of all models

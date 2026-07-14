@@ -166,8 +166,14 @@ class ReplayBuffer:
         """Get the total number of transitions currently stored in the buffer."""
         return self.capacity if self._is_full else self._curr_idx
 
-    def add_transitions(self, transition: Transition) -> None:
-        """Add a transition to the buffer."""
+    def add_transitions(self, transition: Transition) -> torch.Tensor | None:
+        """Add a transition to the buffer.
+
+        Returns:
+            A ``(num_envs,)`` long tensor mapping each ENV to the storage row its transition landed in,
+            with ``-1`` for envs whose transition was dropped (or when nothing was stored). Callers that
+            back-fill per-row data later (the terrain dynamics target) key off these rows.
+        """
         # Drop transitions whose next_obs is a post-reset state (dones set), unless keep_terminal is set (SAC,
         # where next_obs is the true pre-reset obs). If dones is None, all are valid.
         if transition.dones is None or self.keep_terminal:
@@ -177,7 +183,7 @@ class ReplayBuffer:
         num_valid = len(valid_idxs)
         # Exit if no transitions are valid to store
         if num_valid == 0:
-            return
+            return None
         # Raise error if buffer is too small to store transitions
         if num_valid >= self.capacity:
             raise RuntimeError(
@@ -203,6 +209,9 @@ class ReplayBuffer:
         if self._curr_idx >= self.capacity:
             self._is_full = True
             self._curr_idx -= self.capacity
+        rows = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        rows[valid_idxs] = buf_idxs
+        return rows
 
     def sample_mini_batch(self, device: str | None = None) -> Batch:
         """Randomly sample a mini-batch from the replay buffer (with n-step aggregation when ``n_steps > 1``)."""
