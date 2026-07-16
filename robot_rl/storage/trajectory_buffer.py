@@ -121,10 +121,9 @@ class TrajectoryBuffer(ExpertBuffer):
     def set_family_softening(self, alpha: float, weight_clip: float = 32.0) -> None:
         """Weight each clip by ``n_f^(alpha-1)``, ``n_f`` = the clip count of its family.
 
-        ``alpha = 1`` is the natural corpus (box-dominated: 554 boxes vs 26 stairs). ``alpha = 0`` gives
-        every family equal mass, hammering the rare clips ~21x -- and it COMPOUNDS with the EMD priority,
-        which already favours exactly those hard stairs clips. Normalized to a median of 1 and clipped so
-        the product cannot run away.
+        ``alpha = 1`` keeps the natural corpus; ``alpha = 0`` gives every family equal total mass,
+        strongly upweighting rare clips -- and compounds with the EMD priority. Normalized to a median
+        of 1 and clipped.
 
         Args:
             alpha: Softening exponent; 0.5 (sqrt class-balance) is a sane starting point.

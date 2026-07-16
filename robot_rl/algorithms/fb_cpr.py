@@ -326,8 +326,7 @@ class FbCpr:
         # Terminated is all dones that are not time_outs (used to compute discount factor)
         self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
-        # The drop filter must see the dones from the step just taken -- the ones that make THIS
-        # transition's next_obs a post-reset state; staging the previous step's dones inverts the filter.
+        # the drop filter needs the dones of the step just taken (they mark THIS transition's next_obs as post-reset)
         self.transition.dones = dones
 
         # Record the transition; keep the storage rows for subclasses that back-fill per-row data
@@ -392,11 +391,9 @@ class FbCpr:
     def _auxiliary_losses(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
         """Extra losses to fold into the shared encoder step. No-op in the base; subclasses override.
 
-        Called from :meth:`update` after every consumer loss has accumulated encoder gradients and before
-        ``encoder_optimizer.step()``, so anything backwarded here rides the same step. Runs EAGER (like the
-        latent-spectrum block) -- do not put it inside a compiled region: several ``reduce-overhead`` regions
-        share one CUDA-graph pool, and a tensor crossing that boundary is silently overwritten, which would
-        look exactly like "the context is being ignored" rather than like a bug.
+        Runs after all consumer losses have accumulated encoder gradients, so anything backwarded here
+        rides the same encoder step. Must stay eager: the compiled reduce-overhead regions share one
+        CUDA-graph pool.
 
         Args:
             batch: The (normalized, z-relabeled) minibatch used by the consumer updates.

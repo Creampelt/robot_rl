@@ -55,7 +55,7 @@ class _RunningStd(nn.Module):
 
 
 class _BilinearResidualHead(nn.Module):
-    """``pred = W(s, a) @ c``: no additive (s, a)-only path to the output (F5).
+    """``pred = W(s, a) @ c``: no additive (s, a)-only path to the output.
 
     With ``c = 0`` the prediction is EXACTLY the baseline, nothing else can absorb the residual, and
     ``dL/dc = W^T r`` is nonzero whenever the residual is -- the posterior-collapse dead basin is
@@ -148,7 +148,7 @@ class TerrainFbCpr(FbCpr):
         self.encoder_norm = nn.BatchNorm1d(c_dim, momentum=0.01, affine=False).to(self.device)
 
         # --- the dynamics nets. f_base DELIBERATELY wider/deeper than the residual trunk: an under-capacity
-        # baseline leaves (s,a)-structure in the residual and information_gain measures g, not c (F5).
+        # baseline leaves (s,a)-structure in the residual and information_gain measures g, not c.
         obs_dim = int(self._norm_group_dim("obs"))
         act_dim = int(self.replay_buffer.actions.shape[-1])
         # heading-local root lin vel (terrain[:, 4:7]) joins the input AND the 1-step root block: the proprio
@@ -207,12 +207,8 @@ class TerrainFbCpr(FbCpr):
     def _zero_c_pathway(branch: nn.Module, c_dim: int) -> None:
         """Silence the trailing ``c_dim`` input channels of a fused branch at init (c_init_scale = 0).
 
-        Zeroes the c COLUMNS of the first projection and the c GAINS of any preceding layer norm. With
-        ResMLP's PRE-NORM blocks, exact c-deadness is impossible -- LayerNorm computes mean/std over the
-        whole [obs; z; c] input, so c still perturbs every channel's normalization -- but that leak is
-        weak and non-specific (c enters only through the mean/std of 785-dim batch statistics; verify the
-        realized c-vs-z output sensitivity in the training smoke). The property that matters survives: the
-        gradient into the zeroed columns is delta * c^T, nonzero, so the pathway can still GROW.
+        Pre-norm LayerNorm still leaks c weakly through the input mean/std, but the gradient into the
+        zeroed columns stays nonzero so the pathway can grow.
         """
         from robot_rl.modules.parallel import ParallelLinear
 
@@ -332,9 +328,8 @@ class TerrainFbCpr(FbCpr):
     def _context_args(self, norm_obs: TensorDict, detach: bool = False, zero: bool = False) -> tuple:
         """Consumer-facing c: normalized, corrupted, and ALWAYS detached (full consumer detachment).
 
-        L_dyn is the encoder's only teacher (Belief-FB's ablation; the consumer-gradient config
-        hits rank collapse). The dynamics loss does NOT come through here -- it calls
-        the encoder directly on clean obs, with gradients.
+        L_dyn is the encoder's only teacher (consumer gradients cause rank collapse); the dynamics loss
+        calls the encoder directly on clean obs, with gradients.
         """
         if self.encoder is None:
             return ()
@@ -428,7 +423,7 @@ class TerrainFbCpr(FbCpr):
 
             with torch.no_grad():
                 # info gain (1 - ||r - g||^2/||r||^2) PER BLOCK under the valid mask: the flat mean is
-                # ~32:1 proprio-diluted and hides a terrain-blind c. The TERRAIN gain is the F2 gauge.
+                # ~32:1 proprio-diluted and hides a terrain-blind c. The TERRAIN gain is the gauge that matters.
                 r_scaled = self.dyn_residual_std.scale(r_target)
                 c_roll = torch.roll(c.detach(), 1, dims=0)  # null model: correspondence destroyed
                 roll_pred = self.dyn_residual(sa, c_roll)[:, : self._dyn_mse_dim]
@@ -520,7 +515,7 @@ class TerrainFbCpr(FbCpr):
     def broadcast_parameters(self) -> None:
         """Broadcast the base models plus the terrain modules.
 
-        F18: ranks otherwise start from different random inits for dyn_baseline/dyn_residual and
+        Ranks otherwise start from different random inits for dyn_baseline/dyn_residual and
         silently diverge forever (their grads are all-reduced, but grads correct nothing that
         started different).
         """

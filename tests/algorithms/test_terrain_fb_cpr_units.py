@@ -19,7 +19,7 @@ from robot_rl.algorithms.terrain_fb_cpr import (
 
 
 class TestBilinearResidualHead:
-    """The F5 property: no additive (s, a)-only path to the output."""
+    """No additive (s, a)-only path to the output."""
 
     def test_c_zero_is_exactly_zero(self) -> None:
         """With c = 0 the residual must vanish EXACTLY, so the prediction IS the baseline."""

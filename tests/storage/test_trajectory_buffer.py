@@ -5,11 +5,8 @@
 
 """Tests for the TrajectoryBuffer's sampling weights, held-out split and caller-chosen rows.
 
-The failure these guard against is silent: ``eval()`` overwrites ``priorities`` wholesale every
-``eval_interval`` and renormalizes, so a family-softening or held-out weight baked into that tensor
-survives until the first eval and then disappears -- leaving priorities that are pure EMD difficulty,
-which preferentially hammer whatever the policy is worst at. The symptom looks like a mis-set alpha
-rather than like alpha having been erased.
+``eval()`` overwrites ``priorities`` wholesale, so softening/held-out weights must live in separate
+tensors composed via ``sample_weights``.
 """
 
 from __future__ import annotations
