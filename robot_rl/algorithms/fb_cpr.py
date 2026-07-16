@@ -326,11 +326,8 @@ class FbCpr:
         # Terminated is all dones that are not time_outs (used to compute discount factor)
         self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
-        # The buffer's drop filter must see the dones that make THIS transition's next_obs a post-reset
-        # state: the dones from the step we just took. act() used to stage the PREVIOUS step's dones here,
-        # which inverts the filter -- it KEPT the cross-reset pair it exists to drop (and on a time_out,
-        # next_terminated is 0, so that pair was bootstrapped) and DROPPED the first, perfectly valid
-        # transition of the new episode instead.
+        # The drop filter must see the dones from the step just taken -- the ones that make THIS
+        # transition's next_obs a post-reset state; staging the previous step's dones inverts the filter.
         self.transition.dones = dones
 
         # Record the transition; keep the storage rows for subclasses that back-fill per-row data
@@ -536,8 +533,7 @@ class FbCpr:
         actor_cargs = self._context_args(batch.observations, detach=self._detach_actor_context)
         actor_loss_dict, actor_extras = self._update_actor(batch, actor_cargs)
 
-        # Latent-spectrum regularizer on the CLEAN c (no corruption): per-dim variance hinge fights
-        # dimensional collapse, off-diagonal covariance decorrelates dims, L2 bounds magnitudes.
+        # Latent-spectrum regularizer on the CLEAN c (variance hinge, covariance decorrelation, L2).
         # Eager like every encoder forward; grads accumulate with the consumer losses below.
         encoder_reg_dict: dict[str, torch.Tensor] = {}
         if self.encoder_optimizer is not None and (
@@ -560,10 +556,8 @@ class FbCpr:
                 "encoder_l2_loss": l2_loss.detach(),
             }
 
-        # Subclass hook, deliberately OUTSIDE the coef guard above and BEFORE the encoder step below:
-        # every consumer loss has now accumulated its encoder gradients, and encoder_optimizer.step()
-        # has not fired, so an auxiliary encoder objective rides the SAME step (no second step, no
-        # doubled effective LR). No-op in the base.
+        # Subclass hook, deliberately outside the coef guard and BEFORE encoder_optimizer.step(): an
+        # auxiliary encoder objective rides the SAME step (no second step, no doubled LR). No-op in the base.
         aux_loss_dict = self._auxiliary_losses(batch)
 
         # One encoder step on the gradients accumulated from all consumer losses (critics + actor)
@@ -684,9 +678,8 @@ class FbCpr:
                 steps_done += 1
                 if max_steps is not None and steps_done >= max_steps:
                     break
-            # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
-            # Compare against frames 1..bucket_size-1 since actual_emd[:, t] is the pose after targeting frame t+1.
-            # Rows are masked to their un-padded length so hold-final-frame padding never enters the metric.
+            # priorities = 2^{2*emd}, emd clamped to [0.5, 2.0]; compare frames 1.. since actual_emd[:, t]
+            # targets frame t+1. Rows are masked to un-padded length so hold-final padding never enters.
             eval_emd = eval_obs["eval"][:, 1:].to(self.device)
             lengths = getattr(self.expert_buffer, "current_eval_motion_lengths", None)
             emds = torch.empty((mini_batch_size,), device=self.device)
@@ -901,10 +894,8 @@ class FbCpr:
             encoder = encoder_class(obs, cfg["obs_groups"], "encoder", c_dim, **encoder_model_cfg).to(device)
             print(f"Encoder Model: {encoder}")
 
-        # Initialize the policy. The successor measure is a JOINT function of task x terrain, so z and c
-        # enter as ONE input ([obs; z, c]) rather than as parallel branches that only meet in the trunk.
-        # With no encoder c_dim == 0 and every input_dims below is byte-identical to the pre-fusion build.
-        # NOTE the trailing 0 on the actor is a real bare-obs embedding branch, not an arg placeholder.
+        # z and c enter as ONE input [obs; z, c] (the successor measure is a JOINT function of task x terrain);
+        # with no encoder c_dim == 0 keeps dims byte-identical; the actor's trailing 0 is a real bare-obs branch.
         z_dim = cfg["algorithm"]["z_dim"]
         zc_dim = z_dim + c_dim
         actor: FuseModel = actor_class(

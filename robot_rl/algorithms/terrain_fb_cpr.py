@@ -164,13 +164,8 @@ class TerrainFbCpr(FbCpr):
         if self.encoder is None:
             raise ValueError("TerrainFbCpr requires an encoder (encoder_cfg).")
 
-        # zero-init the trailing c columns of every consumer's fused branch: the consumer starts as a
-        # pure [obs; z] tracker and grows a terrain pathway only where it pays (Perceptive-BFM's
-        # identity-init gating, recovered after the fusion foreclosed the per-branch version). Safe ONLY
-        # because consumers are fully detached from the encoder -- grad into W_c is delta * c^T, nonzero
-        # at W_c = 0. MUST run after super().__init__ (model.init_weights() re-randomizes the projection
-        # columns, so pre-init zeroing is dead code) and the EMA targets must then be re-synced, or they
-        # keep the un-zeroed init for ~1/tau updates. (Adversarial review, confirmed.)
+        # zero-init the consumers' c columns (identity-init gating; safe only with detached consumers).
+        # Must run AFTER super().__init__ (init_weights re-randomizes) and re-sync the EMA targets.
         if c_dim:
             for model in (self.actor, self.forward_map, self.disc_critic, self.aux_critic):
                 self._zero_c_pathway(model.embeddings[0], c_dim)
@@ -181,15 +176,12 @@ class TerrainFbCpr(FbCpr):
         # corruption knobs have drifting semantics and the rank probe is scale-sensitive
         self.encoder_norm = nn.BatchNorm1d(c_dim, momentum=0.01, affine=False).to(self.device)
 
-        # --- the dynamics nets. Baseline DELIBERATELY wider/deeper than the residual trunk: an
-        # under-capacity f_base leaves (s,a)-structure in the residual, W(s,a) eats it, and
-        # information_gain measures g's extra capacity instead of c's information (F5).
+        # --- the dynamics nets. f_base DELIBERATELY wider/deeper than the residual trunk: an under-capacity
+        # baseline leaves (s,a)-structure in the residual and information_gain measures g, not c (F5).
         obs_dim = int(self._norm_group_dim("obs"))
         act_dim = int(self.replay_buffer.actions.shape[-1])
-        # root lin vel (heading-local, terrain[:, 4:7]) joins the input AND the 1-step root block: the
-        # proprio "obs" group has no root translation channel at all (joints + ang vel + gravity), so
-        # without it f(s, a) cannot know the robot is moving INTO the step it is about to hit -- the
-        # single most terrain-predictive 1-step channel. (Adversarial review, confirmed spec drift.)
+        # heading-local root lin vel (terrain[:, 4:7]) joins the input AND the 1-step root block: the proprio
+        # obs group has no root translation channel, so f(s, a) cannot otherwise know it moves INTO a step.
         in_dim = obs_dim + 3 + act_dim
         # targets: [ d(obs) 1-step (obs_dim) | d(root_height) 1-step (1) | d(root_vel_h) 1-step (3) |
         # dground n-step (1) ] as MSE blocks, + contacts@t+n (10) as BCE logits. MSE dim = obs_dim + 5.
@@ -289,9 +281,8 @@ class TerrainFbCpr(FbCpr):
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Stash each env's CURRENT tile family, then run the base rollout step."""
-        # the CURRENT tile family, read BEFORE super().act() (which refreshes the expert-rollout z);
-        # extras arrive in process_env_step, too late. Coning on the SPAWN tile would mis-label ~half
-        # the assignments after the robot walks across 10 m tiles (F8).
+        # CURRENT tile family, read BEFORE super().act() refreshes the expert-rollout z (extras arrive in
+        # process_env_step, too late); the SPAWN tile would mis-label envs that walked onto another tile (F8).
         if "terrain" in obs:
             self._tile_family = obs["terrain"][:, 0].long().to(self.device)
         return super().act(obs)
@@ -334,11 +325,8 @@ class TerrainFbCpr(FbCpr):
         ep_len = self._cur_episode_length.clone() if self._cur_episode_length is not None else None
         if ep_len is None or rows is None:
             return
-        # 🔴 a re-tenanted row must NOT inherit the previous occupant's target: the buffer wraps at
-        # ~capacity_per_env iterations (~5k of a 187k run), and rows whose back-fill never fires
-        # (timeout inside the window, ring cleared by a post-eval reset) would otherwise keep a
-        # FOREIGN [dground, contacts, valid=1] payload forever -- ~4% of "valid" targets, silently
-        # corrupting L_dyn while dyn_future_valid_frac reads healthy. (Adversarial review, confirmed.)
+        # a re-tenanted row must NOT inherit the previous occupant's payload: the buffer wraps ~5k
+        # iters in, and stale [dground, contacts, valid=1] rows would silently corrupt L_dyn forever
         fresh = rows[rows >= 0]
         if fresh.numel():
             storage = self.replay_buffer.observations[_FUTURE_KEY]
@@ -450,9 +438,8 @@ class TerrainFbCpr(FbCpr):
             res_mse, res_logits = res_pred[:, : self._dyn_mse_dim], res_pred[:, self._dyn_mse_dim :]
 
             r_target = (y_mse - base_mse).detach()  # the residual the baseline leaves behind
-            # RE-standardize through the running std of the TARGET residual only: the residual shrinks
-            # exactly as fast as f_base improves, and without this the encoder's gradient decays by the
-            # same factor -- re-creating the dilution the residual exists to fix
+            # RE-standardize through the running std of the TARGET residual: it shrinks as f_base improves,
+            # and without this the encoder's gradient decays by the same factor -- re-creating the dilution.
             self.dyn_residual_std.update(r_target)
             r_scaled_err = self.dyn_residual_std.scale(r_target) - self.dyn_residual_std.scale(res_mse)
             res_p, res_r = blocks(r_scaled_err**2)
@@ -469,11 +456,8 @@ class TerrainFbCpr(FbCpr):
             self.dyn_residual_optimizer.step()
 
             with torch.no_grad():
-                # information gain vs the baseline's own residual, 1 - ||r - g||^2 / ||r||^2, computed
-                # PER BLOCK under the valid mask: the flat mean is ~32:1 proprio-diluted and counts
-                # never-back-filled dground rows as zero-error, so a terrain-blind c could read as
-                # healthy (or a terrain-seeing one as dead). The TERRAIN gain is the F2 gauge.
-                # (Adversarial review, confirmed.)
+                # info gain (1 - ||r - g||^2/||r||^2) PER BLOCK under the valid mask: the flat mean is
+                # ~32:1 proprio-diluted and hides a terrain-blind c. The TERRAIN gain is the F2 gauge.
                 r_scaled = self.dyn_residual_std.scale(r_target)
                 c_roll = torch.roll(c.detach(), 1, dims=0)  # null model: correspondence destroyed
                 roll_pred = self.dyn_residual(sa, c_roll)[:, : self._dyn_mse_dim]

@@ -87,9 +87,8 @@ class SAC:
         self.critic_2 = critic_2.to(device)
         self.critic_1_target = TargetNetwork(self.critic_1, tau).to(device)
         self.critic_2_target = TargetNetwork(self.critic_2, tau).to(device)
-        # Optional shared observation encoder: its latent is an extra input to actor and critics. Trained
-        # by the critic loss, plus the actor loss unless ``encoder_cfg.detach_actor_gradients`` (SAC-AE style).
-        # Target Q-values encode next_obs with the online encoder under no-grad.
+        # Optional shared obs encoder feeding actor + critics; trained by the critic loss, plus the actor
+        # loss unless detach_actor_gradients (SAC-AE). Target Q encodes next_obs with the online encoder, no-grad.
         self.encoder = encoder.to(device) if encoder is not None else None
 
         # Replay buffer
@@ -141,9 +140,8 @@ class SAC:
         else:
             self.encoder_optimizer = None
 
-        # Apply torch.compile to the forward+loss+backward hot paths (single unbroken graphs; optimizer
-        # steps stay eager -- a graph break at step() invalidates cudagraph outputs under reduce-overhead).
-        # "eager"/"none" sentinels disable it, since configclass cannot hydra-override a None default.
+        # compile the forward+loss+backward hot paths; optimizer steps stay eager (a graph break at step()
+        # invalidates cudagraph outputs). "eager"/"none" sentinels: configclass cannot hydra-override None.
         if compile_mode not in (None, "eager", "none"):
             self._critic_losses_and_backward = torch.compile(self._critic_losses_and_backward, mode=compile_mode)
             self._actor_loss_and_backward = torch.compile(self._actor_loss_and_backward, mode=compile_mode)

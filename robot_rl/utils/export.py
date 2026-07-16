@@ -141,9 +141,8 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     nsd = ckpt["obs_normalizer_state_dict"]
     obs = {group: torch.zeros(1, dim) for group, dim in _group_dims(nsd).items()}
     dims = {"z_dim": cfg["algorithm"]["z_dim"], "num_actions": _num_actions(ckpt["actor_state_dict"])}
-    # Optional context encoder: exports as encoder.pt (raw scan -> c, normalizer baked). The consumer
-    # models take c FUSED into their z slot, so the exported policy signature is (obs, [z; c]) -- the
-    # deployment consumer concatenates. policy.pt + encoder.pt = the HL-distillation contract.
+    # Optional context encoder exports as encoder.pt (raw scan -> c, normalizer baked); consumers take c
+    # FUSED into z, so the exported signature is (obs, [z; c]) -- policy.pt + encoder.pt = the distillation contract.
     encoder_cfg = cfg["algorithm"].get("encoder_cfg")
     if encoder_cfg is not None:
         dims["c_dim"] = int(encoder_cfg["output_dim"])
