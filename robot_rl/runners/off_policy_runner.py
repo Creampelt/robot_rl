@@ -28,11 +28,11 @@ class OffPolicyRunner:
         train_cfg: dict,
         log_dir: str | None = None,
         device: str = "cpu",
-        build_expert_buffer: bool = True,
+        inference: bool = False,
     ) -> None:
         """Construct the runner, algorithm, and logging stack.
 
-        ``build_expert_buffer=False`` skips loading the expert motion buffer (a large dataset only
+        ``inference=True`` skips loading the expert motion buffer (a large dataset only
         needed for training/eval), so play/visualization can construct the policy without the disk load.
         """
         self.cfg = train_cfg
@@ -45,12 +45,12 @@ class OffPolicyRunner:
         # Query observations from the environment for algorithm construction
         obs = self.env.get_observations()
 
-        # Create the algorithm. FbCpr's construct_algorithm takes build_expert_buffer; simpler off-policy
+        # Create the algorithm. FbCpr's construct_algorithm takes inference; simpler off-policy
         # algorithms (e.g. SAC) use the plain (obs, env, cfg, device) factory signature.
         alg_class: type[FbCpr] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
-        if "build_expert_buffer" in inspect.signature(alg_class.construct_algorithm).parameters:
+        if "inference" in inspect.signature(alg_class.construct_algorithm).parameters:
             self.alg = alg_class.construct_algorithm(
-                obs, self.env, self.cfg, self.device, build_expert_buffer=build_expert_buffer
+                obs, self.env, self.cfg, self.device, inference=inference
             )
         else:
             self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
