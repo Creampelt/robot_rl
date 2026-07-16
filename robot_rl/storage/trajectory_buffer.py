@@ -65,8 +65,9 @@ class TrajectoryBuffer(ExpertBuffer):
         self.device = device
         self.obs_groups = expert_obs_groups
 
-        # motions file should be obs tensordict with batch shape (num_motions, bucket_size)
-        self.motions = torch.load(motion_path, weights_only=False).to(device)
+        # motions: obs tensordict with batch shape (num_motions, bucket_size). map_location="cpu": GPU-converted
+        # bundles carry cuda:0 tensors and torch.load would materialize the multi-GB file on GPU0.
+        self.motions = torch.load(motion_path, weights_only=False, map_location="cpu").to(device)
         if len(self.motions.shape) != 2:
             raise ValueError(
                 "Expected motions batch size to be 2-dimensional (num_motions, bucket_size), but instead got shape "
@@ -80,11 +81,8 @@ class TrajectoryBuffer(ExpertBuffer):
         else:
             self.valid_lengths = torch.full((self.num_motions,), self.bucket_size, dtype=torch.long, device=device)
         self.priorities = torch.ones((self.num_motions,), device=device)
-        # Family softening (alpha) and the held-out split live in their OWN persistent tensors, never in
-        # `priorities`: eval() overwrites priorities wholesale every eval_interval and renormalizes, so
-        # anything baked in there survives until the first eval and then vanishes silently -- and in a
-        # plausible-looking direction (priorities become pure EMD difficulty). Both samplers compose them
-        # at draw time via `sample_weights`.
+        # Family softening and the held-out split live in their OWN tensors, never in `priorities`: eval()
+        # overwrites priorities wholesale, erasing anything baked in; samplers compose via `sample_weights`.
         self.base_weights = torch.ones((self.num_motions,), device=device)
         self.train_mask = torch.ones((self.num_motions,), device=device)
         if "heldout" in self.motions:
