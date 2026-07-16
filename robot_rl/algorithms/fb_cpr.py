@@ -838,11 +838,11 @@ class FbCpr:
 
     @staticmethod
     def construct_algorithm(
-        obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, build_expert_buffer: bool = True
+        obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool = False
     ) -> FbCpr:
         """Construct the FB-CPR algorithm.
 
-        Set ``build_expert_buffer=False`` to skip loading the expert motion ``TrajectoryBuffer`` (the
+        Set ``inference=True`` to skip loading the expert motion ``TrajectoryBuffer`` (the
         ~GB-scale motion dataset at ``cfg["algorithm"]["motion_path"]``). Only training/eval touch it,
         so play/visualization paths (which just need the actor + obs normalizer) can avoid the disk load.
         """
@@ -934,7 +934,7 @@ class FbCpr:
         )
         expert_buffer = (
             TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"])
-            if build_expert_buffer
+            if not inference
             else None
         )
         z_buffer = ZBuffer(cfg["algorithm"]["z_buffer_capacity"], z_dim, cfg["storage_device"])

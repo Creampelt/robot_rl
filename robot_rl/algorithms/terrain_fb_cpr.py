@@ -185,7 +185,7 @@ class TerrainFbCpr(FbCpr):
         )
 
         # --- coning state (skipped without an expert buffer: play/export construct with
-        # build_expert_buffer=False and never draw expert-rollout z)
+        # inference=True and never draw expert-rollout z)
         self._tile_family: torch.Tensor | None = None
         self._compat: torch.Tensor | None = None
         self._cone_stats: dict[str, float] = {}
