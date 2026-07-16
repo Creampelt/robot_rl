@@ -97,7 +97,7 @@ class FbCpr:
         device: str = "cpu",
         dtype: str = "float32",
         compile_mode: str | None = "reduce-overhead",
-        # Rollout-state parameters (owned here since act(obs) internalized z/seed-phase/clipping)
+        # Rollout-state parameters (z refresh, seed phase, action clipping live in act())
         clip_actions: float | None = None,
         num_seed_steps_per_env: int = 0,
         # Distributed training parameters
@@ -172,8 +172,8 @@ class FbCpr:
         self.expert_rollout_envs: torch.Tensor | None = None
         self.expert_rollout_z: torch.Tensor | None = None
 
-        # Rollout state (was runner-held): latent z, last dones, per-env episode step, and act count for
-        # the seed phase. Episode lengths are lazily allocated on the first act (num_envs known then).
+        # Rollout state: latent z, last dones, per-env episode step, and act count for the seed phase.
+        # Episode lengths are lazily allocated on the first act (num_envs known then).
         self.clip_actions = clip_actions
         self.num_seed_steps_per_env = num_seed_steps_per_env
         self._rollout_z: torch.Tensor | None = None
@@ -239,8 +239,8 @@ class FbCpr:
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data.
 
-        Owns the rollout state the runner used to thread through: the per-env latent ``z`` (refreshed from
-        episode progress), the previous step's dones, the seed-phase random sampling, and action clipping.
+        Owns the per-env rollout state: the latent ``z`` (refreshed from episode progress), previous dones,
+        seed-phase random sampling, and action clipping.
         """
         num_envs = obs.batch_size[0]
         if self._cur_episode_length is None:
@@ -676,7 +676,6 @@ class FbCpr:
             device=device,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
-            # rollout-state knobs owned by the algorithm since act(obs) internalized z/seed/clipping
             clip_actions=cfg.get("clip_actions"),
             num_seed_steps_per_env=cfg.get("num_seed_steps_per_env", 0),
         )

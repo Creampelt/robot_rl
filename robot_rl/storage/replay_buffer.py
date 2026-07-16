@@ -228,8 +228,7 @@ class ReplayBuffer:
     def _sample_nstep(self, device: str | None = None) -> Batch | None:
         """Sample a mini-batch with n-step returns over the per-env time sequence (keep_terminal layout).
 
-        Ports the validated logic from ``leggedrobotics/rsl_rl_sac`` onto our flat, row-aligned storage: a
-        stored index is ``row * num_envs + env``, so env ``e``'s consecutive steps are ``num_envs`` apart. Start
+        A stored index is ``row * num_envs + env``, so env ``e``'s consecutive steps are ``num_envs`` apart. Start
         indices whose n-step window would cross the circular write head are excluded; the discounted return is
         summed until the first episode end, and ``effective_n_steps`` records how many steps were aggregated.
         Returns ``None`` if there is not yet a full n-step window anywhere in the buffer.

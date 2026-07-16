@@ -37,10 +37,8 @@ class SAC:
         critic_2: FuseModel,
         replay_buffer: ReplayBuffer,
         num_actions: int,
-        replay_buffer_size: int = 1_000_000,
         num_learning_epochs: int = 1,
         num_mini_batches: int = 1,
-        mini_batch_size: int = 256,
         actor_learning_rate: float = 1e-3,
         critic_learning_rate: float = 1e-3,
         alpha_learning_rate: float = 1e-3,
@@ -88,24 +86,18 @@ class SAC:
 
         # Replay buffer
         self.replay_buffer = replay_buffer
-        self.replay_buffer_size = replay_buffer_size
         self.transition = ReplayBuffer.Transition()
 
         # Hyperparameters
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
-        self.mini_batch_size = mini_batch_size
         self.gamma = gamma
-        self.tau = tau
         self.auto_alpha = auto_alpha
         self.alpha = alpha
         self.actor_learning_rate = actor_learning_rate
-        self.critic_learning_rate = critic_learning_rate
-        self.alpha_learning_rate = alpha_learning_rate
         self.policy_frequency = policy_frequency
         self.n_steps = n_steps
         self.max_grad_norm = max_grad_norm
-        self.num_actions = num_actions
         self.update_step = 0
         self.intrinsic_rewards: torch.Tensor | None = None
 

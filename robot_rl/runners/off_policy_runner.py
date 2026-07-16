@@ -72,12 +72,9 @@ class OffPolicyRunner:
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
         """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save.
 
-        One external loop serves every off-policy algorithm; only the cadence differs, resolved from the
-        cfg up front. URL algorithms (FbCpr) collect one env step per iteration and run
-        ``num_agent_updates`` updates every ``num_steps_per_env`` iterations after the seed phase; simple
-        ones (SAC) collect ``num_steps_per_env`` env steps per iteration and update once per iteration
-        after ``start_training``. Algorithm-specific rollout state (latent z, seed-phase sampling) lives
-        inside ``alg.act``/``alg.process_env_step``, not here.
+        Cadence is cfg-resolved: URL algorithms step once per iteration and batch updates every
+        ``num_steps_per_env`` iterations; others collect ``num_steps_per_env`` steps and update each
+        iteration after ``start_training``.
         """
         is_url = hasattr(self.alg, "expert_buffer")
         start_it = self.current_learning_iteration

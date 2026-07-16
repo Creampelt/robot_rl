@@ -14,17 +14,9 @@ from typing import Any
 class TargetNetwork(nn.Module):
     """A slow-moving target copy of an online model, for bootstrapped value estimates.
 
-    Wraps an online ``nn.Module`` and maintains a deep-copied **target** whose parameters are detached
-    (``requires_grad=False``) and never updated by gradient descent -- only by Polyak soft update
-    (:meth:`update`) or a full copy (:meth:`hard_sync`). The update mechanics live here so no algorithm has
-    to re-implement target networks; both SAC (twin-Q) and FbCpr (forward/backward maps, critics) use it.
-
     The online model is held as a plain reference (not a registered submodule), so this wrapper's own
-    parameters/state are *only* the target's -- the algorithm optimizes the online model directly, and the
-    frozen target params are naturally excluded from any ``requires_grad``-filtered optimizer.
-
-    Evaluate the target by calling the wrapper (``target_net(obs)`` / ``target_net.target``); the forward
-    runs under ``torch.no_grad``.
+    parameters/state are *only* the target's -- the frozen target params are naturally excluded from any
+    ``requires_grad``-filtered optimizer. Calling the wrapper evaluates the target under ``torch.no_grad``.
     """
 
     def __init__(self, online: nn.Module, tau: float = 0.005) -> None:
@@ -57,8 +49,7 @@ class TargetNetwork(nn.Module):
         from robot_rl.utils import soft_update_params
 
         t = self.tau if tau is None else float(tau)
-        # Reuse the shared foreach mul+add so target updates are byte-identical to FbCpr's, which drives
-        # this wrapper too (a per-param lerp_ would round differently and break FbCpr parity).
+        # Shared foreach mul+add: a per-param lerp_ would round differently than soft_update_params.
         soft_update_params(tuple(self.online.parameters()), tuple(self.target.parameters()), t)
         # Buffers (e.g. normalization running stats) are not gradient-updated; hard-copy them each step.
         for tb, ob in zip(self.target.buffers(), self.online.buffers(), strict=True):
