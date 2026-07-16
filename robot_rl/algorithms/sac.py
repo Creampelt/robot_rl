@@ -13,7 +13,7 @@ from typing import Any
 
 from robot_rl.env import VecEnv
 from robot_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
-from robot_rl.models import FuseModel, MLPModel
+from robot_rl.models import EncoderInferencePolicy, FuseModel, MLPModel
 from robot_rl.modules import TargetNetwork
 from robot_rl.storage import ReplayBuffer
 from robot_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
@@ -412,8 +412,10 @@ class SAC:
         if self.rnd:
             self.rnd.eval()
 
-    def get_policy(self) -> MLPModel:
-        """Return the actor (policy) model."""
+    def get_policy(self) -> nn.Module:
+        """Return the inference policy, chaining the shared encoder into the actor when configured."""
+        if self.encoder is not None:
+            return EncoderInferencePolicy(self.encoder, self.actor)
         return self.actor
 
     def log_info(self) -> dict:

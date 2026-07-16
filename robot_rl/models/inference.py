@@ -66,7 +66,6 @@ class EncoderInferencePolicy(nn.Module):
         self,
         encoder: nn.Module,
         actor: MLPModel,
-        latent_first: bool = True,
         zero_latent: bool = False,
         fuse_latent: bool = False,
     ) -> None:
@@ -75,8 +74,6 @@ class EncoderInferencePolicy(nn.Module):
         Args:
             encoder: The shared observation encoder.
             actor: The actor model taking the encoder latent as an extra input.
-            latent_first: Whether the latent precedes the other extra inputs (PPO/SAC convention) or trails
-                them. Ignored when ``fuse_latent`` is set.
             zero_latent: Feed the actor a zero latent instead of the encoder output (blind-degradation eval).
             fuse_latent: CONCATENATE the latent onto the first extra input rather than passing it as its own
                 (FB-CPR: the actor takes one fused ``[z; c]`` input, so appending would be an arity error).
@@ -84,7 +81,6 @@ class EncoderInferencePolicy(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.actor = actor
-        self.latent_first = latent_first
         self.zero_latent = zero_latent
         self.fuse_latent = fuse_latent
 
@@ -114,11 +110,9 @@ class EncoderInferencePolicy(nn.Module):
         if self.zero_latent:
             latent = torch.zeros_like(latent)
         if self.fuse_latent:
-            # one fused input: [z; c]. zero_latent above already zeroes exactly the c slice.
-            inputs = (torch.cat([args[0], latent], dim=-1), *args[1:])
-        else:
-            inputs = (latent, *args) if self.latent_first else (*args, latent)
-        return self.actor(obs, *inputs, **kwargs)
+            # one fused input: [z; c]; zero_latent above already zeroes exactly the c slice
+            return self.actor(obs, torch.cat([args[0], latent], dim=-1), *args[1:], **kwargs)
+        return self.actor(obs, latent, *args, **kwargs)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         """Reset the actor state (the encoder is stateless)."""
