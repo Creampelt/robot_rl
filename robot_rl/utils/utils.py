@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import math
+import os
 import pkgutil
 import torch
 import torch.nn as nn
@@ -600,6 +601,43 @@ def soft_update_params(
     """
     torch._foreach_mul_(target_params, 1.0 - tau)
     torch._foreach_add_(target_params, params, alpha=tau)
+
+
+def demote_old_checkpoint(alg: Any, log_dir: str, it: int, keep: int | None, save_interval: int) -> int | None:
+    """Rewrite the checkpoint that just left the keep-full window as policy-only, to bound storage.
+
+    Demoted checkpoints keep only the keys from ``alg.policy_state_keys()`` -- still playable, eval'able,
+    and exportable, but not training-resumable. No-op unless the algorithm exposes ``policy_state_keys``.
+
+    Args:
+        alg: The algorithm (must provide ``policy_state_keys`` for demotion to occur).
+        log_dir: Directory holding the ``model_<it>.pt`` checkpoints.
+        it: The iteration just saved.
+        keep: How many recent checkpoints to keep full; ``None``/0 disables demotion.
+        save_interval: Iterations between checkpoints (to locate the one leaving the window).
+
+    Returns:
+        The demoted iteration (so the caller can re-register the slimmed file with its logger), or None.
+    """
+    if not keep or not hasattr(alg, "policy_state_keys"):
+        return None
+    demote_it = it - keep * save_interval
+    if demote_it < 0:
+        return None
+    path = os.path.join(log_dir, f"model_{demote_it}.pt")
+    if not os.path.exists(path):
+        return None
+    # mmap so only the small policy tensors are read; the large resume-only tensors are never materialized
+    ckpt = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    if ckpt.get("_policy_only"):
+        return None
+    keep_keys = set(alg.policy_state_keys()) | {"iter", "env_step", "infos"}
+    slim = {k: v for k, v in ckpt.items() if k in keep_keys}
+    slim["_policy_only"] = True
+    tmp_path = path + ".tmp"
+    torch.save(slim, tmp_path)
+    os.replace(tmp_path, path)
+    return demote_it
 
 
 class _BallNorm(nn.Module):
