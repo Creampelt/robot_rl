@@ -14,7 +14,7 @@ from datetime import timedelta
 from robot_rl.algorithms import PPO
 from robot_rl.env import VecEnv
 from robot_rl.models import MLPModel
-from robot_rl.utils import check_nan, resolve_callable
+from robot_rl.utils import check_nan, demote_old_checkpoint, resolve_callable
 from robot_rl.utils.logger import Logger
 
 
@@ -131,6 +131,11 @@ class OnPolicyRunner:
             # Save model
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+                demoted = demote_old_checkpoint(
+                    self.alg, self.logger.log_dir, it, self.cfg.get("keep_full_checkpoints"), self.cfg["save_interval"]
+                )
+                if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
+                    self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
 
         # Save the final model after training and stop the logging writer
         if self.logger.writer is not None:

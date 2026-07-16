@@ -596,6 +596,15 @@ class PPO:
                 env.train_mode()
         return []
 
+    @staticmethod
+    def policy_state_keys() -> tuple[str, ...]:
+        """State-dict keys sufficient to run/eval/export the policy (all other keys are resume-only).
+
+        A checkpoint keeping only these can be played, rendered, and exported, but NOT resumed for
+        training (critic/optimizer/RND absent). The memory/encoder keys only exist on those runs.
+        """
+        return ("actor_state_dict", "memory_state_dict", "encoder_state_dict")
+
     def save(self) -> dict:
         """Return a dict of all models for saving."""
         saved_dict = {
@@ -628,13 +637,14 @@ class PPO:
         # Load the specified models
         if load_cfg.get("actor"):
             self._raw_actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
-        if load_cfg.get("critic"):
+        # critic/optimizer are absent from a policy-only (slim) checkpoint -- skip rather than KeyError
+        if load_cfg.get("critic") and "critic_state_dict" in loaded_dict:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("memory") and self.memory is not None and "memory_state_dict" in loaded_dict:
             self._raw_memory.load_state_dict(loaded_dict["memory_state_dict"], strict=strict)
         if self.encoder is not None and "encoder_state_dict" in loaded_dict:
             self._raw_encoder.load_state_dict(loaded_dict["encoder_state_dict"], strict=strict)
-        if load_cfg.get("optimizer"):
+        if load_cfg.get("optimizer") and "optimizer_state_dict" in loaded_dict:
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
