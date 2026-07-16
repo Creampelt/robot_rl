@@ -1,36 +1,7 @@
-"""Terrain-conditioned FB-CPR (terrain-bfm v3).
+"""Terrain-conditioned FB-CPR: encoder residual-dynamics loss + terrain-conditioned expert-z sampling ("coning").
 
-Adds a residual dynamics objective for the context encoder and terrain-conditioned expert-z
-sampling ("coning").
-
-Everything here plugs into seams the base class already exposes -- no compiled math is copied:
-
-- :meth:`_auxiliary_losses` (SEAM 3) carries the encoder's dynamics loss, riding the SAME encoder
-  optimizer step as the consumer gradients (which are fully detached here, so L_dyn is the encoder's
-  ONLY teacher -- Belief-FB's better configuration; v2 ran their inferior one and hit the predicted
-  rank collapse 35.6 -> 2).
-- :meth:`_expert_rollout_rows` (SEAM 4) draws the expert-rollout clip from the family of the tile each
-  env is CURRENTLY standing on, with probability ``cone_p`` annealed from 0 (B is a random projection
-  at init, so early coning only costs (s, z) coverage). Random z stays uniform -- the uniform branch IS
-  the off-diagonal coverage that keeps "box-jump with no box" trained.
-
-THE SPLIT HORIZON (F2, settled from measurement). The terrain-determined channel is
-``Delta(ground under root)``; it is piecewise-constant between footfalls, so over one env step it is
-EXACTLY ZERO in 98.4% of frames and the encoder would learn "what is under my feet now" (~rank 2-4).
-At n = 20 (0.40 s, one swing at the measured 0.90 s footfall period) the target says something on ~19%
-of frames -- a 12x gradient -- while ``n * v = 0.4 m`` stays inside the 0.8 m scan with 2x margin.
-Only the TERRAIN block looks ahead; the proprio block stays at n = 1, because the residual's premise
-(``E[r | s, a] ~ 0``) needs a GOOD (s, a)-predictor and the full state 0.4 s out is near-unpredictable
--- a bad baseline fills the residual with (s, a)-noise, g absorbs it, and information_gain becomes a
-lie (F5).
-
-Implemented as a STAGING RING over replay-buffer rows, never via ``_sample_nstep``: flipping
-``n_steps`` on the shared buffer would silently hand FB / both critics / D n-step TD targets. The env's
-``terrain`` obs key (invisible to every model) carries ``[family, difficulty, ground_z, root_z,
-root_lin_vel_h (3)]``; when
-step ``t + n`` arrives, row ``t`` gets a ``future_terrain`` key ``[dground(1), contacts_t+n(10),
-valid(1)]`` written in place. Rows whose episode resets inside the window keep ``valid = 0`` and are
-masked out of the loss -- nothing else in the buffer is touched.
+Data contract: the env's ``terrain`` obs key carries ``[family, difficulty, ground_z, root_z,
+root_lin_vel_h (3)]``; replay rows gain an in-place ``future_terrain`` key ``[dground(1), contacts(10), valid(1)]``.
 """
 
 from __future__ import annotations
@@ -124,7 +95,7 @@ class _NormedEncoder(nn.Module):
 
 
 class TerrainFbCpr(FbCpr):
-    """FB-CPR + the v3 terrain pieces: encoder dynamics objective, coning, family softening."""
+    """FB-CPR + the terrain pieces: encoder dynamics objective, coning, family softening."""
 
     def __init__(
         self,
@@ -142,7 +113,7 @@ class TerrainFbCpr(FbCpr):
         family_alpha: float = 0.5,
         **kwargs: Any,
     ) -> None:
-        """See the module docstring; every extra kwarg is documented in the v3 §5 HP table."""
+        """See the module docstring; the extra kwargs cover the dynamics objective, coning, and family softening."""
         self.dyn_horizon = int(dyn_horizon)
         self._dyn_cfg = dict(
             baseline_lr=dyn_baseline_lr,
@@ -282,13 +253,13 @@ class TerrainFbCpr(FbCpr):
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Stash each env's CURRENT tile family, then run the base rollout step."""
         # CURRENT tile family, read BEFORE super().act() refreshes the expert-rollout z (extras arrive in
-        # process_env_step, too late); the SPAWN tile would mis-label envs that walked onto another tile (F8).
+        # process_env_step, too late); the SPAWN tile would mis-label envs that walked onto another tile.
         if "terrain" in obs:
             self._tile_family = obs["terrain"][:, 0].long().to(self.device)
         return super().act(obs)
 
     def _expert_rollout_rows(self, num_rows: int) -> torch.Tensor | None:
-        """Cone the expert-rollout clip draw on the CURRENT tile family (SEAM 4; §2.4)."""
+        """Cone the expert-rollout clip draw on the CURRENT tile family."""
         if self._tile_family is None or self._compat is None:
             return None
         assert self.expert_rollout_envs is not None
@@ -361,8 +332,8 @@ class TerrainFbCpr(FbCpr):
     def _context_args(self, norm_obs: TensorDict, detach: bool = False, zero: bool = False) -> tuple:
         """Consumer-facing c: normalized, corrupted, and ALWAYS detached (full consumer detachment).
 
-        L_dyn is the encoder's only teacher (Belief-FB's ablation; v2 ran the consumer-gradient config
-        and hit the predicted rank collapse). The dynamics loss does NOT come through here -- it calls
+        L_dyn is the encoder's only teacher (Belief-FB's ablation; the consumer-gradient config
+        hits rank collapse). The dynamics loss does NOT come through here -- it calls
         the encoder directly on clean obs, with gradients.
         """
         if self.encoder is None:
@@ -372,9 +343,9 @@ class TerrainFbCpr(FbCpr):
         return (c.detach(),)
 
     def _auxiliary_losses(self, batch: ReplayBuffer.Batch) -> dict[str, torch.Tensor]:
-        """Compute the residual dynamics loss, eager, riding the shared encoder step (SEAM 3).
+        """Compute the residual dynamics loss, eager, riding the shared encoder step.
 
-        Entirely eager and self-contained (the F12 rule: a tensor crossing a CUDA-graph pool boundary
+        Entirely eager and self-contained (a tensor crossing a CUDA-graph pool boundary
         is silently overwritten, which reads exactly like "c is ignored").
         """
         obs_n = batch.observations["obs"]
@@ -526,7 +497,7 @@ class TerrainFbCpr(FbCpr):
 
         Without this the deployed/played actor receives raw c although it only ever trained on
         BatchNorm-normalized c -- and at deployment batch sizes train-mode batch statistics are
-        meaningless (batch-1 variance is zero). (Adversarial review, confirmed.)
+        meaningless (batch-1 variance is zero).
         """
         from robot_rl.models.inference import EncoderInferencePolicy
 

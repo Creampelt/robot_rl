@@ -5,7 +5,7 @@
 
 """Tests for the FuseModel, and for the FB-CPR [z; c] fusion contract built on it.
 
-The fusion (terrain-bfm v3 SEAM 1) passes ``cat([z, c])`` as ONE input rather than giving c its own
+The fusion passes ``cat([z, c])`` as ONE input rather than giving c its own
 parallel embedding branch, because the successor measure is a joint function of task x terrain. The
 tests that matter here are the two that would fail silently otherwise: the branch/arity contract, and
 that an ENCODER-LESS build is unchanged by the fusion.
@@ -82,7 +82,7 @@ class TestBranchContract:
 
 
 class TestEncoderlessBuildIsUnchanged:
-    """The v3 gate: with no encoder, c_dim == 0 and the build must be IDENTICAL to pre-fusion."""
+    """The regression gate: with no encoder, c_dim == 0 and the build must be IDENTICAL to pre-fusion."""
 
     @pytest.mark.parametrize(
         ("pre_fusion", "post_fusion"),

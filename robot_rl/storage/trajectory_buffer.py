@@ -127,7 +127,7 @@ class TrajectoryBuffer(ExpertBuffer):
         the product cannot run away.
 
         Args:
-            alpha: Softening exponent; 0.5 (sqrt class-balance) is the v3 starting point.
+            alpha: Softening exponent; 0.5 (sqrt class-balance) is a sane starting point.
             weight_clip: Max weight relative to the median.
         """
         if "family" not in self.motions:
@@ -147,10 +147,8 @@ class TrajectoryBuffer(ExpertBuffer):
     ) -> tuple[TensorDict, TensorDict]:
         """Sample current and next expert observations, weighted by :attr:`sample_weights`.
 
-        When ``seq_length > 1``, samples are returned as ``batch_size // seq_length`` consecutive windows, each of
-        length ``seq_length``, drawn from a single motion starting at a random frame. The flat output is ordered so
-        that reshaping ``(batch_size, ...) -> (num_slices, seq_length, ...)`` recovers the windows row-wise. With
-        ``seq_length = 1`` behavior is equivalent to iid transition sampling.
+        With ``seq_length > 1`` the flat output is ``batch_size // seq_length`` consecutive single-motion
+        windows, ordered so reshaping to ``(num_slices, seq_length, ...)`` recovers them row-wise.
 
         Args:
             batch_size: The batch size to sample. Must be divisible by ``seq_length``.

@@ -604,27 +604,16 @@ class FbCpr:
         update_priorities: bool = True,
         **kwargs: Any,
     ) -> list[dict[str, torch.Tensor]]:
-        r"""Evaluate motions and update priorities in expert buffer.
-
-        Priorities are updated according to:
-
-        .. math::
-
-            2^\{4 * \min(2, \max(0.5, x))}
-
-        where x is the Earth Mover's Distance between the actual and expert ``eval`` obs group per trajectory.
+        r"""Evaluate the expert motions and update expert-buffer priorities from the per-trajectory EMD.
 
         Args:
             env: Vectorized environment to replay the expert motions in.
-            max_steps: When provided, ``env.step`` is called at most this many times across all motion
-                mini-batches and the loop breaks early -- intended for the video logger, which only needs a
-                bounded-length clip rather than the full priorities update. ``None`` runs every mini-batch.
-            zero_context: Force ``c = 0`` for this pass (blind-degradation canary); the returned metric is
-                keyed ``emd_zero_context`` so it logs alongside the perceptive ``emd``.
-            update_priorities: When False, leave the expert-buffer priorities untouched -- required for
-                diagnostic second passes so they don't clobber the perceptive pass's priorities.
-            **kwargs: Extra keyword eval arguments (e.g. ``stochastic``, ``action_repeat``) are accepted and
-                ignored, so this method tolerates a uniform eval call signature.
+            max_steps: Cap on total ``env.step`` calls across mini-batches (breaks early; for bounded
+                video clips). ``None`` runs every mini-batch.
+            zero_context: Force ``c = 0`` for this pass; the returned metric is keyed ``emd_zero_context``.
+            update_priorities: When False, leave the expert-buffer priorities untouched (required for
+                diagnostic second passes).
+            **kwargs: Extra eval arguments (e.g. ``stochastic``, ``action_repeat``) are accepted and ignored.
 
         Returns:
             A list of per-batch info dicts collected over the evaluated motion mini-batches.

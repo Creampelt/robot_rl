@@ -52,8 +52,8 @@ class FuseModel(MLPModel):
             last_activation: Activation function of the model output.
             obs_normalization: Whether to normalize the observations before feeding them to the model.
             normalize_first_layer: Whether to normalize the output of the first layer with LayerNorm.
-            distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
-                stochastic values sampled from the distribution.
+            distribution_cfg: Configuration for the output distribution; if provided, the model can output
+                stochastic samples.
         """
         nn.Module.__init__(self)
 
@@ -251,10 +251,9 @@ class ResidualFuseModel(FuseModel):
             first_activation: Activation function of the first layer of the model (no-op for residual model).
             last_activation: Activation function of the model output.
             obs_normalization: Whether to normalize the observations before feeding them to the model.
-            normalize_first_layer: Whether to normalize the output of the first layer with LayerNorm (no-op for
-                residual model).
-            distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
-                stochastic values sampled from the distribution.
+            normalize_first_layer: Whether to normalize the first layer's output with LayerNorm (no-op here).
+            distribution_cfg: Configuration for the output distribution; if provided, the model can output
+                stochastic samples.
         """
         # We redefine init here to change defaults (e.g. default activation is Mish for residual networks)
         super().__init__(

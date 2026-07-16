@@ -161,7 +161,7 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
         other_dims = tuple(dims[k] for k in other_spec)
         if encoder_cfg is not None and name in _FBCPR_CONTEXT_CONSUMERS:
             # c is fused INTO the z slot (slot 0), not appended as its own branch -- must mirror
-            # construct_algorithm exactly or the strict load below fails on every v3 checkpoint
+            # construct_algorithm exactly or the strict load below fails on every encoder checkpoint
             other_dims = (other_dims[0] + dims["c_dim"], *other_dims[1:])
         bn = _load_bn(nsd, cfg["obs_groups"][obs_set])
         if name == "policy":
