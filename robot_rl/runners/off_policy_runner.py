@@ -209,8 +209,7 @@ class OffPolicyRunner:
 
         Only the last ``keep_full_checkpoints`` checkpoints stay fully training-resumable; older ones
         are rewritten as slim (actor/backward/normalizer only) — still playable/eval'able/exportable,
-        but not resumable — to bound checkpoint storage. The overwrite is atomic and re-uploaded so the
-        external logger's live-sync (e.g. W&B) replaces the full copy with the slim one.
+        but not resumable — to bound checkpoint storage.
         """
         keep = self.cfg.get("keep_full_checkpoints")
         if not keep or not hasattr(self.alg, "policy_state_keys"):
@@ -305,10 +304,8 @@ class OffPolicyRunner:
             load_cfg (dict | None): Optional dictionary that defines what models and states to load. If None, all
                 models and states are loaded.
             strict (bool): Whether state_dict loading should be strict.
-            map_location (str | None): Device mapping for loading the model. Defaults to the runner's
-                device -- torch.load's own default restores tensors to the device they were SAVED on
-                (cuda:0), which made every cuda:1 video-recorder pass park ~7 GB of optimizer/model
-                state on the trainer's GPU and thrash it against the VRAM ceiling.
+            map_location (str | None): Device mapping for the load; defaults to the runner's device
+                (torch.load's own default restores to the SAVED device).
         """
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location or self.device)
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)

@@ -167,9 +167,8 @@ class OnPolicyRunner:
             load_cfg (dict | None): Optional dictionary that defines what models and states to load. If None, all
                 models and states are loaded.
             strict (bool): Whether state_dict loading should be strict.
-            map_location (str | None): Device mapping for loading the model. Defaults to the runner's
-                device (torch.load's own default restores to the SAVED device -- a cross-GPU reader
-                like the video recorder would otherwise allocate on the trainer's GPU).
+            map_location (str | None): Device mapping for the load; defaults to the runner's device
+                (torch.load's own default restores to the SAVED device).
         """
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location or self.device)
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)

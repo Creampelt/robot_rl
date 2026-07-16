@@ -169,12 +169,7 @@ class TestReplayBuffer:
 
 
 class TestPostResetTransitionIsDropped:
-    """The drop filter keys on the dones of the step that PRODUCED next_obs, not the previous step's.
-
-    With a stale (previous-step) dones the filter inverts: the cross-reset pair (s_t -> post-reset s)
-    is KEPT -- and on a time_out its next_terminated is 0, so it is bootstrapped -- while the first,
-    perfectly valid transition of the new episode is dropped instead. Regression test for that.
-    """
+    """Drop filter keys on the dones of the step that PRODUCED next_obs, not the previous step's (regression test)."""
 
     def test_only_the_cross_reset_pair_is_dropped(self) -> None:
         """Env 0 ends its episode at step 1; exactly that transition must not be stored."""

@@ -274,11 +274,7 @@ class FbCpr:
         # Terminated is all dones that are not time_outs
         self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
-        # The buffer's drop filter must see the dones that make THIS transition's next_obs a post-reset
-        # state: the dones from the step we just took. act() used to stage the PREVIOUS step's dones here,
-        # which inverts the filter -- it KEPT the cross-reset pair it exists to drop (and on a time_out,
-        # next_terminated is 0, so that pair was bootstrapped) and DROPPED the first, perfectly valid
-        # transition of the new episode instead.
+        # the drop filter needs the dones of the step just taken (they mark THIS transition's next_obs as post-reset)
         self.transition.dones = dones
 
         # Record the transition
@@ -526,8 +522,7 @@ class FbCpr:
         """State-dict keys sufficient to run/eval/export the policy (all other keys are resume-only).
 
         A checkpoint keeping only these can be played, video-rendered, and exported, but NOT resumed
-        for training (critics/optimizers/buffers are absent). Used by the runner to demote old
-        checkpoints to a policy-only slim form.
+        for training (critics/optimizers/buffers are absent).
         """
         return ("actor_state_dict", "backward_map_state_dict", "obs_normalizer_state_dict")
 
