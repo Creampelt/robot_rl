@@ -197,12 +197,12 @@ class SAC:
             rewards_b = batch.rewards.view(-1)
             not_terminated = 1.0 - batch.next_terminated.view(-1).float()
 
-            # 1) Critic update -- bootstrapped target with entropy and (n-step) discount.
+            # Critic update -- bootstrapped target with entropy and n-step discount.
             critic_1_loss, critic_2_loss = self._update_critics(
                 batch, obs_b, next_obs_b, actions_b, rewards_b, not_terminated
             )
 
-            # 2) Alpha + 3) actor (delayed by policy_frequency).
+            # Alpha and actor updates, delayed by policy_frequency.
             new_actions, logp = self.actor.act_and_log_prob(obs_b)
 
             if self.auto_alpha:
@@ -225,7 +225,7 @@ class SAC:
                 mean_actor_loss += actor_loss.item()
                 num_actor_updates += 1
 
-            # 4) Soft-update the target critics.
+            # Soft-update the target critics.
             self.critic_1_target.update()
             self.critic_2_target.update()
 
