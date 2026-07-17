@@ -1031,7 +1031,7 @@ class FbCpr:
         return z
 
     def _soft_update_targets(self) -> None:
-        """Update params of TD targets from main network params (tau baked into each TargetNetwork)."""
+        """Update params of TD targets from main network params."""
         self.target_forward_map.update()
         self.target_backward_map.update()
         self.target_disc_critic.update()
