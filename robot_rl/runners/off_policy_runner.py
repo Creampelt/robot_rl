@@ -10,7 +10,7 @@ from typing import Any
 from robot_rl.algorithms import FbCpr
 from robot_rl.env import URLVecEnv
 from robot_rl.models import MLPModel
-from robot_rl.utils import check_nan, resolve_callable
+from robot_rl.utils import check_nan, demote_old_checkpoint, resolve_callable
 from robot_rl.utils.export import bake_live_normalizer, save_jit, save_onnx
 from robot_rl.utils.logger import Logger
 
@@ -194,6 +194,15 @@ class OffPolicyRunner:
                 # Save model
                 if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
                     self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+                    demoted = demote_old_checkpoint(
+                        self.alg,
+                        self.logger.log_dir,
+                        it,
+                        self.cfg.get("keep_full_checkpoints"),
+                        self.cfg["save_interval"],
+                    )
+                    if demoted is not None:  # re-upload so the logger's live-sync replaces the full remote copy
+                        self.logger.save_model(os.path.join(self.logger.log_dir, f"model_{demoted}.pt"), demoted)
 
                 if prof is not None:
                     prof.step()
@@ -274,9 +283,10 @@ class OffPolicyRunner:
             load_cfg (dict | None): Optional dictionary that defines what models and states to load. If None, all
                 models and states are loaded.
             strict (bool): Whether state_dict loading should be strict.
-            map_location (str | None): Device mapping for loading the model.
+            map_location (str | None): Device mapping for the load; defaults to the runner's device
+                (torch.load's own default restores to the SAVED device).
         """
-        loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
+        loaded_dict = torch.load(path, weights_only=False, map_location=map_location or self.device)
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]

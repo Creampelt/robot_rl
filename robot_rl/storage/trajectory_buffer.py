@@ -33,8 +33,8 @@ class TrajectoryBuffer(ExpertBuffer):
         self.device = device
         self.obs_groups = expert_obs_groups
 
-        # motions file should be obs tensordict with batch shape (num_motions, bucket_size)
-        self.motions = torch.load(motion_path, weights_only=False).to(device)
+        # motions: obs tensordict with batch shape (num_motions, bucket_size).
+        self.motions = torch.load(motion_path, weights_only=False, map_location="cpu").to(device)
         if len(self.motions.shape) != 2:
             raise ValueError(
                 "Expected motions batch size to be 2-dimensional (num_motions, bucket_size), but instead got shape "

@@ -175,7 +175,6 @@ class FbCpr:
         self.clip_actions = clip_actions
         self.num_seed_steps_per_env = num_seed_steps_per_env
         self._rollout_z: torch.Tensor | None = None
-        self._last_dones: torch.Tensor | None = None
         self._cur_episode_length: torch.Tensor | None = None
         self._act_steps = 0
 
@@ -256,10 +255,8 @@ class FbCpr:
         if random_sample:
             clip_actions = 1.0 if self.clip_actions is None else self.clip_actions
             self.transition.actions.uniform_(-clip_actions, clip_actions).detach()
-        # record obs and dones before env.step()
+        # record obs before env.step(); dones is attached in process_env_step, once it is known
         self.transition.observations = obs
-        # dones is None if this is the first step
-        self.transition.dones = self._last_dones
         self.transition.context = z
         return self.transition.actions  # type: ignore
 
@@ -277,6 +274,8 @@ class FbCpr:
         # Terminated is all dones that are not time_outs
         self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
+        # the drop filter needs the dones of the step just taken (they mark THIS transition's next_obs as post-reset)
+        self.transition.dones = dones
 
         # Record the transition
         self.replay_buffer.add_transitions(self.transition)
@@ -286,17 +285,15 @@ class FbCpr:
         for model in self.models:
             model.reset(dones)
 
-        # Advance the rollout state consumed by the next act(): episode step counters and last dones
+        # Advance the rollout state consumed by the next act(): episode step counters
         if self._cur_episode_length is not None:
             self._cur_episode_length += 1
             self._cur_episode_length[(dones > 0).nonzero(as_tuple=False)] = 0
-        self._last_dones = dones
 
     def reset_rollout_state(self) -> None:
         """Reset the per-env rollout bookkeeping after an external env reset (e.g. post-eval); z is kept."""
         if self._cur_episode_length is not None:
             self._cur_episode_length[:] = 0
-        self._last_dones = None
 
     def compute_gammas(self) -> None:
         """Compute gamma values from stored transitions."""
@@ -520,8 +517,21 @@ class FbCpr:
         }
         return saved_dict
 
+    @staticmethod
+    def policy_state_keys() -> tuple[str, ...]:
+        """State-dict keys sufficient to run/eval/export the policy (all other keys are resume-only).
+
+        A checkpoint keeping only these can be played, video-rendered, and exported, but NOT resumed
+        for training (critics/optimizers/buffers are absent).
+        """
+        return ("actor_state_dict", "backward_map_state_dict", "obs_normalizer_state_dict")
+
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """Load specified models from a saved dict."""
+        """Load specified models from a saved dict.
+
+        Missing keys are skipped, so a policy-only (slim) checkpoint loads its actor/backward/normalizer
+        and leaves the resume-only nets at their constructed init (fine for play/eval/export).
+        """
         # If no load_cfg is provided, load all models and states
         if load_cfg is None:
             load_cfg = {
@@ -535,17 +545,29 @@ class FbCpr:
                 "iteration": True,
             }
 
-        # Load the specified models
+        # Warn loudly if a resume was requested but this is a policy-only checkpoint (training state absent)
+        wants_resume = any(load_cfg.get(k) for k in ("critic", "optimizer", "buffer"))
+        if wants_resume and "forward_map_state_dict" not in loaded_dict:
+            print(
+                "[WARNING] FbCpr.load: policy-only (slim) checkpoint — critics/optimizers/buffers were NOT"
+                " restored; this checkpoint is playable/exportable but not training-resumable."
+            )
+
+        def _load(module: torch.nn.Module, key: str) -> None:
+            if key in loaded_dict:
+                module.load_state_dict(loaded_dict[key], strict=strict)
+
+        # Load the specified models (each guarded so slim checkpoints skip absent keys)
         if load_cfg.get("actor"):
-            self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+            _load(self.actor, "actor_state_dict")
         if load_cfg.get("backward"):
-            self.backward_map.load_state_dict(loaded_dict["backward_map_state_dict"], strict=strict)
+            _load(self.backward_map, "backward_map_state_dict")
         if load_cfg.get("critic"):
-            self.forward_map.load_state_dict(loaded_dict["forward_map_state_dict"], strict=strict)
-            self.disc_critic.load_state_dict(loaded_dict["disc_critic_state_dict"], strict=strict)
-            self.aux_critic.load_state_dict(loaded_dict["aux_critic_state_dict"], strict=strict)
+            _load(self.forward_map, "forward_map_state_dict")
+            _load(self.disc_critic, "disc_critic_state_dict")
+            _load(self.aux_critic, "aux_critic_state_dict")
         if load_cfg.get("discriminator"):
-            self.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"], strict=strict)
+            _load(self.discriminator, "discriminator_state_dict")
         if load_cfg.get("target"):
             for online, target, target_key in (
                 (self.forward_map, self.target_forward_map, "target_forward_map_state_dict"),
@@ -554,18 +576,23 @@ class FbCpr:
                 (self.aux_critic, self.target_aux_critic, "target_aux_critic_state_dict"),
             ):
                 target.target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
-        if "obs_normalizer_state_dict" in loaded_dict:
-            self.obs_normalizer.load_state_dict(loaded_dict["obs_normalizer_state_dict"], strict=strict)
+        _load(self.obs_normalizer, "obs_normalizer_state_dict")
         if load_cfg.get("optimizer"):
-            self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
-            self.forward_optimizer.load_state_dict(loaded_dict["forward_optimizer_state_dict"])
-            self.backward_optimizer.load_state_dict(loaded_dict["backward_optimizer_state_dict"])
-            self.disc_critic_optimizer.load_state_dict(loaded_dict["disc_critic_optimizer_state_dict"])
-            self.aux_critic_optimizer.load_state_dict(loaded_dict["aux_critic_optimizer_state_dict"])
-            self.discriminator_optimizer.load_state_dict(loaded_dict["discriminator_optimizer_state_dict"])
+            for opt, key in (
+                (self.actor_optimizer, "actor_optimizer_state_dict"),
+                (self.forward_optimizer, "forward_optimizer_state_dict"),
+                (self.backward_optimizer, "backward_optimizer_state_dict"),
+                (self.disc_critic_optimizer, "disc_critic_optimizer_state_dict"),
+                (self.aux_critic_optimizer, "aux_critic_optimizer_state_dict"),
+                (self.discriminator_optimizer, "discriminator_optimizer_state_dict"),
+            ):
+                if key in loaded_dict:
+                    opt.load_state_dict(loaded_dict[key])
         if load_cfg.get("buffer"):
-            self.z_buffer.load_state_dict(loaded_dict["z_buffer_state"])
-            self.expert_buffer.load_state_dict(loaded_dict["expert_buffer_state"])
+            if "z_buffer_state" in loaded_dict:
+                self.z_buffer.load_state_dict(loaded_dict["z_buffer_state"])
+            if "expert_buffer_state" in loaded_dict:
+                self.expert_buffer.load_state_dict(loaded_dict["expert_buffer_state"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
