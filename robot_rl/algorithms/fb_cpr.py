@@ -837,9 +837,7 @@ class FbCpr:
         return self.actor
 
     @staticmethod
-    def construct_algorithm(
-        obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool = False
-    ) -> FbCpr:
+    def construct_algorithm(obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool = False) -> FbCpr:
         """Construct the FB-CPR algorithm.
 
         Set ``inference=True`` to skip loading the expert motion ``TrajectoryBuffer`` (the
