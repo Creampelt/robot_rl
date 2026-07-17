@@ -15,7 +15,7 @@ from tensordict import TensorDict
 from typing import Any
 
 from robot_rl.modules import MLP, EmpiricalNormalization, HiddenState
-from robot_rl.modules.distribution import Distribution
+from robot_rl.modules.distribution import Distribution, GaussianDistribution
 from robot_rl.utils import resolve_callable, resolve_nn_activation, unpad_trajectories
 
 
@@ -311,6 +311,21 @@ class MLPModel(nn.Module):
         return base_dim + self.obs_dim + self.other_input_dim
 
 
+def _export_gaussian_std(distribution: Distribution | None) -> torch.Tensor:
+    """Return a plain Gaussian policy's input-independent std for export, else an empty tensor.
+
+    Subclasses (heteroscedastic, truncated) and non-Gaussian policies return empty; ``forward_dist``
+    rejects those at call time.
+    """
+    if type(distribution) is not GaussianDistribution:
+        return torch.empty(0)
+    if distribution.std_type == "scalar":
+        std = distribution.std_param.clamp(distribution.std_range[0], distribution.std_range[1])
+    else:
+        std = distribution.log_std_param.clamp(distribution.log_std_range[0], distribution.log_std_range[1]).exp()
+    return std.detach().clone()
+
+
 class _TorchMLPModel(nn.Module):
     """Exportable MLP model for JIT."""
 
@@ -324,12 +339,22 @@ class _TorchMLPModel(nn.Module):
         else:
             self.deterministic_output = nn.Identity()
         self.last_activation = copy.deepcopy(model.last_activation) or nn.Identity()
+        self.register_buffer("_std", _export_gaussian_std(model.distribution))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference on pre-concatenated observations."""
         x = self.obs_normalizer(x)
         out = self.mlp(x)
         return self.last_activation(self.deterministic_output(out))
+
+    @torch.jit.export
+    def forward_dist(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the Gaussian policy's ``(mean, std)`` for pre-concatenated observations."""
+        if self._std.numel() == 0:
+            raise RuntimeError("forward_dist is only supported for a plain GaussianDistribution policy.")
+        x = self.obs_normalizer(x)
+        mean = self.deterministic_output(self.mlp(x))
+        return mean, self._std.expand_as(mean)
 
     @torch.jit.export
     def reset(self) -> None:
