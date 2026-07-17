@@ -119,11 +119,8 @@ class Logger:
                 # The W&B writer logs environment steps as a custom metric, so inject the env count
                 if isinstance(writer_class, type) and issubclass(writer_class, WandbLogWriter):
                     logger_cfg.setdefault("num_envs", self.num_envs)
-                    # auto-tag every run with its algorithm, plus any cfg-level wandb_tags
+                    # pass through any cfg-level wandb_tags
                     tags = list(logger_cfg.get("tags") or []) + list(self.cfg.get("wandb_tags") or [])
-                    alg = (self.cfg.get("algorithm") or {}).get("class_name")
-                    if alg:
-                        tags.append(f"alg:{alg.lower()}")
                     logger_cfg["tags"] = sorted(set(tags))
                 self.writer = writer_class(log_dir=self.log_dir, **logger_cfg)  # type: ignore
         else:
