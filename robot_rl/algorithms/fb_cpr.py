@@ -97,7 +97,6 @@ class FbCpr:
         device: str = "cpu",
         dtype: str = "float32",
         compile_mode: str | None = "reduce-overhead",
-        # Rollout-state parameters (z refresh, seed phase, action clipping live in act())
         clip_actions: float | None = None,
         num_seed_steps_per_env: int = 0,
         # Distributed training parameters
@@ -129,8 +128,7 @@ class FbCpr:
         for model in self.models:
             model.init_weights()
 
-        # Target networks (Polyak copies) via the shared wrapper; fb_tau for the maps, critic_tau for the
-        # critics. TargetNetwork.update reuses soft_update_params, so soft-updates stay byte-identical.
+        # Instantiate target (Polyak) networks
         self.target_forward_map = TargetNetwork(self.forward_map, tau=fb_tau).to(self.device)
         self.target_backward_map = TargetNetwork(self.backward_map, tau=fb_tau).to(self.device)
         self.target_disc_critic = TargetNetwork(self.disc_critic, tau=critic_tau).to(self.device)
