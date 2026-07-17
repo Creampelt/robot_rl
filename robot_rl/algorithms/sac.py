@@ -485,8 +485,6 @@ class SAC:
 
         buffer_size = int(cfg["algorithm"].get("replay_buffer_size", 1_000_000))
         capacity_per_env = 1 if inference else max(buffer_size // env.num_envs, 1)
-        # The replay buffer can live off the compute device (e.g. "cpu") to fit a large capacity in host RAM;
-        # transitions move to it on add and batches move back to `device` on sample.
         storage_device = cfg.get("storage_device") or device
         replay_buffer = ReplayBuffer(
             env.num_envs,
