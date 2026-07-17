@@ -69,14 +69,15 @@ class OffPolicyRunner:
         total_it = start_it + num_learning_iterations
         collect_steps = self.cfg.get("num_steps_per_env", 1)
 
-        # Resolve the update cadence and initial observations
+        # Resolve the update cadence and initial observations. The seed phase (warm up before policy
+        # updates begin) is a shared runner-level knob for both the URL and non-URL branches.
+        seed_until = start_it + self.cfg["num_seed_steps_per_env"]
+
+        def update_gate(it: int) -> bool:
+            return it > seed_until
+
         if is_url:
-            num_updates = self.cfg["num_agent_updates"]
-            seed_until = start_it + self.cfg["num_seed_steps_per_env"]
-
-            def update_gate(it: int) -> bool:
-                return it > seed_until
-
+            num_updates = self.cfg["algorithm"]["num_agent_updates"]
             # Attach the expert buffer, then re-reset so the initial state is RSI'd from the expert buffer
             # rather than the default-pose state from the env wrapper's first reset (ran before attach).
             self.env.set_expert_buffer(self.alg.expert_buffer)
@@ -85,11 +86,6 @@ class OffPolicyRunner:
             self.env.train_mode()
         else:
             num_updates = 1
-            start_training = self.cfg.get("start_training", 0)
-
-            def update_gate(it: int) -> bool:
-                return it >= start_training
-
             obs = self.env.get_observations().to(self.device)
 
         # Switch models to train mode (for dropout etc.) and sync parameters across ranks
@@ -113,8 +109,8 @@ class OffPolicyRunner:
                     eval_extras = None
                     if (
                         is_url
-                        and not self.cfg.get("skip_eval", False)
-                        and (it - start_it) % self.cfg["eval_interval"] == 0
+                        and not self.cfg["algorithm"].get("skip_eval", False)
+                        and (it - start_it) % self.cfg["algorithm"]["eval_interval"] == 0
                     ):
                         # Eval runs on rank 0 only (mutates the expert buffer once); other ranks skip
                         # and wait at the barrier below so update()'s all-reduces stay in lockstep.

@@ -580,14 +580,20 @@ class FbCpr:
         ~GB-scale motion dataset at ``cfg["algorithm"]["motion_path"]``). Only training/eval touch it,
         so play/visualization paths (which just need the actor + obs normalizer) can avoid the disk load.
         """
-        # Resolve class callables
+        # Resolve class callables. The FB-CPR-specific models live on the algorithm cfg; pop them so they
+        # aren't re-passed as kwargs to the algorithm constructor below.
         alg_class: type[FbCpr] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[FuseModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
-        forward_map_class: type[FuseModel] = resolve_callable(cfg["forward_map"].pop("class_name"))  # type: ignore
-        backward_map_class: type[MLPModel] = resolve_callable(cfg["backward_map"].pop("class_name"))  # type: ignore
-        disc_critic_class: type[FuseModel] = resolve_callable(cfg["disc_critic"].pop("class_name"))  # type: ignore
-        aux_critic_class: type[FuseModel] = resolve_callable(cfg["aux_critic"].pop("class_name"))  # type: ignore
-        discriminator_class: type[DiscriminatorModel] = resolve_callable(cfg["discriminator"].pop("class_name"))  # type: ignore
+        forward_map_cfg = cfg["algorithm"].pop("forward_map")
+        backward_map_cfg = cfg["algorithm"].pop("backward_map")
+        disc_critic_cfg = cfg["algorithm"].pop("disc_critic")
+        aux_critic_cfg = cfg["algorithm"].pop("aux_critic")
+        discriminator_cfg = cfg["algorithm"].pop("discriminator")
+        forward_map_class: type[FuseModel] = resolve_callable(forward_map_cfg.pop("class_name"))  # type: ignore
+        backward_map_class: type[MLPModel] = resolve_callable(backward_map_cfg.pop("class_name"))  # type: ignore
+        disc_critic_class: type[FuseModel] = resolve_callable(disc_critic_cfg.pop("class_name"))  # type: ignore
+        aux_critic_class: type[FuseModel] = resolve_callable(aux_critic_cfg.pop("class_name"))  # type: ignore
+        discriminator_class: type[DiscriminatorModel] = resolve_callable(discriminator_cfg.pop("class_name"))  # type: ignore
 
         # Resolve observation groups
         default_sets = ["actor", "critic", "backward", "discriminator", "expert"]
@@ -607,23 +613,23 @@ class FbCpr:
         )
         print(f"Actor Model: {actor}")
         forward_map: FuseModel = forward_map_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), z_dim, **cfg["forward_map"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), z_dim, **forward_map_cfg
         ).to(device)
         print(f"Forward Map Model: {forward_map}")
-        backward_map: MLPModel = backward_map_class(
-            obs, cfg["obs_groups"], "backward", z_dim, **cfg["backward_map"]
-        ).to(device)
+        backward_map: MLPModel = backward_map_class(obs, cfg["obs_groups"], "backward", z_dim, **backward_map_cfg).to(
+            device
+        )
         print(f"Backward Map Model: {backward_map}")
         disc_critic: FuseModel = disc_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **cfg["disc_critic"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **disc_critic_cfg
         ).to(device)
         print(f"Discriminator Critic Model: {disc_critic}")
         aux_critic: FuseModel = aux_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **cfg["aux_critic"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **aux_critic_cfg
         ).to(device)
         print(f"Auxiliary Critic Model: {aux_critic}")
         discriminator: DiscriminatorModel = discriminator_class(
-            obs, cfg["obs_groups"], "discriminator", 1, other_input_dims=(z_dim,), **cfg["discriminator"]
+            obs, cfg["obs_groups"], "discriminator", 1, other_input_dims=(z_dim,), **discriminator_cfg
         ).to(device)
         print(f"Discriminator Model: {discriminator}")
         # Initialize shared observation normalizer across all obs keys used by any model
@@ -643,7 +649,7 @@ class FbCpr:
             max_episode_length = int(max_episode_length.max().item())
         replay_buffer = ReplayBuffer(
             env.num_envs,
-            cfg["storage_scale"] * max_episode_length,
+            cfg["algorithm"]["storage_scale"] * max_episode_length,
             obs,
             [env.num_actions],
             z_dim,

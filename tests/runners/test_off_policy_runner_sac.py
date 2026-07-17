@@ -63,7 +63,7 @@ def _make_cfg() -> dict:
         "num_steps_per_env": 4,
         "save_interval": 100,
         "log_interval": 1,
-        "start_training": 1,
+        "num_seed_steps_per_env": 1,
         "obs_groups": {"actor": ["policy"], "critic": ["policy"]},
         "actor": {
             "class_name": "MLPModel",
@@ -107,7 +107,7 @@ class TestOffPolicyRunnerSAC:
         assert len(runner.alg.replay_buffer) == 3 * 4 * NUM_ENVS  # 3 iters * 4 steps * num_envs
 
     def test_learn_updates_policy(self) -> None:
-        """After several iterations past start_training, the actor parameters have changed (learning occurred)."""
+        """After several iterations past the seed phase, the actor parameters have changed (learning occurred)."""
         runner = OffPolicyRunner(DummyEnv(), _make_cfg(), log_dir=None, device="cpu")
         before = [p.detach().clone() for p in runner.alg.actor_parameters]
         runner.learn(num_learning_iterations=6)

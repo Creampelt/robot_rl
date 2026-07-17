@@ -97,15 +97,18 @@ class FakeUrlAlg:
 def _make_cfg() -> dict:
     return {
         "num_steps_per_env": 2,
-        "num_agent_updates": 3,
         "num_seed_steps_per_env": 2,
-        "eval_interval": 4,
         "log_interval": 1,
         "save_interval": 100,
         "clip_actions": 1.0,
         "check_for_nan": True,
         "obs_groups": {"actor": ["policy"]},
-        "algorithm": {"class_name": FakeUrlAlg, "rnd_cfg": None},
+        "algorithm": {
+            "class_name": FakeUrlAlg,
+            "rnd_cfg": None,
+            "num_agent_updates": 3,
+            "eval_interval": 4,
+        },
     }
 
 
