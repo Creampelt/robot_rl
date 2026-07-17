@@ -44,7 +44,7 @@ class OffPolicyRunner:
         # Query observations from the environment for algorithm construction
         obs = self.env.get_observations()
 
-        # Every off-policy algorithm's construct_algorithm takes `inference`.
+        # Create the algorithm
         alg_class: type[FbCpr] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device, inference=inference)
 
