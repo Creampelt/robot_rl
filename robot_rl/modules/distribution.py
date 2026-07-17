@@ -630,7 +630,7 @@ class VonMisesFisherDistribution(Distribution):
             return self._rsample()
 
     def sample_and_log_prob(self, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reparameterized ``(sample, log_prob)`` from a single draw (the SAC actor-update path).
+        """Reparameterized ``(sample, log_prob)`` from a single draw.
 
         Gradients flow to the mean direction and concentration through both the sample and its log-prob;
         the acceptance probability's kappa-dependence is ignored (Davidson et al., 2018).

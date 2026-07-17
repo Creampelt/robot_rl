@@ -103,8 +103,6 @@ class WandbLogWriter(SummaryWriter, LogWriter):
     ) -> None:
         """Log a scalar to both TensorBoard and W&B."""
         super().add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime, new_style=new_style)
-        # Pin _step to the training iteration (also in shared mode) so a resumed run continues at the
-        # checkpoint's iteration instead of restarting _step at 0; secondary writers keep their own sequence.
         self.run.log(
             {tag: scalar_value, "local_step": global_step, "env_step": global_step * self.num_envs},
             step=global_step,

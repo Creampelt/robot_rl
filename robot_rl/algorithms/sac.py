@@ -465,8 +465,11 @@ class SAC:
     # -- construction ----------------------------------------------------------------------------------------
 
     @staticmethod
-    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> SAC:
-        """Build the SAC algorithm (actor, twin critics, replay buffer) from a config dict."""
+    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str, inference: bool = False) -> SAC:
+        """Build the SAC algorithm from a config dict.
+
+        ``inference=True`` builds a minimal replay buffer for play/eval.
+        """
         alg_class: type[SAC] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
         critic_class: type[FuseModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
@@ -489,7 +492,7 @@ class SAC:
         ).to(device)
 
         buffer_size = int(cfg["algorithm"].get("replay_buffer_size", 1_000_000))
-        capacity_per_env = max(buffer_size // env.num_envs, 1)
+        capacity_per_env = 1 if inference else max(buffer_size // env.num_envs, 1)
         # The replay buffer can live off the compute device (e.g. "cpu") to fit a large capacity in host RAM;
         # transitions move to it on add and batches move back to `device` on sample.
         storage_device = cfg.get("storage_device") or device
