@@ -20,14 +20,11 @@ from robot_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimiz
 
 
 class SAC:
-    """Soft Actor-Critic.
+    """Soft Actor-Critic (SAC) algorithm.
 
-    Reuses the shared building blocks: a generic :class:`~robot_rl.models.MLPModel` actor with a
-    :class:`~robot_rl.modules.SquashedTanhGaussianDistribution` output, twin :class:`~robot_rl.models.FuseModel`
-    Q-critics each wrapped in a :class:`~robot_rl.modules.TargetNetwork`, and the shared
-    :class:`~robot_rl.storage.ReplayBuffer` in ``keep_terminal`` mode. The temperature ``alpha`` is optionally
-    learned against a target entropy. Exposes the standard runner interface: :meth:`act`,
-    :meth:`process_env_step`, :meth:`update`.
+    Reference:
+        - Haarnoja et al. "Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a
+          Stochastic Actor." arXiv preprint arXiv:1801.01290 (2018).
     """
 
     def __init__(
