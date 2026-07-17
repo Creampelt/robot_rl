@@ -115,9 +115,7 @@ class SAC:
         self.actor_optimizer = resolve_optimizer(actor_optimizer)(self.actor_parameters, lr=actor_learning_rate)
         self.critic_optimizer = resolve_optimizer(critic_optimizer)(self.critic_parameters, lr=critic_learning_rate)
 
-        # Apply torch.compile to the forward+loss+backward hot paths (single unbroken graphs; optimizer
-        # steps stay eager -- a graph break at step() invalidates cudagraph outputs under reduce-overhead).
-        # "eager"/"none" sentinels disable it, since configclass cannot hydra-override a None default.
+        # Apply torch.compile to the forward+loss+backward paths.
         if compile_mode not in (None, "eager", "none"):
             self._critic_losses_and_backward = torch.compile(self._critic_losses_and_backward, mode=compile_mode)
             self._actor_loss_and_backward = torch.compile(self._actor_loss_and_backward, mode=compile_mode)
