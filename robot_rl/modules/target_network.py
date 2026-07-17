@@ -64,6 +64,6 @@ class TargetNetwork(nn.Module):
             tb.copy_(ob)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Evaluate the target model under ``no_grad`` (targets never propagate gradients)."""
+        """Evaluate the target model under ``no_grad``."""
         with torch.no_grad():
             return self.target(*args, **kwargs)

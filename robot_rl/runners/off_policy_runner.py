@@ -120,7 +120,7 @@ class OffPolicyRunner:
         with self._get_profile_context() as prof:
             for it in range(start_it, total_it):
                 with torch.inference_mode(), torch.profiler.record_function("rollout"):
-                    # Run evaluation (URL only; skip_eval bypasses it entirely — debug-only speed-up)
+                    # Run evaluation (URL only; skip_eval bypasses it entirely -- debug-only speed-up)
                     eval_extras = None
                     if (
                         is_url

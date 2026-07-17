@@ -20,11 +20,11 @@ from robot_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimiz
 
 
 class SAC:
-    """Soft Actor-Critic (off-policy, entropy-regularized).
+    """Soft Actor-Critic.
 
     Reuses the shared building blocks: a generic :class:`~robot_rl.models.MLPModel` actor with a
     :class:`~robot_rl.modules.SquashedTanhGaussianDistribution` output, twin :class:`~robot_rl.models.FuseModel`
-    Q-critics (obs+action fusion) each wrapped in a :class:`~robot_rl.modules.TargetNetwork`, and the shared
+    Q-critics each wrapped in a :class:`~robot_rl.modules.TargetNetwork`, and the shared
     :class:`~robot_rl.storage.ReplayBuffer` in ``keep_terminal`` mode. The temperature ``alpha`` is optionally
     learned against a target entropy. Exposes the standard runner interface: :meth:`act`,
     :meth:`process_env_step`, :meth:`update`.
@@ -59,7 +59,7 @@ class SAC:
         multi_gpu_cfg: dict | None = None,
         **kwargs: Any,
     ) -> None:
-        """Initialize the SAC algorithm. See the module docstring for the design; args mirror the SAC config."""
+        """Initialize the SAC algorithm. See the module docstring for the design."""
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
         if multi_gpu_cfg is not None:

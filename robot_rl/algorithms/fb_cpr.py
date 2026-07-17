@@ -135,7 +135,7 @@ class FbCpr:
         self.target_aux_critic = TargetNetwork(self.aux_critic, tau=critic_tau).to(self.device)
 
         # Create the optimizers. Adam/AdamW support a fused CUDA kernel that collapses the per-parameter
-        # _foreach_add_/_foreach_mul_ ops into a single launch — noticeable speedup at 16 updates/iter.
+        # _foreach_add_/_foreach_mul_ ops into a single launch.
         optimizer_cls = resolve_optimizer(optimizer)
         optimizer_kwargs: dict[str, Any] = {"weight_decay": weight_decay}
         if optimizer.lower() in ("adam", "adamw"):
@@ -274,7 +274,7 @@ class FbCpr:
         # Record the rewards
         self.transition.rewards = rewards
         # Record the and next obs and next terminated (after env.step)
-        # Terminated is all dones that are not time_outs (used to compute discount factor)
+        # Terminated is all dones that are not time_outs
         self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
 
@@ -693,7 +693,7 @@ class FbCpr:
 
         Scoped to a single module on purpose: FB-CPR trains several models with separate
         optimizers and backward/step cycles, so each model's gradients must be all-reduced
-        independently right before its own ``optimizer.step()`` — reducing every model's
+        independently right before its own ``optimizer.step()`` -- reducing every model's
         parameters here (as a global reduce would) is both incorrect (it would touch other
         models' stale grads) and wasteful (one collective per model instead of per step).
         """

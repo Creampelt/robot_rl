@@ -551,7 +551,7 @@ class VonMisesFisherDistribution(Distribution):
 
     Why this over a Gaussian-then-normalize action: ball-normalizing a Gaussian discards a magnitude DoF, so its
     entropy (computed pre-normalization) is unbounded in ``std`` even though the *behavioral* (directional) spread
-    saturates to uniform — the entropy bonus then inflates ``std`` without limit. The vMF measures entropy on the
+    saturates to uniform -- the entropy bonus then inflates ``std`` without limit. The vMF measures entropy on the
     sphere itself, so it is bounded above by the uniform entropy and the entropy bonus is correctly priced.
 
     The samples produced are **unit vectors**; the downstream action term is responsible for scaling them onto the
@@ -879,7 +879,7 @@ class SquashedTanhGaussianDistribution(Distribution):
 
     @property
     def std(self) -> torch.Tensor:
-        """Return the pre-squash standard deviation (used for logging the exploration scale)."""
+        """Return the pre-squash standard deviation."""
         return self._std  # type: ignore
 
     @property
@@ -897,7 +897,7 @@ class SquashedTanhGaussianDistribution(Distribution):
         return (self._mean_pre, self._std)  # type: ignore
 
     def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        """Compute KL between the *pre-squash* Gaussians (SAC does not use this; provided for completeness)."""
+        """Compute KL between the *pre-squash* Gaussians."""
         old_mean, old_std = old_params
         new_mean, new_std = new_params
         return torch.distributions.kl_divergence(Normal(old_mean, old_std), Normal(new_mean, new_std)).sum(dim=-1)

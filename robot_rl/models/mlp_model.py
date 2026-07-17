@@ -73,7 +73,7 @@ class MLPModel(nn.Module):
                 ``obs=...``. Used for an asymmetric critic head that consumes privileged obs the actor does not see.
             memory_only: When ``True``, skip building the MLP head and output distribution. Used when a
                 memory-bearing model (RNN/TXL) is constructed solely to provide a shared latent to downstream
-                heads — :meth:`forward` then returns the memory module's latent directly.
+                heads -- :meth:`forward` then returns the memory module's latent directly.
         """
         super().__init__()
 

@@ -10,7 +10,7 @@ from tensordict import TensorDict
 
 
 class ReplayBuffer:
-    """Storage for the data collected across rollouts (for off-policy RL).
+    """Storage for the data collected across rollouts.
 
     The replay storage is populated by adding transitions during the rollout phase.
     """
@@ -86,7 +86,7 @@ class ReplayBuffer:
             """Batch of latent context (z) vectors."""
 
             self.next_terminated: torch.Tensor | None = next_terminated
-            """Batch of terminated flags after the step (true termination only; used by SAC to gate the bootstrap)."""
+            """Batch of terminated flags after the step (true termination only)."""
 
             self.effective_n_steps: torch.Tensor | None = effective_n_steps
             """Per-sample number of steps actually aggregated (<= n_steps; 1-step or capped at an episode end)."""
