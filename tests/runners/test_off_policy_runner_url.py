@@ -64,7 +64,9 @@ class FakeUrlAlg:
         self.calls: list[str] = []
 
     @staticmethod
-    def construct_algorithm(obs: TensorDict, env: DummyUrlEnv, cfg: dict, device: str) -> FakeUrlAlg:  # noqa: D102
+    def construct_algorithm(  # noqa: D102
+        obs: TensorDict, env: DummyUrlEnv, cfg: dict, device: str, inference: bool = False
+    ) -> FakeUrlAlg:
         return FakeUrlAlg(env.num_actions, device)
 
     def act(self, obs: TensorDict) -> torch.Tensor:  # noqa: D102

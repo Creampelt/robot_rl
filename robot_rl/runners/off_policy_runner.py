@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import inspect
 import os
 import time
 import torch
@@ -45,13 +44,9 @@ class OffPolicyRunner:
         # Query observations from the environment for algorithm construction
         obs = self.env.get_observations()
 
-        # Create the algorithm. FbCpr's construct_algorithm takes inference; simpler off-policy
-        # algorithms (e.g. SAC) use the plain (obs, env, cfg, device) factory signature.
+        # Every off-policy algorithm's construct_algorithm takes `inference`.
         alg_class: type[FbCpr] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
-        if "inference" in inspect.signature(alg_class.construct_algorithm).parameters:
-            self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device, inference=inference)
-        else:
-            self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
+        self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device, inference=inference)
 
         # Create the logger
         self.logger = Logger(
