@@ -68,24 +68,19 @@ class OffPolicyRunner:
         self.current_learning_iteration = 0
 
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
-        """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save.
-
-        Cadence is cfg-resolved: URL algorithms step once per iteration and batch updates every
-        ``num_steps_per_env`` iterations; others collect ``num_steps_per_env`` steps and update each
-        iteration after ``start_training``.
-        """
+        """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save."""
         is_url = hasattr(self.alg, "expert_buffer")
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
+        collect_steps = self.cfg.get("num_steps_per_env", 1)
 
-        # Resolve the loop cadence and initial observations
+        # Resolve the update cadence and initial observations
         if is_url:
-            collect_steps = 1
             num_updates = self.cfg["num_agent_updates"]
             seed_until = start_it + self.cfg["num_seed_steps_per_env"]
 
             def update_gate(it: int) -> bool:
-                return it > seed_until and it % self.cfg["num_steps_per_env"] == 0
+                return it > seed_until
 
             # Attach the expert buffer, then re-reset so the initial state is RSI'd from the expert buffer
             # rather than the default-pose state from the env wrapper's first reset (ran before attach).
@@ -94,7 +89,6 @@ class OffPolicyRunner:
             obs = obs.to(self.device)
             self.env.train_mode()
         else:
-            collect_steps = self.cfg.get("num_steps_per_env", 1)
             num_updates = 1
             start_training = self.cfg.get("start_training", 0)
 

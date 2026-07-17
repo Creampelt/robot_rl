@@ -5,9 +5,9 @@
 
 """Locks the OffPolicyRunner's URL-path loop cadence (seed phase, update gate, eval interval).
 
-Uses a stub URL algorithm (has ``expert_buffer``) so the FbCpr control flow -- one env step per
-iteration, ``num_agent_updates`` updates every ``num_steps_per_env`` iterations after the seed phase,
-eval every ``eval_interval`` iterations -- is pinned without needing Isaac Sim or motion data.
+Uses a stub URL algorithm (has ``expert_buffer``) so the FbCpr control flow -- ``num_steps_per_env``
+env steps per iteration, ``num_agent_updates`` updates every iteration after the seed phase, eval every
+``eval_interval`` iterations -- is pinned without needing Isaac Sim or motion data.
 """
 
 from __future__ import annotations
@@ -108,22 +108,21 @@ def _make_cfg() -> dict:
 
 
 class TestOffPolicyRunnerUrlCadence:
-    """The unified loop must reproduce the FbCpr cadence exactly for URL algorithms."""
+    """The unified loop must reproduce the FbCpr cadence for URL algorithms."""
 
     def test_loop_cadence(self) -> None:
-        """8 iterations: 1 act/iter; updates only past the seed phase on num_steps_per_env boundaries."""
+        """8 iterations: num_steps_per_env acts/iter; updates every iteration past the seed phase."""
         env = DummyUrlEnv()
         runner = OffPolicyRunner(env, _make_cfg(), log_dir=None, device="cpu")
         runner.learn(num_learning_iterations=8)
         calls = runner.alg.calls
 
-        # One env step per iteration
-        assert calls.count("act") == 8
-        assert calls.count("step") == 8
-        # Update gate: it > start_it + num_seed_steps_per_env (2) and it % num_steps_per_env (2) == 0
-        # -> iterations 4 and 6 -> 2 phases x num_agent_updates (3)
-        assert calls.count("gammas") == 2
-        assert calls.count("update") == 6
+        # num_steps_per_env (2) env steps per iteration
+        assert calls.count("act") == 16
+        assert calls.count("step") == 16
+        # Update gate: it > start_it + num_seed_steps_per_env (2) -> iterations 3..7 -> 5 x num_agent_updates (3)
+        assert calls.count("gammas") == 5
+        assert calls.count("update") == 15
         # Eval every eval_interval (4) iterations -> it 0 and 4; env reset follows each eval
         assert calls.count("eval") == 2
         assert calls.count("reset_rollout") == 2

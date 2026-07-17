@@ -114,16 +114,11 @@ class ReplayBuffer:
             z_dim: Latent-context dimension (use ``0`` for algorithms without a latent, e.g. SAC).
             batch_size: Mini-batch size returned by :meth:`sample_mini_batch`.
             device: Storage device.
-            keep_terminal: If ``False`` (default; FbCpr) transitions whose ``dones`` is set are dropped, since the
-                stored next-obs would be a post-reset state. If ``True`` (SAC) *all* transitions are kept -- the
-                caller must set ``next_observations`` to the true pre-reset next-obs (via ``time_outs_obs``) and
-                ``next_terminated`` to gate the bootstrap.
-            n_steps: Number of steps for n-step returns. ``1`` (default) is single-step. ``>1`` requires
-                ``keep_terminal=True`` (n-step needs the per-env temporal sequence that only the keep-all layout
-                preserves -- every ``add_transitions`` then writes exactly ``num_envs`` transitions, so a stored
-                index ``i`` maps to env ``i % num_envs``, row ``i // num_envs``, and env ``e``'s next step is at
-                ``i + num_envs``). ``sample_mini_batch`` then aggregates the discounted return, stopping at
-                episode ends, and returns ``effective_n_steps`` per sample.
+            keep_terminal: If ``False`` (default; FbCpr), transitions whose ``dones`` is set are dropped, since
+                their stored next-obs is a post-reset state. If ``True`` (SAC), all transitions are kept and the
+                caller supplies the true pre-reset ``next_observations`` and ``next_terminated``.
+            n_steps: Number of steps for n-step returns; ``1`` (default) is single-step. ``>1`` requires
+                ``keep_terminal=True`` and returns the discounted n-step return, stopped at episode boundaries.
             gamma: Discount factor used for the n-step return (unused for ``n_steps == 1``).
         """
         # store inputs
