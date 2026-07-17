@@ -122,8 +122,6 @@ class SAC:
             self._critic_losses_and_backward = torch.compile(self._critic_losses_and_backward, mode=compile_mode)
             self._actor_loss_and_backward = torch.compile(self._actor_loss_and_backward, mode=compile_mode)
 
-    # -- rollout ---------------------------------------------------------------------------------------------
-
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample a stochastic action and record the transition's observation/action."""
         with torch.no_grad():
@@ -182,8 +180,6 @@ class SAC:
 
         self.replay_buffer.add_transitions(self.transition)
         self.transition.clear()
-
-    # -- learning --------------------------------------------------------------------------------------------
 
     def update(self) -> dict:
         """Run the off-policy SAC updates over sampled mini-batches; returns mean losses."""
@@ -461,8 +457,6 @@ class SAC:
                 numel = p.numel()
                 p.grad.data.copy_(all_grads[offset : offset + numel].view_as(p.grad.data))
                 offset += numel
-
-    # -- construction ----------------------------------------------------------------------------------------
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str, inference: bool = False) -> SAC:
