@@ -26,6 +26,7 @@ from .parallel import ParallelLayerNorm, ParallelLinear
 from .residual import ResMLP
 from .rnn import RNN, HiddenState
 from .target_network import TargetNetwork
+from .tcn import TCNEncoder
 from .transformer_xl import TransformerXL
 
 __all__ = [
