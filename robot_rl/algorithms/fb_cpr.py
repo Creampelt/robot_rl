@@ -8,7 +8,7 @@ from tensordict import TensorDict
 from typing import Any
 
 from robot_rl.env import URLVecEnv
-from robot_rl.models import DiscriminatorModel, FuseModel, MLPModel
+from robot_rl.models import FuseModel, MLPModel
 from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization, TargetNetwork
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
 from robot_rl.utils import (
@@ -47,7 +47,7 @@ class FbCpr:
     aux_critic: FuseModel
     """The auxiliary critic model."""
 
-    discriminator: DiscriminatorModel
+    discriminator: MLPModel
     """The discriminator model"""
 
     def __init__(
@@ -57,7 +57,7 @@ class FbCpr:
         backward_map: MLPModel,
         disc_critic: FuseModel,
         aux_critic: FuseModel,
-        discriminator: DiscriminatorModel,
+        discriminator: MLPModel,
         obs_normalizer: DictModule[nn.BatchNorm1d],
         replay_buffer: ReplayBuffer,
         expert_buffer: TrajectoryBuffer | None,
@@ -593,7 +593,7 @@ class FbCpr:
         backward_map_class: type[MLPModel] = resolve_callable(backward_map_cfg.pop("class_name"))  # type: ignore
         disc_critic_class: type[FuseModel] = resolve_callable(disc_critic_cfg.pop("class_name"))  # type: ignore
         aux_critic_class: type[FuseModel] = resolve_callable(aux_critic_cfg.pop("class_name"))  # type: ignore
-        discriminator_class: type[DiscriminatorModel] = resolve_callable(discriminator_cfg.pop("class_name"))  # type: ignore
+        discriminator_class: type[MLPModel] = resolve_callable(discriminator_cfg.pop("class_name"))  # type: ignore
 
         # Resolve observation groups
         default_sets = ["actor", "critic", "backward", "discriminator", "expert"]
@@ -628,7 +628,7 @@ class FbCpr:
             obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **aux_critic_cfg
         ).to(device)
         print(f"Auxiliary Critic Model: {aux_critic}")
-        discriminator: DiscriminatorModel = discriminator_class(
+        discriminator: MLPModel = discriminator_class(
             obs, cfg["obs_groups"], "discriminator", 1, other_input_dims=(z_dim,), **discriminator_cfg
         ).to(device)
         print(f"Discriminator Model: {discriminator}")
@@ -766,8 +766,8 @@ class FbCpr:
         self, batch: ReplayBuffer.Batch, expert_obs: TensorDict, expert_z: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
-            expert_logits = self.discriminator(expert_obs, expert_z, raw_logits=True)
-            unlabeled_logits = self.discriminator(batch.observations, batch.context, raw_logits=True)
+            expert_logits = self.discriminator(expert_obs, expert_z, raw_output=True)
+            unlabeled_logits = self.discriminator(batch.observations, batch.context, raw_output=True)
             # Compute loss with binary cross entropy
             expert_loss = -nn.functional.logsigmoid(expert_logits)
             unlabeled_loss = nn.functional.softplus(unlabeled_logits)
