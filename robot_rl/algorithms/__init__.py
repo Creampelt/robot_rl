@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .fb_cpr import FbCpr
 from .ppo import PPO
+from .sac import SAC
 
-__all__ = ["PPO", "Distillation", "FbCpr"]
+__all__ = ["PPO", "SAC", "Distillation", "FbCpr"]

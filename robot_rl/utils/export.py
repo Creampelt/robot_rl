@@ -128,7 +128,7 @@ _FBCPR_MODELS = {
     "forward": ("forward_map", "critic", "ResidualFuseModel", "z_dim", ("z_dim", "num_actions")),
     "disc_critic": ("disc_critic", "critic", "ResidualFuseModel", 1, ("z_dim", "num_actions")),
     "aux_critic": ("aux_critic", "critic", "ResidualFuseModel", 1, ("z_dim", "num_actions")),
-    "discriminator": ("discriminator", "discriminator", "DiscriminatorModel", 1, ("z_dim",)),
+    "discriminator": ("discriminator", "discriminator", "MLPModel", 1, ("z_dim",)),
 }
 
 

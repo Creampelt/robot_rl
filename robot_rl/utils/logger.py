@@ -119,6 +119,9 @@ class Logger:
                 # The W&B writer logs environment steps as a custom metric, so inject the env count
                 if isinstance(writer_class, type) and issubclass(writer_class, WandbLogWriter):
                     logger_cfg.setdefault("num_envs", self.num_envs)
+                    # pass through any cfg-level wandb_tags
+                    tags = list(logger_cfg.get("tags") or []) + list(self.cfg.get("wandb_tags") or [])
+                    logger_cfg["tags"] = sorted(set(tags))
                 self.writer = writer_class(log_dir=self.log_dir, **logger_cfg)  # type: ignore
         else:
             self.writer = None
@@ -179,6 +182,21 @@ class Logger:
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
+
+    def process_update_extras(
+        self,
+        eval_extras: list[dict] | None = None,
+        loss_extras: list[dict] | None = None,
+        algo_extras: list[dict] | None = None,
+    ) -> None:
+        """Buffer per-iteration extras produced outside env stepping (eval results, update losses)."""
+        if self.writer is not None:
+            if eval_extras:
+                self.eval_extras.extend(eval_extras)
+            if loss_extras:
+                self.loss_extras.extend(loss_extras)
+            if algo_extras:
+                self.algo_extras.extend(algo_extras)
 
     def reset_all_envs(self) -> None:
         """Save and clear all logging buffers."""

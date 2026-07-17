@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import math
 import os
 import torch
@@ -9,8 +8,8 @@ from tensordict import TensorDict
 from typing import Any
 
 from robot_rl.env import URLVecEnv
-from robot_rl.models import DiscriminatorModel, FuseModel, MLPModel
-from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization
+from robot_rl.models import FuseModel, MLPModel
+from robot_rl.modules import DictModule, ExponentialMovingAverageNormalization, TargetNetwork
 from robot_rl.storage import ReplayBuffer, TrajectoryBuffer, ZBuffer
 from robot_rl.utils import (
     compute_emd,
@@ -22,7 +21,6 @@ from robot_rl.utils import (
     resolve_dtype,
     resolve_obs_groups,
     resolve_optimizer,
-    soft_update_params,
 )
 
 
@@ -49,7 +47,7 @@ class FbCpr:
     aux_critic: FuseModel
     """The auxiliary critic model."""
 
-    discriminator: DiscriminatorModel
+    discriminator: MLPModel
     """The discriminator model"""
 
     def __init__(
@@ -59,7 +57,7 @@ class FbCpr:
         backward_map: MLPModel,
         disc_critic: FuseModel,
         aux_critic: FuseModel,
-        discriminator: DiscriminatorModel,
+        discriminator: MLPModel,
         obs_normalizer: DictModule[nn.BatchNorm1d],
         replay_buffer: ReplayBuffer,
         expert_buffer: TrajectoryBuffer | None,
@@ -99,6 +97,8 @@ class FbCpr:
         device: str = "cpu",
         dtype: str = "float32",
         compile_mode: str | None = "reduce-overhead",
+        clip_actions: float | None = None,
+        num_seed_steps_per_env: int = 0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs: Any,
@@ -128,24 +128,14 @@ class FbCpr:
         for model in self.models:
             model.init_weights()
 
-        # Initialize target networks
-        self.target_forward_map = copy.deepcopy(self.forward_map).to(self.device)
-        self.target_backward_map = copy.deepcopy(self.backward_map).to(self.device)
-        self.target_disc_critic = copy.deepcopy(self.disc_critic).to(self.device)
-        self.target_aux_critic = copy.deepcopy(self.aux_critic).to(self.device)
-
-        # Initialize paramlists
-        self._forward_map_paramlist = tuple(x.data for x in self.forward_map.parameters())
-        self._backward_map_paramlist = tuple(x.data for x in self.backward_map.parameters())
-        self._disc_critic_paramlist = tuple(x.data for x in self.disc_critic.parameters())
-        self._aux_critic_paramlist = tuple(x.data for x in self.aux_critic.parameters())
-        self._target_forward_map_paramlist = tuple(x.data for x in self.target_forward_map.parameters())
-        self._target_backward_map_paramlist = tuple(x.data for x in self.target_backward_map.parameters())
-        self._target_disc_critic_paramlist = tuple(x.data for x in self.target_disc_critic.parameters())
-        self._target_aux_critic_paramlist = tuple(x.data for x in self.target_aux_critic.parameters())
+        # Instantiate target (Polyak) networks
+        self.target_forward_map = TargetNetwork(self.forward_map, tau=fb_tau).to(self.device)
+        self.target_backward_map = TargetNetwork(self.backward_map, tau=fb_tau).to(self.device)
+        self.target_disc_critic = TargetNetwork(self.disc_critic, tau=critic_tau).to(self.device)
+        self.target_aux_critic = TargetNetwork(self.aux_critic, tau=critic_tau).to(self.device)
 
         # Create the optimizers. Adam/AdamW support a fused CUDA kernel that collapses the per-parameter
-        # _foreach_add_/_foreach_mul_ ops into a single launch — noticeable speedup at 16 updates/iter.
+        # _foreach_add_/_foreach_mul_ ops into a single launch.
         optimizer_cls = resolve_optimizer(optimizer)
         optimizer_kwargs: dict[str, Any] = {"weight_decay": weight_decay}
         if optimizer.lower() in ("adam", "adamw"):
@@ -179,6 +169,15 @@ class FbCpr:
         # State for expert rollout context
         self.expert_rollout_envs: torch.Tensor | None = None
         self.expert_rollout_z: torch.Tensor | None = None
+
+        # Rollout state: latent z, last dones, per-env episode step, and act count for the seed phase.
+        # Episode lengths are lazily allocated on the first act (num_envs known then).
+        self.clip_actions = clip_actions
+        self.num_seed_steps_per_env = num_seed_steps_per_env
+        self._rollout_z: torch.Tensor | None = None
+        self._last_dones: torch.Tensor | None = None
+        self._cur_episode_length: torch.Tensor | None = None
+        self._act_steps = 0
 
         # FB-CPR parameters
         self.dtype = resolve_dtype(dtype)
@@ -235,29 +234,32 @@ class FbCpr:
             self.discriminator,
         ]
 
-    def act(
-        self,
-        obs: TensorDict,
-        z: torch.Tensor,
-        dones: torch.Tensor | None,
-        random_sample: bool = False,
-        clip_actions: float | None = None,
-    ) -> torch.Tensor:
-        """Sample actions and store transition data."""
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        """Sample actions and store transition data.
+
+        Owns the per-env rollout state: the latent ``z`` (refreshed from episode progress), previous dones,
+        seed-phase random sampling, and action clipping.
+        """
+        num_envs = obs.batch_size[0]
+        if self._cur_episode_length is None:
+            self._cur_episode_length = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        # Update latent z from episode progress, then sample
+        z = self._rollout_z = self.update_rollout_z(self._rollout_z, self._cur_episode_length, num_envs)
+        random_sample = self._act_steps <= self.num_seed_steps_per_env
+        self._act_steps += 1
         # Normalize observations
         with eval_mode(self.obs_normalizer):
             norm_obs = self.obs_normalizer(obs)
         # compute the actions and values
         self.transition.actions = self.actor(norm_obs, z, stochastic_output=True).detach()
-        # uniformly sample from action space if specified
+        # uniformly sample from action space during the seed phase
         if random_sample:
-            if clip_actions is None:
-                clip_actions = 1.0
+            clip_actions = 1.0 if self.clip_actions is None else self.clip_actions
             self.transition.actions.uniform_(-clip_actions, clip_actions).detach()
         # record obs and dones before env.step()
         self.transition.observations = obs
         # dones is None if this is the first step
-        self.transition.dones = dones
+        self.transition.dones = self._last_dones
         self.transition.context = z
         return self.transition.actions  # type: ignore
 
@@ -272,7 +274,7 @@ class FbCpr:
         # Record the rewards
         self.transition.rewards = rewards
         # Record the and next obs and next terminated (after env.step)
-        # Terminated is all dones that are not time_outs (used to compute discount factor)
+        # Terminated is all dones that are not time_outs
         self.transition.next_terminated = (dones * ~extras["time_outs"]).byte()
         self.transition.next_observations = obs
 
@@ -283,6 +285,18 @@ class FbCpr:
         # Reset hidden states of all models
         for model in self.models:
             model.reset(dones)
+
+        # Advance the rollout state consumed by the next act(): episode step counters and last dones
+        if self._cur_episode_length is not None:
+            self._cur_episode_length += 1
+            self._cur_episode_length[(dones > 0).nonzero(as_tuple=False)] = 0
+        self._last_dones = dones
+
+    def reset_rollout_state(self) -> None:
+        """Reset the per-env rollout bookkeeping after an external env reset (e.g. post-eval); z is kept."""
+        if self._cur_episode_length is not None:
+            self._cur_episode_length[:] = 0
+        self._last_dones = None
 
     def compute_gammas(self) -> None:
         """Compute gamma values from stored transitions."""
@@ -497,10 +511,10 @@ class FbCpr:
             "disc_critic_optimizer_state_dict": self.disc_critic_optimizer.state_dict(),
             "aux_critic_optimizer_state_dict": self.aux_critic_optimizer.state_dict(),
             "discriminator_optimizer_state_dict": self.discriminator_optimizer.state_dict(),
-            "target_forward_map_state_dict": self.target_forward_map.state_dict(),
-            "target_backward_map_state_dict": self.target_backward_map.state_dict(),
-            "target_disc_critic_state_dict": self.target_disc_critic.state_dict(),
-            "target_aux_critic_state_dict": self.target_aux_critic.state_dict(),
+            "target_forward_map_state_dict": self.target_forward_map.target.state_dict(),
+            "target_backward_map_state_dict": self.target_backward_map.target.state_dict(),
+            "target_disc_critic_state_dict": self.target_disc_critic.target.state_dict(),
+            "target_aux_critic_state_dict": self.target_aux_critic.target.state_dict(),
             "z_buffer_state": self.z_buffer.state_dict(),
             "expert_buffer_state": self.expert_buffer.state_dict(),
         }
@@ -539,7 +553,7 @@ class FbCpr:
                 (self.disc_critic, self.target_disc_critic, "target_disc_critic_state_dict"),
                 (self.aux_critic, self.target_aux_critic, "target_aux_critic_state_dict"),
             ):
-                target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
+                target.target.load_state_dict(loaded_dict.get(target_key, online.state_dict()), strict=strict)
         if "obs_normalizer_state_dict" in loaded_dict:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_normalizer_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
@@ -559,23 +573,27 @@ class FbCpr:
         return self.actor
 
     @staticmethod
-    def construct_algorithm(
-        obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, build_expert_buffer: bool = True
-    ) -> FbCpr:
+    def construct_algorithm(obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool = False) -> FbCpr:
         """Construct the FB-CPR algorithm.
 
-        Set ``build_expert_buffer=False`` to skip loading the expert motion ``TrajectoryBuffer`` (the
+        Set ``inference=True`` to skip loading the expert motion ``TrajectoryBuffer`` (the
         ~GB-scale motion dataset at ``cfg["algorithm"]["motion_path"]``). Only training/eval touch it,
         so play/visualization paths (which just need the actor + obs normalizer) can avoid the disk load.
         """
-        # Resolve class callables
+        # Resolve class callables. The FB-CPR-specific models live on the algorithm cfg; pop them so they
+        # aren't re-passed as kwargs to the algorithm constructor below.
         alg_class: type[FbCpr] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[FuseModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
-        forward_map_class: type[FuseModel] = resolve_callable(cfg["forward_map"].pop("class_name"))  # type: ignore
-        backward_map_class: type[MLPModel] = resolve_callable(cfg["backward_map"].pop("class_name"))  # type: ignore
-        disc_critic_class: type[FuseModel] = resolve_callable(cfg["disc_critic"].pop("class_name"))  # type: ignore
-        aux_critic_class: type[FuseModel] = resolve_callable(cfg["aux_critic"].pop("class_name"))  # type: ignore
-        discriminator_class: type[DiscriminatorModel] = resolve_callable(cfg["discriminator"].pop("class_name"))  # type: ignore
+        forward_map_cfg = cfg["algorithm"].pop("forward_map")
+        backward_map_cfg = cfg["algorithm"].pop("backward_map")
+        disc_critic_cfg = cfg["algorithm"].pop("disc_critic")
+        aux_critic_cfg = cfg["algorithm"].pop("aux_critic")
+        discriminator_cfg = cfg["algorithm"].pop("discriminator")
+        forward_map_class: type[FuseModel] = resolve_callable(forward_map_cfg.pop("class_name"))  # type: ignore
+        backward_map_class: type[MLPModel] = resolve_callable(backward_map_cfg.pop("class_name"))  # type: ignore
+        disc_critic_class: type[FuseModel] = resolve_callable(disc_critic_cfg.pop("class_name"))  # type: ignore
+        aux_critic_class: type[FuseModel] = resolve_callable(aux_critic_cfg.pop("class_name"))  # type: ignore
+        discriminator_class: type[MLPModel] = resolve_callable(discriminator_cfg.pop("class_name"))  # type: ignore
 
         # Resolve observation groups
         default_sets = ["actor", "critic", "backward", "discriminator", "expert"]
@@ -595,23 +613,23 @@ class FbCpr:
         )
         print(f"Actor Model: {actor}")
         forward_map: FuseModel = forward_map_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), z_dim, **cfg["forward_map"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), z_dim, **forward_map_cfg
         ).to(device)
         print(f"Forward Map Model: {forward_map}")
-        backward_map: MLPModel = backward_map_class(
-            obs, cfg["obs_groups"], "backward", z_dim, **cfg["backward_map"]
-        ).to(device)
+        backward_map: MLPModel = backward_map_class(obs, cfg["obs_groups"], "backward", z_dim, **backward_map_cfg).to(
+            device
+        )
         print(f"Backward Map Model: {backward_map}")
         disc_critic: FuseModel = disc_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **cfg["disc_critic"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **disc_critic_cfg
         ).to(device)
         print(f"Discriminator Critic Model: {disc_critic}")
         aux_critic: FuseModel = aux_critic_class(
-            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **cfg["aux_critic"]
+            obs, cfg["obs_groups"], "critic", (z_dim, env.num_actions), 1, **aux_critic_cfg
         ).to(device)
         print(f"Auxiliary Critic Model: {aux_critic}")
-        discriminator: DiscriminatorModel = discriminator_class(
-            obs, cfg["obs_groups"], "discriminator", 1, other_input_dims=(z_dim,), **cfg["discriminator"]
+        discriminator: MLPModel = discriminator_class(
+            obs, cfg["obs_groups"], "discriminator", 1, other_input_dims=(z_dim,), **discriminator_cfg
         ).to(device)
         print(f"Discriminator Model: {discriminator}")
         # Initialize shared observation normalizer across all obs keys used by any model
@@ -631,7 +649,7 @@ class FbCpr:
             max_episode_length = int(max_episode_length.max().item())
         replay_buffer = ReplayBuffer(
             env.num_envs,
-            cfg["storage_scale"] * max_episode_length,
+            cfg["algorithm"]["storage_scale"] * max_episode_length,
             obs,
             [env.num_actions],
             z_dim,
@@ -640,7 +658,7 @@ class FbCpr:
         )
         expert_buffer = (
             TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"])
-            if build_expert_buffer
+            if not inference
             else None
         )
         z_buffer = ZBuffer(cfg["algorithm"]["z_buffer_capacity"], z_dim, cfg["storage_device"])
@@ -660,6 +678,8 @@ class FbCpr:
             device=device,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
+            clip_actions=cfg.get("clip_actions"),
+            num_seed_steps_per_env=cfg.get("num_seed_steps_per_env", 0),
         )
 
         return alg
@@ -679,7 +699,7 @@ class FbCpr:
 
         Scoped to a single module on purpose: FB-CPR trains several models with separate
         optimizers and backward/step cycles, so each model's gradients must be all-reduced
-        independently right before its own ``optimizer.step()`` — reducing every model's
+        independently right before its own ``optimizer.step()`` -- reducing every model's
         parameters here (as a global reduce would) is both incorrect (it would touch other
         models' stale grads) and wasteful (one collective per model instead of per step).
         """
@@ -737,17 +757,17 @@ class FbCpr:
 
     def _soft_update_targets(self) -> None:
         """Update params of TD targets from main network params."""
-        soft_update_params(self._forward_map_paramlist, self._target_forward_map_paramlist, self.fb_tau)
-        soft_update_params(self._backward_map_paramlist, self._target_backward_map_paramlist, self.fb_tau)
-        soft_update_params(self._disc_critic_paramlist, self._target_disc_critic_paramlist, self.critic_tau)
-        soft_update_params(self._aux_critic_paramlist, self._target_aux_critic_paramlist, self.critic_tau)
+        self.target_forward_map.update()
+        self.target_backward_map.update()
+        self.target_disc_critic.update()
+        self.target_aux_critic.update()
 
     def _update_discriminator(
         self, batch: ReplayBuffer.Batch, expert_obs: TensorDict, expert_z: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype):
-            expert_logits = self.discriminator(expert_obs, expert_z, raw_logits=True)
-            unlabeled_logits = self.discriminator(batch.observations, batch.context, raw_logits=True)
+            expert_logits = self.discriminator(expert_obs, expert_z, raw_output=True)
+            unlabeled_logits = self.discriminator(batch.observations, batch.context, raw_output=True)
             # Compute loss with binary cross entropy
             expert_loss = -nn.functional.logsigmoid(expert_logits)
             unlabeled_loss = nn.functional.softplus(unlabeled_logits)

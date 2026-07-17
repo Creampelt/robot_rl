@@ -16,7 +16,7 @@ from typing import Any
 
 from robot_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from robot_rl.modules.distribution import Distribution
-from robot_rl.utils import resolve_callable, unpad_trajectories
+from robot_rl.utils import resolve_callable, resolve_nn_activation, unpad_trajectories
 
 
 class MLPModel(nn.Module):
@@ -59,7 +59,8 @@ class MLPModel(nn.Module):
             hidden_dims: Hidden dimensions of the MLP.
             activation: Activation function of the MLP.
             first_activation: Activation function of the first layer. None uses the default model activation.
-            last_activation: Activation function of the last layer. None results in a linear last layer.
+            last_activation: Activation applied to the model output in :meth:`forward`, skippable at call time via
+                ``raw_output`` and baked into the export. None leaves the output linear.
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             normalize_first_layer: Whether to normalize the first layer output with LayerNorm.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
@@ -73,9 +74,13 @@ class MLPModel(nn.Module):
                 ``obs=...``. Used for an asymmetric critic head that consumes privileged obs the actor does not see.
             memory_only: When ``True``, skip building the MLP head and output distribution. Used when a
                 memory-bearing model (RNN/TXL) is constructed solely to provide a shared latent to downstream
-                heads — :meth:`forward` then returns the memory module's latent directly.
+                heads -- :meth:`forward` then returns the memory module's latent directly.
         """
         super().__init__()
+
+        # Output activation is applied in ``forward`` (gated by ``raw_output``) and baked into the export,
+        # rather than into the MLP head, so callers can request the pre-activation output.
+        self.last_activation = resolve_nn_activation(last_activation) if last_activation is not None else None
 
         # Head-only mode bypasses observation handling entirely; the latent is produced upstream. With
         # ``append_obs_groups`` the head still resolves its obs groups to append them to that latent.
@@ -122,7 +127,6 @@ class MLPModel(nn.Module):
             hidden_dims,
             activation=activation,
             first_activation=first_activation,
-            last_activation=last_activation,
             normalize_first_layer=normalize_first_layer,
         )
 
@@ -138,13 +142,14 @@ class MLPModel(nn.Module):
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
         std_clip: float | None = None,
+        raw_output: bool = False,
     ) -> torch.Tensor:
         """Forward pass of the MLP model.
 
         ..note::
             The `stochastic_output` flag only has an effect if the model has a distribution (i.e., ``distribution_cfg``
             was provided) and defaults to ``False``, meaning that even stochastic models will return deterministic
-            outputs by default.
+            outputs by default. ``raw_output`` skips ``last_activation`` and returns the pre-activation output.
         """
         # If observations are padded for recurrent training but the model is non-recurrent, unpad the observations
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
@@ -161,6 +166,8 @@ class MLPModel(nn.Module):
                 self.distribution.update(mlp_output)
                 return self.distribution.sample(std_clip=std_clip)
             return self.distribution.deterministic_output(mlp_output)
+        if self.last_activation is not None and not raw_output:
+            mlp_output = self.last_activation(mlp_output)
         return mlp_output
 
     def forward_from_latent(
@@ -190,6 +197,8 @@ class MLPModel(nn.Module):
                 self.distribution.update(mlp_output)
                 return self.distribution.sample(std_clip=std_clip)
             return self.distribution.deterministic_output(mlp_output)
+        if self.last_activation is not None:
+            mlp_output = self.last_activation(mlp_output)
         return mlp_output
 
     def get_latent(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
@@ -240,6 +249,21 @@ class MLPModel(nn.Module):
     def output_distribution_params(self) -> tuple[torch.Tensor, ...]:
         """Return raw parameters of the current output distribution."""
         return self.distribution.params
+
+    def act_and_log_prob(
+        self, obs: TensorDict, *args: torch.Tensor, std_clip: float | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample a stochastic action and its log-prob from a single (reparameterized) draw.
+
+        Updates the output distribution from a forward pass and returns ``(action, log_prob)`` derived from the
+        same draw. Used by off-policy algorithms (e.g. SAC) that need the action and its log-prob together for the
+        entropy term; requires a distribution implementing :meth:`sample_and_log_prob`
+        (e.g. ``SquashedTanhGaussianDistribution``).
+        """
+        latent = self.get_latent(obs, *args)
+        mlp_output = self.mlp(latent)
+        self.distribution.update(mlp_output)  # type: ignore
+        return self.distribution.sample_and_log_prob(std_clip=std_clip)  # type: ignore
 
     def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
         """Compute log-probabilities of outputs under the current distribution."""
@@ -299,12 +323,13 @@ class _TorchMLPModel(nn.Module):
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
+        self.last_activation = copy.deepcopy(model.last_activation) or nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference on pre-concatenated observations."""
         x = self.obs_normalizer(x)
         out = self.mlp(x)
-        return self.deterministic_output(out)
+        return self.last_activation(self.deterministic_output(out))
 
     @torch.jit.export
     def reset(self) -> None:
@@ -327,13 +352,14 @@ class _OnnxMLPModel(nn.Module):
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
+        self.last_activation = copy.deepcopy(model.last_activation) or nn.Identity()
         self.input_size = model.obs_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference for ONNX export."""
         x = self.obs_normalizer(x)
         out = self.mlp(x)
-        return self.deterministic_output(out)
+        return self.last_activation(self.deterministic_output(out))
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor]:
         """Return representative dummy inputs for ONNX tracing."""

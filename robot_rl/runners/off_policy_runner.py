@@ -27,12 +27,12 @@ class OffPolicyRunner:
         train_cfg: dict,
         log_dir: str | None = None,
         device: str = "cpu",
-        build_expert_buffer: bool = True,
+        inference: bool = False,
     ) -> None:
         """Construct the runner, algorithm, and logging stack.
 
-        ``build_expert_buffer=False`` skips loading the expert motion buffer (a large dataset only
-        needed for training/eval), so play/visualization can construct the policy without the disk load.
+        ``inference=True`` skips loading the expert motion buffer, so play/visualization can construct the
+        policy without the disk load.
         """
         self.cfg = train_cfg
         self.device = device
@@ -46,9 +46,7 @@ class OffPolicyRunner:
 
         # Create the algorithm
         alg_class: type[FbCpr] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
-        self.alg = alg_class.construct_algorithm(
-            obs, self.env, self.cfg, self.device, build_expert_buffer=build_expert_buffer
-        )
+        self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device, inference=inference)
 
         # Create the logger
         self.logger = Logger(
@@ -65,19 +63,33 @@ class OffPolicyRunner:
         self.current_learning_iteration = 0
 
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
-        """Run the learning loop for the specified number of iterations."""
-        # Add expert buffer to environment, then re-reset so the initial state is RSI'd from the expert buffer rather
-        # than the default-pose state produced by the env wrapper's first reset (which ran before attach).
-        self.env.set_expert_buffer(self.alg.expert_buffer)
+        """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save."""
+        is_url = hasattr(self.alg, "expert_buffer")
+        start_it = self.current_learning_iteration
+        total_it = start_it + num_learning_iterations
+        collect_steps = self.cfg.get("num_steps_per_env", 1)
 
-        # Start learning
-        obs, _ = self.env.reset()
-        obs = obs.to(self.device)
-        # Switch models and environment to train mode (for dropout, env events, etc.)
+        # Resolve the update cadence and initial observations. The seed phase (warm up before policy
+        # updates begin) is a shared runner-level knob for both the URL and non-URL branches.
+        seed_until = start_it + self.cfg["num_seed_steps_per_env"]
+
+        def update_gate(it: int) -> bool:
+            return it > seed_until
+
+        if is_url:
+            num_updates = self.cfg["algorithm"]["num_agent_updates"]
+            # Attach the expert buffer, then re-reset so the initial state is RSI'd from the expert buffer
+            # rather than the default-pose state from the env wrapper's first reset (ran before attach).
+            self.env.set_expert_buffer(self.alg.expert_buffer)
+            obs, _ = self.env.reset()
+            obs = obs.to(self.device)
+            self.env.train_mode()
+        else:
+            num_updates = 1
+            obs = self.env.get_observations().to(self.device)
+
+        # Switch models to train mode (for dropout etc.) and sync parameters across ranks
         self.alg.train_mode()
-        self.env.train_mode()
-
-        # Ensure all parameters are in-synced
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
@@ -85,22 +97,21 @@ class OffPolicyRunner:
         # Initialize the logging writer
         self.logger.init_logging_writer()
 
-        # Start training
-        start_it = self.current_learning_iteration
-        total_it = start_it + num_learning_iterations
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
         eval_time = 0.0
         collect_time = 0.0
         learn_time = 0.0
-        z: torch.Tensor | None = None
-        last_dones: torch.Tensor | None = None
+        check_for_nan = self.cfg.get("check_for_nan", True)
 
         with self._get_profile_context() as prof:
             for it in range(start_it, total_it):
                 with torch.inference_mode(), torch.profiler.record_function("rollout"):
-                    # Run evaluation (skip_eval bypasses it entirely — debug-only speed-up)
+                    # Run evaluation (URL only; skip_eval bypasses it entirely -- debug-only speed-up)
                     eval_extras = None
-                    if not self.cfg.get("skip_eval", False) and (it - start_it) % self.cfg["eval_interval"] == 0:
+                    if (
+                        is_url
+                        and not self.cfg["algorithm"].get("skip_eval", False)
+                        and (it - start_it) % self.cfg["algorithm"]["eval_interval"] == 0
+                    ):
                         # Eval runs on rank 0 only (mutates the expert buffer once); other ranks skip
                         # and wait at the barrier below so update()'s all-reduces stay in lockstep.
                         if self.gpu_global_rank == 0:
@@ -113,11 +124,10 @@ class OffPolicyRunner:
                             stop = time.time()
                             eval_time += stop - start
 
-                            # reset env and training variables (only rank 0's env was perturbed)
+                            # reset env and rollout state (only rank 0's env was perturbed)
                             obs, _ = self.env.reset()
                             obs = obs.to(self.device)
-                            last_dones = None
-                            cur_episode_length[:] = 0
+                            self.alg.reset_rollout_state()
                         if self.is_distributed:
                             torch.distributed.barrier()
                             # Eval just rewrote the expert buffer's priorities on rank 0; mirror
@@ -126,53 +136,39 @@ class OffPolicyRunner:
                             torch.distributed.broadcast(priorities, src=0)
                             self.alg.expert_buffer.priorities.copy_(priorities)
 
-                    # Rollout
+                    # Collect environment steps
                     start = time.time()
-                    is_seed = it <= self.cfg["num_seed_steps_per_env"] + start_it
-                    # Update latent z
-                    z = self.alg.update_rollout_z(z, cur_episode_length, self.env.num_envs)
-                    # Sample actions
-                    actions = self.alg.act(
-                        obs, z, last_dones, random_sample=is_seed, clip_actions=self.cfg["clip_actions"]
-                    )
-                    # Step the environment
-                    with torch.profiler.record_function("env_step"):
-                        obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    # Check for NaN values from the environment
-                    if self.cfg.get("check_for_nan", True):
-                        check_nan(obs, rewards, dones)
-                    # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
-                    # Update episode length and last dones
-                    cur_episode_length += 1
-                    new_ids = (dones > 0).nonzero(as_tuple=False)
-                    cur_episode_length[new_ids] = 0
-                    last_dones = dones
-
-                    # Update timer
+                    for _ in range(collect_steps):
+                        actions = self.alg.act(obs)
+                        with torch.profiler.record_function("env_step"):
+                            obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                        if check_for_nan:
+                            check_nan(obs, rewards, dones)
+                        obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                        self.alg.process_env_step(obs, rewards, dones, extras)
+                        self.logger.process_env_step(
+                            rewards, dones, extras, intrinsic_rewards=getattr(self.alg, "intrinsic_rewards", None)
+                        )
                     stop = time.time()
                     collect_time += stop - start
                     start = stop
 
+                # Run agent updates
                 loss_extras: list[dict] = []
                 algo_extras: list[dict] = []
-                if not is_seed and it % self.cfg["num_steps_per_env"] == 0:
-                    with torch.inference_mode():
-                        self.alg.compute_gammas()
-
-                    # Update policy
+                if update_gate(it):
+                    if hasattr(self.alg, "compute_gammas"):
+                        with torch.inference_mode():
+                            self.alg.compute_gammas()
                     with torch.profiler.record_function("update"):
-                        for _ in range(self.cfg["num_agent_updates"]):
-                            loss_dict, algo_dict = self.alg.update()
+                        for _ in range(num_updates):
+                            out = self.alg.update()
+                            loss_dict, algo_dict = out if isinstance(out, tuple) else (out, {})
                             loss_extras.append(loss_dict)
-                            algo_extras.append(algo_dict)
-                    # gc.collect()
-
-                # Book keeping
-                self.logger.process_env_step(
-                    rewards, dones, extras, eval_extras=eval_extras, loss_extras=loss_extras, algo_extras=algo_extras
+                            if algo_dict:
+                                algo_extras.append(algo_dict)
+                self.logger.process_update_extras(
+                    eval_extras=eval_extras, loss_extras=loss_extras, algo_extras=algo_extras
                 )
 
                 stop = time.time()
@@ -180,7 +176,8 @@ class OffPolicyRunner:
                 self.current_learning_iteration = it
 
                 # Log information
-                if it % self.cfg["log_interval"] == 0:
+                if it % self.cfg.get("log_interval", 1) == 0:
+                    log_info = self.alg.log_info() if hasattr(self.alg, "log_info") else {}
                     self.logger.log(
                         it=it,
                         start_it=start_it,
@@ -188,6 +185,7 @@ class OffPolicyRunner:
                         collect_time=collect_time,
                         learn_time=learn_time,
                         eval_time=eval_time,
+                        **log_info,
                     )
                     eval_time = 0.0
                     collect_time = 0.0
@@ -298,14 +296,19 @@ class OffPolicyRunner:
         return self.alg.get_policy().to(device)  # type: ignore
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
-        """Export the BFM-Zero actor (with its obs normalizer baked in) to a Torch JIT file."""
-        export_model = bake_live_normalizer(self.alg.get_policy(), self.alg.obs_normalizer).to("cpu")
-        save_jit(export_model.as_jit(), path, filename)
+        """Export the actor to a Torch JIT file (baking FbCpr's external obs normalizer in when present)."""
+        save_jit(self._export_model().as_jit(), path, filename)
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
-        """Export the BFM-Zero actor (with its obs normalizer baked in) to an ONNX file."""
-        export_model = bake_live_normalizer(self.alg.get_policy(), self.alg.obs_normalizer).to("cpu")
-        save_onnx(export_model.as_onnx(verbose), path, filename, verbose)
+        """Export the actor to an ONNX file (baking FbCpr's external obs normalizer in when present)."""
+        save_onnx(self._export_model().as_onnx(verbose), path, filename, verbose)
+
+    def _export_model(self) -> MLPModel:
+        """Build the export-ready actor: FbCpr normalizes externally (bake it in); SAC normalizes in-model."""
+        normalizer = getattr(self.alg, "obs_normalizer", None)
+        if normalizer is not None:
+            return bake_live_normalizer(self.alg.get_policy(), normalizer).to("cpu")
+        return self.alg.get_policy().to("cpu")
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""

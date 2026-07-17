@@ -32,6 +32,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         num_envs: int = 1,
         shared: bool = False,
         log_videos_async: bool = False,
+        tags: list[str] | None = None,
     ) -> None:
         """Initialize a W&B run for logging."""
         if wandb is None:
@@ -50,7 +51,7 @@ class WandbLogWriter(SummaryWriter, LogWriter):
         self.num_envs = num_envs
 
         settings = wandb.Settings(start_method="thread")
-        tags = []
+        tags = list(tags or [])
         if self.shared:
             settings.x_label = "main"
             settings.mode = "shared"

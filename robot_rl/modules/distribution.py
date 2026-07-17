@@ -49,6 +49,19 @@ class Distribution(nn.Module):
         """
         raise NotImplementedError
 
+    def sample_and_log_prob(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample and return the sample together with its log probability, summed over the last dimension.
+
+        The default computes the two separately; distributions with a reparameterized sample whose log-prob is
+        best evaluated from the pre-sample latent (e.g. squashed Gaussians) should override this so both are
+        derived from the *same* draw.
+
+        Returns:
+            A tuple ``(sample, log_prob)``.
+        """
+        sample = self.sample(**kwargs)
+        return sample, self.log_prob(sample)
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the deterministic (mean) output from the raw MLP output.
 
@@ -524,36 +537,17 @@ class BetaDistribution(Distribution):
 class VonMisesFisherDistribution(Distribution):
     r"""von Mises-Fisher distribution on the unit hypersphere :math:`S^{d-1}`.
 
-    This is the "Gaussian on a sphere": a rotationally-symmetric directional distribution parameterized by a unit
-    **mean direction** :math:`\hat{\mu}` (the normalized MLP output) and a single, state-independent scalar
-    **concentration** :math:`\kappa \ge 0`. Its density w.r.t. the surface measure is
+    The directional analogue of a Gaussian: a unit mean direction :math:`\hat{\mu}` and a scalar concentration
+    :math:`\kappa \ge 0`; samples are unit vectors. Entropy is bounded above by the uniform-sphere entropy
+    (:math:`\kappa \to 0`) and vanishes as :math:`\kappa \to \infty`. ``init_std`` sets the initial
+    concentration :math:`\kappa_0 = 1/\text{init\_std}^2` and :attr:`std` reports :math:`1/\sqrt{\kappa}`, so a
+    smaller std means more concentrated (matching Gaussian semantics). :meth:`sample_and_log_prob` is
+    reparameterized for SAC-style updates; the :math:`\kappa`-dependence of the rejection acceptance probability
+    is ignored.
 
-    .. math::
-        p(x;\hat{\mu},\kappa) = C_p(\kappa)\,\exp(\kappa\,\hat{\mu}^\top x),\qquad
-        C_p(\kappa) = \frac{\kappa^{p/2-1}}{(2\pi)^{p/2} I_{p/2-1}(\kappa)},
-
-    with :math:`p` the ambient dimension (``output_dim``) and :math:`I_\nu` the modified Bessel function of the first
-    kind. As :math:`\kappa\to 0` the distribution becomes uniform on the sphere (maximum, **bounded** entropy) and as
-    :math:`\kappa\to\infty` it collapses to the point :math:`\hat{\mu}`.
-
-    Why this over a Gaussian-then-normalize action: ball-normalizing a Gaussian discards a magnitude DoF, so its
-    entropy (computed pre-normalization) is unbounded in ``std`` even though the *behavioral* (directional) spread
-    saturates to uniform — the entropy bonus then inflates ``std`` without limit. The vMF measures entropy on the
-    sphere itself, so it is bounded above by the uniform entropy and the entropy bonus is correctly priced.
-
-    The samples produced are **unit vectors**; the downstream action term is responsible for scaling them onto the
-    radius-:math:`\sqrt{p}` sphere expected by the pretrained low-level policy.
-
-    .. note::
-        Sampling uses Wood's rejection algorithm and is **not** reparameterized — this distribution targets PPO, where
-        actions are detached and only ``log_prob``/``entropy`` need to carry gradients (w.r.t. :math:`\hat{\mu}` and
-        :math:`\kappa`). It is therefore unsuitable as-is for algorithms that backpropagate through the sampled action.
-
-    .. note::
-        ``init_std`` is interpreted as an (asymptotic) tangent-space standard deviation: the concentration is
-        initialized to :math:`\kappa_0 = 1/\text{init\_std}^2` (exact only for :math:`\kappa \gg p`, where the vMF
-        looks Gaussian with per-tangent-dim variance :math:`1/\kappa`). The reported :attr:`std` is likewise
-        :math:`1/\sqrt{\kappa}`, so smaller "std" means more concentrated, matching Gaussian semantics.
+    Reference:
+        - Wood. "Simulation of the von Mises Fisher distribution." Communications in Statistics 23(1) (1994).
+        - Davidson et al. "Hyperspherical Variational Auto-Encoders." arXiv preprint arXiv:1804.00891 (2018).
     """
 
     def __init__(
@@ -632,33 +626,58 @@ class VonMisesFisherDistribution(Distribution):
         for the per-row rejection sampler, then restored. ``std_clip`` is accepted for interface compatibility
         but unused (vMF spread is set by the concentration).
         """
+        with torch.no_grad():
+            return self._rsample()
+
+    def sample_and_log_prob(self, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized ``(sample, log_prob)`` from a single draw.
+
+        Gradients flow to the mean direction and concentration through both the sample and its log-prob;
+        the acceptance probability's kappa-dependence is ignored (Davidson et al., 2018).
+        """
+        x = self._rsample()
+        return x, self.log_prob(x)
+
+    def _rsample(self) -> torch.Tensor:
+        """Sample unit vectors, differentiably w.r.t. ``(mu, kappa)`` when grad is enabled.
+
+        The rejection noise (accepted Beta draws) is sampled without gradient; the tangential component
+        ``w = mu . x`` is then rebuilt from it as a differentiable function of the concentration, and the
+        orthogonal-projection construction keeps the sample differentiable in the mean direction.
+        """
         mu = self._mu  # [..., p]
         p = mu.shape[-1]
         lead = mu.shape[:-1]
         flat_mu = mu.reshape(-1, p)  # [N, p]
         n = flat_mu.shape[0]
         device = mu.device
-        kappa = float(self._kappa.item())
-
-        # Component along the mean direction, w = mu . x, drawn from its marginal density on [-1, 1].
-        w = self._sample_weight(n, p, kappa, device)  # [N]
+        d = float(p - 1)
+        kappa = self._kappa.squeeze()
+        with torch.no_grad():
+            z = self._sample_weight_noise(n, p, float(kappa.item()), device)  # [N]
+        b = (-2.0 * kappa + torch.sqrt(4.0 * kappa * kappa + d * d)) / d
+        w = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
         # Direction orthogonal to mu, uniform on the (p-2)-subsphere.
         v = torch.randn(n, p, device=device)
         v = v - (v * flat_mu).sum(dim=-1, keepdim=True) * flat_mu
         v = torch.nn.functional.normalize(v, dim=-1)
-        x = w.unsqueeze(-1) * flat_mu + torch.sqrt((1.0 - w * w).clamp_min(0.0)).unsqueeze(-1) * v
+        x = w.unsqueeze(-1) * flat_mu + torch.sqrt((1.0 - w * w).clamp_min(1e-12)).unsqueeze(-1) * v
         x = torch.nn.functional.normalize(x, dim=-1)  # defensive re-normalization
         return x.reshape(*lead, p)
 
-    def _sample_weight(self, batch: int, p: int, kappa: float, device: torch.device) -> torch.Tensor:
-        """Sample the tangential component ``w`` of a vMF sample (Wood, 1994), vectorized with rejection refill."""
+    def _sample_weight_noise(self, batch: int, p: int, kappa: float, device: torch.device) -> torch.Tensor:
+        """Rejection-sample the Beta noise behind the tangential component ``w`` (Wood, 1994), with refill.
+
+        Returns the accepted ``Beta(d/2, d/2)`` draws; rows still unaccepted after the retry cap (should not
+        happen) keep the initial ``z = 0.5``, which maps exactly to the mode ``w = x0``.
+        """
         d = float(p - 1)
         b = (-2.0 * kappa + math.sqrt(4.0 * kappa * kappa + d * d)) / d
         x0 = (1.0 - b) / (1.0 + b)
         c = kappa * x0 + d * math.log(max(1.0 - x0 * x0, 1e-300))
         beta = Beta(torch.tensor(d / 2.0, device=device), torch.tensor(d / 2.0, device=device))
 
-        w = torch.empty(batch, device=device)
+        z = torch.full((batch,), 0.5, device=device)
         done = torch.zeros(batch, dtype=torch.bool, device=device)
         # Refill only the not-yet-accepted entries each round until all are accepted.
         for _ in range(100):
@@ -666,17 +685,14 @@ class VonMisesFisherDistribution(Distribution):
             n = todo.numel()
             if n == 0:
                 break
-            z = beta.sample((n,))
-            w_prop = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z)
+            z_prop = beta.sample((n,))
+            w_prop = (1.0 - (1.0 + b) * z_prop) / (1.0 - (1.0 - b) * z_prop)
             u = torch.rand(n, device=device)
             accept = kappa * w_prop + d * torch.log((1.0 - x0 * w_prop).clamp_min(1e-300)) - c >= torch.log(u)
             acc_idx = todo[accept]
-            w[acc_idx] = w_prop[accept]
+            z[acc_idx] = z_prop[accept]
             done[acc_idx] = True
-        # Any stragglers (should not happen): fall back to the mode.
-        if not bool(done.all()):
-            w[~done] = x0
-        return w
+        return z
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Return the unit mean direction (the deterministic action is the mode of the vMF)."""
@@ -734,6 +750,137 @@ class VonMisesFisherDistribution(Distribution):
         log_norm1, _ = self._bessel_terms(kappa1)
         dot = (mu0 * mu1).sum(dim=-1)
         return (log_norm0 - log_norm1) + a0 * (kappa0 - kappa1 * dot)
+
+
+class SquashedTanhGaussianDistribution(Distribution):
+    r"""Squashed (tanh) diagonal Gaussian for SAC-style reparameterized, bounded actions.
+
+    A diagonal Gaussian in *pre-squash* space (mean = MLP output, state-independent std) is passed through
+    ``tanh`` and affinely mapped onto ``(low, high)``: :math:`a = \text{scale}\cdot\tanh(u) + \text{offset}`.
+    Sampling is reparameterized (``rsample``) so gradients flow through the action, and :meth:`log_prob`
+    includes the tanh change-of-variables (Jacobian) correction. The scalar std is learnable or fixed and is
+    clamped in log-space to ``[log_std_min, log_std_max]``.
+
+    Use :meth:`sample_and_log_prob` for the SAC actor update: it derives the action and its log-prob from the
+    *same* pre-squash draw (numerically stable). :meth:`log_prob` on an arbitrary action inverts the squash
+    with ``atanh`` and is less precise near the bounds.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        init_noise_std: float = 1.0,
+        log_std_min: float = -20.0,
+        log_std_max: float = 2.0,
+        learn_std: bool = True,
+        low: float = -1.0,
+        high: float = 1.0,
+        eps: float = 1e-6,
+    ) -> None:
+        """Initialize the squashed-tanh Gaussian distribution module.
+
+        Args:
+            output_dim: Dimension of the action/output space.
+            init_noise_std: Initial (pre-squash) standard deviation.
+            log_std_min: Lower clamp on the log standard deviation.
+            log_std_max: Upper clamp on the log standard deviation.
+            learn_std: Whether the std is learnable. If False it is held fixed at ``init_noise_std``.
+            low: Lower bound of the squashed action range.
+            high: Upper bound of the squashed action range.
+            eps: Small tolerance for the ``atanh`` inversion in :meth:`log_prob`.
+        """
+        super().__init__(output_dim)
+        self.log_std_param = nn.Parameter(torch.log(init_noise_std * torch.ones(output_dim)), requires_grad=learn_std)
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
+        self._eps = eps
+        self._scale = (high - low) / 2
+        self._offset = (high + low) / 2
+
+        self._mean_pre: torch.Tensor | None = None  # pre-squash mean (MLP output)
+        self._std: torch.Tensor | None = None
+        self._distribution: Normal | None = None
+
+        Normal.set_default_validate_args(False)
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the pre-squash Gaussian from MLP output (mean = output; std = clamped log-std param)."""
+        self._mean_pre = mlp_output
+        log_std = self.log_std_param.clamp(self.log_std_min, self.log_std_max)
+        self._std = torch.exp(log_std).expand_as(mlp_output)
+        self._distribution = Normal(self._mean_pre, self._std)
+
+    def _squash(self, pre_tanh: torch.Tensor) -> torch.Tensor:
+        """Map a pre-squash sample into ``(low, high)`` via tanh + affine scaling."""
+        return self._scale * torch.tanh(pre_tanh) + self._offset
+
+    def _log_prob_from_pre_tanh(self, pre_tanh: torch.Tensor) -> torch.Tensor:
+        """Log-prob of the squashed action derived from its pre-squash sample, summed over the last dim.
+
+        Applies the tanh Jacobian correction with the numerically stable identity
+        ``log(1 - tanh(u)^2) = 2 (log 2 - u - softplus(-2u))`` plus ``log(scale)`` for the affine map.
+        """
+        base = self._distribution.log_prob(pre_tanh)  # type: ignore
+        jac = 2.0 * (math.log(2.0) - pre_tanh - torch.nn.functional.softplus(-2.0 * pre_tanh))
+        return (base - jac - math.log(self._scale)).sum(dim=-1)
+
+    def sample(self, std_clip: float | None = None) -> torch.Tensor:
+        """Reparameterized sample of a squashed action (``std_clip`` accepted for interface compat, unused)."""
+        return self._squash(self._distribution.rsample())  # type: ignore
+
+    def sample_and_log_prob(self, std_clip: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reparameterized ``(action, log_prob)`` from a single pre-squash draw (the SAC actor-update path)."""
+        pre_tanh = self._distribution.rsample()  # type: ignore
+        return self._squash(pre_tanh), self._log_prob_from_pre_tanh(pre_tanh)
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Log-prob of an arbitrary squashed action, inverting the squash with ``atanh`` (less precise)."""
+        t = ((outputs - self._offset) / self._scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
+        pre_tanh = torch.atanh(t)
+        return self._log_prob_from_pre_tanh(pre_tanh)
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Return the squashed mean action (the deterministic policy output)."""
+        return self._squash(mlp_output)
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Return an export-friendly module that squashes the MLP output into ``[low, high]``."""
+        return _TanhScaledDeterministicOutput(self._scale, self._offset)
+
+    @property
+    def input_dim(self) -> int:
+        """Return the input dimension required by the distribution (the MLP outputs the pre-squash mean)."""
+        return self.output_dim
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Return the squashed mean action."""
+        return self._squash(self._mean_pre)  # type: ignore
+
+    @property
+    def std(self) -> torch.Tensor:
+        """Return the pre-squash standard deviation."""
+        return self._std  # type: ignore
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """Return the *pre-squash* Gaussian entropy summed over the last dim.
+
+        The true squashed entropy has no closed form (SAC uses ``-log_prob`` instead); this exposes the
+        pre-squash Gaussian entropy so generic entropy consumers keep working.
+        """
+        return self._distribution.entropy().sum(dim=-1)  # type: ignore
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        """Return ``(pre_squash_mean, std)`` of the current distribution."""
+        return (self._mean_pre, self._std)  # type: ignore
+
+    def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Compute KL between the *pre-squash* Gaussians."""
+        old_mean, old_std = old_params
+        new_mean, new_std = new_params
+        return torch.distributions.kl_divergence(Normal(old_mean, old_std), Normal(new_mean, new_std)).sum(dim=-1)
 
 
 class _IdentityDeterministicOutput(nn.Module):

@@ -12,6 +12,7 @@ from .distribution import (
     Distribution,
     GaussianDistribution,
     HeteroscedasticGaussianDistribution,
+    SquashedTanhGaussianDistribution,
     TruncatedGaussianDistribution,
     VonMisesFisherDistribution,
 )
@@ -24,6 +25,7 @@ from .normalization import (
 from .parallel import ParallelLayerNorm, ParallelLinear
 from .residual import ResMLP
 from .rnn import RNN, HiddenState
+from .target_network import TargetNetwork
 from .transformer_xl import TransformerXL
 
 __all__ = [
@@ -42,6 +44,8 @@ __all__ = [
     "ParallelLayerNorm",
     "ParallelLinear",
     "ResMLP",
+    "SquashedTanhGaussianDistribution",
+    "TargetNetwork",
     "TransformerXL",
     "TruncatedGaussianDistribution",
     "VonMisesFisherDistribution",
