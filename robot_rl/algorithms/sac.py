@@ -268,7 +268,7 @@ class SAC:
         critic_1_loss, critic_2_loss = self._critic_losses_and_backward(
             batch, obs_b, next_obs_b, actions_b, rewards_b, not_terminated
         )
-        # clone in EAGER context: compiled outputs live in the cudagraph pool and are invalidated by the
+        # clone in eager context: compiled outputs live in the cudagraph pool and are invalidated by the
         # next replay of any graph (the in-graph clone does not escape the pool)
         critic_1_loss, critic_2_loss = critic_1_loss.clone(), critic_2_loss.clone()
         if self.is_multi_gpu:
