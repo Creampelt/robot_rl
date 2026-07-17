@@ -49,9 +49,7 @@ class OffPolicyRunner:
         # algorithms (e.g. SAC) use the plain (obs, env, cfg, device) factory signature.
         alg_class: type[FbCpr] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
         if "inference" in inspect.signature(alg_class.construct_algorithm).parameters:
-            self.alg = alg_class.construct_algorithm(
-                obs, self.env, self.cfg, self.device, inference=inference
-            )
+            self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device, inference=inference)
         else:
             self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
