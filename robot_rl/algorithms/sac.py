@@ -328,8 +328,6 @@ class SAC:
         actor_loss.backward()
         return actor_loss.detach()
 
-    # -- mode / persistence ----------------------------------------------------------------------------------
-
     def train_mode(self) -> None:
         """Set the actor and critics to training mode."""
         self.actor.train()
