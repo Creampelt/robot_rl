@@ -32,8 +32,8 @@ class OffPolicyRunner:
     ) -> None:
         """Construct the runner, algorithm, and logging stack.
 
-        ``inference=True`` skips loading the expert motion buffer (a large dataset only
-        needed for training/eval), so play/visualization can construct the policy without the disk load.
+        ``inference=True`` skips loading the expert motion buffer, so play/visualization can construct the
+        policy without the disk load.
         """
         self.cfg = train_cfg
         self.device = device

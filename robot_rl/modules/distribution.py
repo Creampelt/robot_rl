@@ -537,37 +537,17 @@ class BetaDistribution(Distribution):
 class VonMisesFisherDistribution(Distribution):
     r"""von Mises-Fisher distribution on the unit hypersphere :math:`S^{d-1}`.
 
-    This is the "Gaussian on a sphere": a rotationally-symmetric directional distribution parameterized by a unit
-    **mean direction** :math:`\hat{\mu}` (the normalized MLP output) and a single, state-independent scalar
-    **concentration** :math:`\kappa \ge 0`. Its density w.r.t. the surface measure is
+    The directional analogue of a Gaussian: a unit mean direction :math:`\hat{\mu}` and a scalar concentration
+    :math:`\kappa \ge 0`; samples are unit vectors. Entropy is bounded above by the uniform-sphere entropy
+    (:math:`\kappa \to 0`) and vanishes as :math:`\kappa \to \infty`. ``init_std`` sets the initial
+    concentration :math:`\kappa_0 = 1/\text{init\_std}^2` and :attr:`std` reports :math:`1/\sqrt{\kappa}`, so a
+    smaller std means more concentrated (matching Gaussian semantics). :meth:`sample_and_log_prob` is
+    reparameterized for SAC-style updates; the :math:`\kappa`-dependence of the rejection acceptance probability
+    is ignored.
 
-    .. math::
-        p(x;\hat{\mu},\kappa) = C_p(\kappa)\,\exp(\kappa\,\hat{\mu}^\top x),\qquad
-        C_p(\kappa) = \frac{\kappa^{p/2-1}}{(2\pi)^{p/2} I_{p/2-1}(\kappa)},
-
-    with :math:`p` the ambient dimension (``output_dim``) and :math:`I_\nu` the modified Bessel function of the first
-    kind. As :math:`\kappa\to 0` the distribution becomes uniform on the sphere (maximum, **bounded** entropy) and as
-    :math:`\kappa\to\infty` it collapses to the point :math:`\hat{\mu}`.
-
-    Why this over a Gaussian-then-normalize action: ball-normalizing a Gaussian discards a magnitude DoF, so its
-    entropy (computed pre-normalization) is unbounded in ``std`` even though the *behavioral* (directional) spread
-    saturates to uniform -- the entropy bonus then inflates ``std`` without limit. The vMF measures entropy on the
-    sphere itself, so it is bounded above by the uniform entropy and the entropy bonus is correctly priced.
-
-    The samples produced are **unit vectors**; the downstream action term is responsible for scaling them onto the
-    radius-:math:`\sqrt{p}` sphere expected by the pretrained low-level policy.
-
-    .. note::
-        Sampling uses Wood's rejection algorithm. :meth:`sample_and_log_prob` is reparameterized for SAC-style
-        updates that backpropagate through the action: the rejection noise is drawn without gradient, then the
-        sample is rebuilt as a differentiable transform of :math:`(\hat{\mu}, \kappa)`; the :math:`\kappa`-dependence
-        of the acceptance probability is ignored (as in Davidson et al., 2018).
-
-    .. note::
-        ``init_std`` is interpreted as an (asymptotic) tangent-space standard deviation: the concentration is
-        initialized to :math:`\kappa_0 = 1/\text{init\_std}^2` (exact only for :math:`\kappa \gg p`, where the vMF
-        looks Gaussian with per-tangent-dim variance :math:`1/\kappa`). The reported :attr:`std` is likewise
-        :math:`1/\sqrt{\kappa}`, so smaller "std" means more concentrated, matching Gaussian semantics.
+    Reference:
+        - Wood. "Simulation of the von Mises Fisher distribution." Communications in Statistics 23(1) (1994).
+        - Davidson et al. "Hyperspherical Variational Auto-Encoders." arXiv preprint arXiv:1804.00891 (2018).
     """
 
     def __init__(
