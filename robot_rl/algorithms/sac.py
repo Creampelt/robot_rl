@@ -25,6 +25,8 @@ class SAC:
     Reference:
         - Haarnoja et al. "Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a
           Stochastic Actor." arXiv preprint arXiv:1801.01290 (2018).
+        - Sabatini et al. "Bridging the Gap: Enabling Soft Actor Critic for High Performance Legged
+          Locomotion." arXiv preprint arXiv:2605.24975 (2026).
     """
 
     def __init__(
