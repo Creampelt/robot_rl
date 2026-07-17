@@ -674,9 +674,11 @@ class FbCpr:
         max_episode_length = env.max_episode_length
         if isinstance(max_episode_length, torch.Tensor):
             max_episode_length = int(max_episode_length.max().item())
+        # inference never samples the storage: keep it at one row per env rather than
+        # storage_scale * max_episode_length, which explodes on never-resetting play envs
         replay_buffer = ReplayBuffer(
             env.num_envs,
-            cfg["algorithm"]["storage_scale"] * max_episode_length,
+            cfg["algorithm"]["storage_scale"] * max_episode_length if not inference else 1,
             obs,
             [env.num_actions],
             z_dim,
