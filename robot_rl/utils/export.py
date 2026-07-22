@@ -140,7 +140,8 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
 
     def build(name: str) -> nn.Module:
         cfg_key, obs_set, default_class, out_spec, other_spec = _FBCPR_MODELS[name]
-        model_cfg = dict(cfg[cfg_key])
+        # legacy runs keep model cfgs at the top level; current FbCpr cfgs nest them in the algorithm
+        model_cfg = dict(cfg.get(cfg_key) or cfg["algorithm"][cfg_key])
         model_class = resolve_callable(model_cfg.pop("class_name", default_class))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
