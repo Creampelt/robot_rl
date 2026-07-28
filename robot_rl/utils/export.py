@@ -187,8 +187,11 @@ def save_jit(module: nn.Module, path: str, filename: str) -> str:
     return save_path
 
 
-def save_onnx(module: nn.Module, path: str, filename: str, verbose: bool = False) -> str:
-    """Save an ONNX export; the module must provide dummy inputs and input/output names."""
+def save_onnx(module: nn.Module, path: str, filename: str, verbose: bool = False, opset: int = 18) -> str:
+    """Save an ONNX export; the module must provide dummy inputs and input/output names.
+
+    ``opset`` is raised by modules that need a newer operator (they advertise it as ``onnx_opset``).
+    """
     os.makedirs(path, exist_ok=True)
     save_path = os.path.join(path, filename)
     torch.onnx.export(
@@ -196,7 +199,7 @@ def save_onnx(module: nn.Module, path: str, filename: str, verbose: bool = False
         module.get_dummy_inputs(),
         save_path,
         export_params=True,
-        opset_version=18,
+        opset_version=opset,
         verbose=verbose,
         input_names=module.input_names,
         output_names=module.output_names,
