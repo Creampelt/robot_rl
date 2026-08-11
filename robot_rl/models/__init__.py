@@ -7,15 +7,18 @@
 
 from .cnn_model import CNNModel
 from .fuse_model import FuseModel, ResidualFuseModel
+from .inference import EncoderInferencePolicy, SharedMemoryInferencePolicy
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 from .txl_model import TXLModel
 
 __all__ = [
     "CNNModel",
+    "EncoderInferencePolicy",
     "FuseModel",
     "MLPModel",
     "RNNModel",
     "ResidualFuseModel",
+    "SharedMemoryInferencePolicy",
     "TXLModel",
 ]
