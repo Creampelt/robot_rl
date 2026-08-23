@@ -4,20 +4,57 @@ from tensordict import TensorDict
 
 from .expert_buffer import ExpertBuffer
 
+# Rows drawn per window; only short rows consume more than one.
+NUM_STITCH_SEGMENTS = 16
+
 
 def _get_idxs(
     priorities: torch.Tensor,
+    valid_lengths: torch.Tensor,
     num_slices: int,
     seq_length: int,
     bucket_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate ``(episode, frame)`` indices for sampling consecutive windows from a trajectory buffer."""
-    ep_indices = torch.multinomial(priorities, num_slices, replacement=True)
-    starts = torch.randint(0, bucket_size - seq_length, (num_slices,), device=priorities.device)
-    offsets = torch.arange(seq_length, device=priorities.device)
-    seq_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
-    ep_flat = ep_indices.unsqueeze(1).expand(num_slices, seq_length).reshape(-1)
-    return ep_flat, seq_indices
+    num_segments: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate current/next ``(episode, frame)`` indices for consecutive windows, skipping padding.
+
+    A window enters its first row at a random real frame and plays to that row's last real frame; if
+    that does not fill the window it continues from the start of a further row, so hold-final-frame
+    padding is never sampled. Rows long enough to cover the window on their own yield a single
+    unbroken segment, which is the whole window for un-padded bundles.
+
+    Returns:
+        ``(ep, frame, next_ep, next_frame)``, each flattened to ``num_slices * seq_length``; the next
+        indices are the following real frame, which a ``frame + 1`` lookup cannot express at a seam.
+    """
+    device = priorities.device
+    window = seq_length + 1  # the caller also needs each frame's successor
+    ep = torch.multinomial(priorities, num_slices * num_segments, replacement=True).view(num_slices, num_segments)
+    lengths = valid_lengths[ep]
+
+    # Only the entry point is random: later segments begin at their own clip's first frame.
+    start_max = torch.clamp(lengths[:, :1] - seq_length, min=1, max=bucket_size - seq_length)
+    first_start = (torch.rand(num_slices, 1, device=device) * start_max).long()
+    starts = torch.cat([first_start, torch.zeros(num_slices, num_segments - 1, dtype=torch.long, device=device)], 1)
+    seg_lengths = lengths - starts
+    ends = torch.cumsum(seg_lengths, dim=1)
+
+    pos = torch.arange(window, device=device).unsqueeze(0).expand(num_slices, window).contiguous()
+    seg = torch.searchsorted(ends, pos, right=True)
+    # Exhausting every segment is vanishingly rare; wrap inside the last one rather than pad.
+    exhausted = seg >= num_segments
+    seg = seg.clamp(max=num_segments - 1)
+    consumed = torch.where(seg > 0, ends.gather(1, (seg - 1).clamp(min=0)), torch.zeros_like(seg))
+    offset = pos - consumed
+    offset = torch.where(exhausted, offset % seg_lengths.gather(1, seg), offset)
+    frames = starts.gather(1, seg) + offset
+    eps = ep.gather(1, seg)
+    return (
+        eps[:, :-1].reshape(-1),
+        frames[:, :-1].reshape(-1),
+        eps[:, 1:].reshape(-1),
+        frames[:, 1:].reshape(-1),
+    )
 
 
 class TrajectoryBuffer(ExpertBuffer):
@@ -41,8 +78,16 @@ class TrajectoryBuffer(ExpertBuffer):
                 f"{self.motions.shape}."
             )
         self.num_motions, self.bucket_size = self.motions.shape
+        # per-row un-padded frame count ("length" key from play_dataset --pad_to_segment); bundles
+        # without it (e.g. LAFAN, fully-real buckets) fall back to bucket_size
+        if "length" in self.motions:
+            self.valid_lengths = self.motions["length"][:, 0].long().clamp(1, self.bucket_size)
+        else:
+            self.valid_lengths = torch.full((self.num_motions,), self.bucket_size, dtype=torch.long, device=device)
         self.priorities = torch.ones((self.num_motions,), device=device)
         self._eval_order = torch.arange(0, self.num_motions, device=self.device)
+        # per-row valid lengths of the most recent get_batch_motions mini-batch
+        self.current_eval_motion_lengths: torch.Tensor | None = None
 
         # mode="default" (no CUDA graphs): this samples under the inference_mode rollout, so a
         # reduce-overhead capture would poison the shared cudagraph pool that update() later reuses.
@@ -77,10 +122,12 @@ class TrajectoryBuffer(ExpertBuffer):
         if seq_length >= self.bucket_size:
             raise ValueError(f"seq_length ({seq_length}) must be less than bucket_size ({self.bucket_size}).")
         num_slices = batch_size // seq_length
-        ep_flat, seq_indices = self._get_idxs(self.priorities, num_slices, seq_length, self.bucket_size)
+        ep_flat, seq_indices, next_ep_flat, next_seq_indices = self._get_idxs(
+            self.priorities, self.valid_lengths, num_slices, seq_length, self.bucket_size, NUM_STITCH_SEGMENTS
+        )
         return (
             self.motions[ep_flat, seq_indices].to(device),
-            self.motions[ep_flat, seq_indices + 1].to(device),
+            self.motions[next_ep_flat, next_seq_indices].to(device),
         )
 
     def sample_states(self, num_envs: int, device: str | None = None) -> dict[str, torch.Tensor]:
@@ -89,7 +136,8 @@ class TrajectoryBuffer(ExpertBuffer):
         See :meth:`get_expert_state` for full state dictionary format.
         """
         ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
-        motion_indices = torch.randint(0, self.bucket_size, (num_envs,), device=self.device)
+        # spawn only from real frames: hold-final-frame padding is a static pose, not a start state
+        motion_indices = (torch.rand(num_envs, device=self.device) * self.valid_lengths[ep_indices]).long()
         motions = self.motions[ep_indices, motion_indices]
         return self.get_expert_state(motions, device=device)
 
@@ -107,6 +155,8 @@ class TrajectoryBuffer(ExpertBuffer):
         self._eval_order = torch.randperm(self.num_motions, device=self.device)
         for idx in range(0, self.num_motions, mini_batch_size):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
+            # rows are yielded whole, so the caller needs the valid lengths to ignore padded frames
+            self.current_eval_motion_lengths = self.valid_lengths[eval_idxs]
             yield self.motions[eval_idxs].to(device)
 
     def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:

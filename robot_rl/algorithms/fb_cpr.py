@@ -463,9 +463,14 @@ class FbCpr:
             # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
             # Compare against frames 1..bucket_size-1 since actual_qpos[:, t] is the pose after targeting frame t+1.
             eval_qpos = eval_motions["joint_position"][:, 1:]
+            # padded frames hold the final pose, which is trivial to track and would deflate the EMD
+            # (and so the priority) of exactly the clips that are shortest
+            valid = self.expert_buffer.current_eval_motion_lengths
             emds = torch.empty((mini_batch_size,), device=self.device)
             for i in range(mini_batch_size):
-                emds[i] = compute_emd(actual_qpos[i], eval_qpos[i])
+                n = eval_qpos.shape[1] if valid is None else int(valid[i].item()) - 1
+                n = max(1, min(n, actual_qpos.shape[1]))
+                emds[i] = compute_emd(actual_qpos[i, :n], eval_qpos[i, :n])
             priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
             # Save priorities to expert buffer
             self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
