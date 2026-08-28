@@ -32,6 +32,11 @@ class FbCpr:
           arXiv:2504.11054 (2025).
     """
 
+    EXPERT_BUNDLE_ROLES = ("backward", "discriminator", "expert")
+    """Obs-group roles served from the stored expert bundle: ``sample()`` feeds the backward map and the
+    discriminator, and ``get_expert_state()`` feeds eval. Every other role is fed from the live rollout, so a
+    bundle need not carry its groups."""
+
     actor: FuseModel
     """The actor model."""
 
@@ -599,6 +604,18 @@ class FbCpr:
         """Get the policy model."""
         return self.actor
 
+    @classmethod
+    def expert_bundle_groups(cls, obs_groups: dict[str, list[str]]) -> list[str]:
+        """Return the obs groups a stored expert bundle must contain, derived from the role mapping.
+
+        Args:
+            obs_groups: The resolved role -> group-name mapping (``cfg["obs_groups"]``).
+
+        Returns:
+            Sorted group names, deduplicated across :attr:`EXPERT_BUNDLE_ROLES`.
+        """
+        return sorted({g for role in cls.EXPERT_BUNDLE_ROLES for g in obs_groups[role]})
+
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool = False) -> FbCpr:
         """Construct the FB-CPR algorithm.
@@ -690,6 +707,16 @@ class FbCpr:
             if not inference
             else None
         )
+        if expert_buffer is not None:
+            # A bundle missing a consumed group still loads and trains: DictModule skips absent keys.
+            required = FbCpr.expert_bundle_groups(cfg["obs_groups"])
+            missing = [g for g in required if g not in expert_buffer.motions]
+            if missing:
+                raise ValueError(
+                    f"Expert bundle {cfg['algorithm']['motion_path']!r} is missing obs group(s) {missing}, which"
+                    f" {FbCpr.EXPERT_BUNDLE_ROLES} read. It has {sorted(expert_buffer.motions.keys())}; rebuild it"
+                    " against this env."
+                )
         z_buffer = ZBuffer(cfg["algorithm"]["z_buffer_capacity"], z_dim, cfg["storage_device"])
 
         # Initialize the algorithm
