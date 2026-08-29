@@ -449,12 +449,23 @@ class FbCpr:
             obs, _ = env.reset_to({"articulation": {"robot": first_motions}}, is_relative=True)
             num_joints = first_motions["joint_position"].shape[1]
             actual_qpos = torch.zeros((mini_batch_size, rollout_steps, num_joints), device=self.device)
+            # A recorder may visualize the clip being tracked; pad the frames it would need.
+            publish_ref = getattr(getattr(env, "unwrapped", env), "write_reference_pose", None)
+            if publish_ref is not None:
+                ref_root = pad_to_size_repeat(
+                    torch.cat([eval_motions["root_pose"], eval_motions["root_velocity"]], dim=-1), env.num_envs
+                )
+                ref_joint_pos = pad_to_size_repeat(eval_motions["joint_position"], env.num_envs)
+                ref_joint_vel = pad_to_size_repeat(eval_motions["joint_velocity"], env.num_envs)
             # Run rollouts for each trajectory latent task and save qpos at each step
             for it in range(rollout_steps):
                 obs = self.obs_normalizer(obs)
                 actions = self.actor(obs, eval_zs[:, it, :])
                 # Pad out remaining envs with zeros
                 actions = pad_to_size(actions, env.num_envs, dim=0)
+                if publish_ref is not None:
+                    # frame it+1 is what z targets this step: the pose the robot is asked to reach
+                    publish_ref(ref_root[:, it + 1], ref_joint_pos[:, it + 1], ref_joint_vel[:, it + 1])
                 obs, _, _, _ = env.step(actions.to(env.device))
                 actual_qpos[:, it, :] = self.expert_buffer.get_expert_state(obs)["joint_position"][:mini_batch_size].to(
                     self.device
