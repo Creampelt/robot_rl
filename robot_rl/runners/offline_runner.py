@@ -149,8 +149,8 @@ class OfflineRlRunner:
         return policy
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
-        """Record a repository's state alongside the run."""
-        self.logger.add_git_repo_to_log(repo_file_path)
+        """Register a repository path whose git status should be logged."""
+        self.logger.git_status_repos.append(repo_file_path)
 
     def _configure_multi_gpu(self) -> None:
         """Read the distributed environment and set this rank's device."""
