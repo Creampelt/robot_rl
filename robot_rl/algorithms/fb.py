@@ -366,9 +366,13 @@ class Fb:
             p.grad.data.copy_(flat[offset : offset + numel].view_as(p.grad.data))
             offset += numel
 
+    DATASET_ROLES = ("actor", "critic", "backward")
+    """Roles served from the stored dataset: the actor, the forward map (built on the critic set), and
+    the backward map. Every gradient step reads all three from the same transition."""
+
     @classmethod
     def expert_bundle_groups(cls, obs_groups: dict[str, list[str]]) -> list[str]:
-        """Obs groups a stored dataset must carry: those the backward map and the actor read.
+        """Obs groups a stored dataset must carry, derived from the role mapping.
 
         Args:
             obs_groups: The resolved role -> group-name mapping.
@@ -376,7 +380,7 @@ class Fb:
         Returns:
             Sorted, deduplicated group names.
         """
-        return sorted({g for role in ("backward", "actor") for g in obs_groups[role]})
+        return sorted({g for role in cls.DATASET_ROLES for g in obs_groups[role]})
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: URLVecEnv, cfg: dict, device: str, inference: bool = False) -> Fb:

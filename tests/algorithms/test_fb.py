@@ -144,6 +144,11 @@ class TestFb:
         on.train_mode()
         assert on.update()[0]["Actor_Loss/behavior_loss"] > 0.0
 
+    def test_required_groups_cover_every_model_that_reads_the_dataset(self) -> None:
+        """The forward map is built on the critic set, so omitting it would let a short dataset through."""
+        groups = {"actor": ["a"], "critic": ["c"], "backward": ["b"]}
+        assert Fb.expert_bundle_groups(groups) == ["a", "b", "c"]
+
     def test_dataset_missing_a_consumed_group_is_rejected(self, tmp_path: Path) -> None:
         """A dataset lacking a group the backward map reads would train quietly on less than configured."""
         cfg = _make_cfg(_write_dataset(tmp_path))
