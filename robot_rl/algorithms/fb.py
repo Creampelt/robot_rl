@@ -4,7 +4,6 @@ import math
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
-from typing import Any
 
 from robot_rl.env import URLVecEnv
 from robot_rl.models import FuseModel, MLPModel
@@ -62,7 +61,6 @@ class Fb:
         compile_mode: str | None = None,
         clip_actions: float | None = None,
         multi_gpu_cfg: dict | None = None,
-        **kwargs: Any,
     ) -> None:
         """Initialize the algorithm with models, dataset, and optimization settings."""
         self.device = device
@@ -448,6 +446,9 @@ class Fb:
         else:
             cfg["algorithm"].pop("dataset_path", None)
 
+        # gamma is already baked into the dataset's per-transition discounts, and num_agent_updates is
+        # the runner's loop count; everything else must be a constructor argument or Fb will reject it
+        alg_kwargs = {k: v for k, v in cfg["algorithm"].items() if k not in ("gamma", "num_agent_updates")}
         return Fb(
             actor=actor,
             forward_map=forward_map,
@@ -457,5 +458,5 @@ class Fb:
             device=device,
             clip_actions=cfg.get("clip_actions"),
             multi_gpu_cfg=cfg.get("multi_gpu_cfg"),
-            **cfg["algorithm"],
+            **alg_kwargs,
         )
