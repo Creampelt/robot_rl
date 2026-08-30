@@ -40,15 +40,10 @@ class OfflineTransitionDataset:
         """
         del device
         data = torch.load(path, weights_only=False)
-        self.observations: TensorDict = data["observations"].to(storage_device)
-        self.next_observations: TensorDict = data["next_observations"].to(storage_device)
         self.actions: torch.Tensor = data["actions"].to(storage_device)
         num = self.actions.shape[0]
-        if self.observations.shape[0] != num or self.next_observations.shape[0] != num:
-            raise ValueError(
-                f"Transition counts disagree: actions {num}, observations {self.observations.shape[0]},"
-                f" next_observations {self.next_observations.shape[0]}."
-            )
+        self.observations = self._batched(data["observations"].to(storage_device), num, "observations")
+        self.next_observations = self._batched(data["next_observations"].to(storage_device), num, "next_observations")
         self.rewards = data.get("rewards", torch.zeros(num, 1)).to(storage_device).view(num, 1)
         terminated = data.get("terminated", torch.zeros(num, 1, dtype=torch.bool))
         self.next_terminated = terminated.to(storage_device).view(num, 1).bool()
@@ -67,6 +62,24 @@ class OfflineTransitionDataset:
             f"[INFO] Loaded {num} offline transitions with groups {self.obs_groups}"
             f" ({dropped} terminal rows excluded from sampling)."
         )
+
+    @staticmethod
+    def _batched(td: TensorDict, num: int, name: str) -> TensorDict:
+        """Give a stored TensorDict its transition batch dimension, checking every group agrees.
+
+        Args:
+            td: Observation groups as loaded; a writer may leave the batch size unset.
+            num: Transition count the groups must share.
+            name: Field name, for the error message.
+
+        Returns:
+            The same data with a batch size, so a batch of indices selects transitions.
+        """
+        for group, tensor in td.items():
+            if tensor.shape[0] != num:
+                raise ValueError(f"Transition counts disagree: actions {num}, {name}[{group!r}] {tensor.shape[0]}.")
+        td.batch_size = torch.Size([num])
+        return td
 
     def __len__(self) -> int:
         """Return the number of stored transitions."""

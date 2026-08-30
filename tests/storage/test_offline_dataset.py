@@ -70,6 +70,15 @@ class TestOfflineTransitionDataset:
         assert not ds.next_terminated.any()
         assert torch.allclose(ds.gammas, torch.full((1,), 0.99))
 
+    def test_tensordict_saved_without_a_batch_size_is_accepted(self, tmp_path: Path) -> None:
+        """A writer may save groups with no batch dim; the tensors are still correctly shaped."""
+        obs = TensorDict({"state": torch.randn(NUM, 7)}, batch_size=[])
+        nxt = TensorDict({"state": torch.randn(NUM, 7)}, batch_size=[])
+        path = tmp_path / "nobatch.pt"
+        torch.save({"observations": obs, "next_observations": nxt, "actions": torch.randn(NUM, ACT)}, path)
+        ds = OfflineTransitionDataset(path, z_dim=Z, batch_size=8)
+        assert ds.sample_mini_batch().observations["state"].shape == (8, 7)
+
     def test_mismatched_transition_counts_are_rejected(self, tmp_path: Path) -> None:
         """A truncated next_observations set would silently misalign every transition."""
         with pytest.raises(ValueError, match="Transition counts disagree"):
