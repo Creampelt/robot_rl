@@ -168,8 +168,14 @@ class Fb:
         torch.compiler.cudagraph_mark_step_begin()
         fb_losses, fb_extras = self._update_forward_backward(batch)
         actor_losses, actor_extras = self._update_actor(batch)
-        self._soft_update_targets()
-        return {**fb_losses, **actor_losses}, {**fb_extras, **actor_extras}
+
+        with torch.no_grad():
+            self._soft_update_targets()
+            # under cudagraphs these are graph-owned buffers the next iteration overwrites, so the
+            # logger would read them after they had already been reused
+            loss_dict = {k: v.clone() for k, v in {**fb_losses, **actor_losses}.items()}
+            extras = {k: v.clone() for k, v in {**fb_extras, **actor_extras}.items()}
+        return loss_dict, extras
 
     def _update_forward_backward(self, batch: ReplayBuffer.Batch) -> tuple[dict[str, torch.Tensor], dict]:
         with torch.autocast(device_type=self.device, dtype=self.dtype, enabled=self._autocast_enabled):
