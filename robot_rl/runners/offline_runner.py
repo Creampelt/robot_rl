@@ -69,6 +69,13 @@ class OfflineRlRunner:
         learn_time = 0.0
         eval_time = 0.0
         for it in range(start_it + 1, total_it + 1):
+            eval_extras: list[dict] = []
+            eval_interval = self.cfg["algorithm"].get("eval_interval")
+            if eval_interval and it % eval_interval == 0 and not self.cfg["algorithm"].get("skip_eval", False):
+                start = time.time()
+                eval_extras = self.alg.eval(self.env)
+                eval_time += time.time() - start
+
             start = time.time()
             loss_extras: list[dict] = []
             algo_extras: list[dict] = []
@@ -77,7 +84,7 @@ class OfflineRlRunner:
                 loss_extras.append(loss_dict)
                 if algo_dict:
                     algo_extras.append(algo_dict)
-            self.logger.process_update_extras(eval_extras=[], loss_extras=loss_extras, algo_extras=algo_extras)
+            self.logger.process_update_extras(eval_extras=eval_extras, loss_extras=loss_extras, algo_extras=algo_extras)
             learn_time += time.time() - start
             self.current_learning_iteration = it
 

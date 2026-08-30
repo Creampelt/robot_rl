@@ -157,6 +157,12 @@ class TestFb:
         with pytest.raises((ValueError, KeyError)):
             Fb.construct_algorithm(env.get_observations(), env, cfg, device="cpu")
 
+    def test_eval_is_a_no_op_without_motions(self, tmp_path: Path) -> None:
+        """Training must not require an eval bundle; scoring is optional."""
+        alg = _build(tmp_path)
+        assert alg.eval_buffer is None
+        assert alg.eval(_DummyVecEnv()) == []
+
     def test_policy_state_keys_exclude_optimizers(self, tmp_path: Path) -> None:
         """Slimmed checkpoints keep only what inference needs."""
         alg = _build(tmp_path)

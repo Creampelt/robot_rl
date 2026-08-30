@@ -4,13 +4,17 @@ import math
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Any
 
 from robot_rl.env import URLVecEnv
 from robot_rl.models import FuseModel, MLPModel
 from robot_rl.modules import DictModule, TargetNetwork
-from robot_rl.storage import OfflineTransitionDataset, ReplayBuffer
+from robot_rl.storage import OfflineTransitionDataset, ReplayBuffer, TrajectoryBuffer
 from robot_rl.utils import (
+    compute_emd,
     compute_td_targets,
+    pad_to_size,
+    pad_to_size_repeat,
     resolve_callable,
     resolve_dtype,
     resolve_obs_groups,
@@ -40,6 +44,7 @@ class Fb:
         backward_map: MLPModel,
         obs_normalizer: DictModule[nn.BatchNorm1d],
         dataset: ReplayBuffer,
+        eval_buffer: TrajectoryBuffer | None,
         z_dim: int,
         actor_learning_rate: float = 1e-4,
         forward_learning_rate: float = 1e-4,
@@ -99,6 +104,7 @@ class Fb:
         self.target_forward_map = TargetNetwork(self.forward_map, tau=fb_tau).to(device)
         self.target_backward_map = TargetNetwork(self.backward_map, tau=fb_tau).to(device)
         self.dataset = dataset
+        self.eval_buffer = eval_buffer
 
         optimizer_class = resolve_optimizer(optimizer)
         self.actor_optimizer = optimizer_class(
@@ -286,6 +292,76 @@ class Fb:
             extras = {"actor_F1": Fs[0].mean().detach()}
         return loss_dict, extras
 
+    @torch.no_grad()
+    def eval(self, env: URLVecEnv, max_steps: int | None = None, **kwargs: Any) -> list[dict[str, torch.Tensor]]:
+        r"""Track each stored motion under :math:`z = B(s)` and score it by Earth Mover's Distance.
+
+        The same measurement as :meth:`FbCpr.eval`: encode a clip's frames with the backward map, drive
+        the actor with that latent sequence from the clip's first pose, and compare the joint
+        trajectory the policy produced against the clip's own.
+
+        Args:
+            env: Environment to replay the motions in.
+            max_steps: Stop after this many ``env.step`` calls across all mini-batches; None runs every
+                mini-batch. Intended for a recorder that only needs a bounded clip.
+            **kwargs: Accepted and ignored, so eval has a uniform signature across algorithms.
+
+        Returns:
+            One dict per mini-batch holding that batch's per-motion EMD.
+        """
+        if self.eval_buffer is None:
+            return []
+        print("[INFO] Evaluating motions...")
+        self.eval_mode()
+        env.eval_mode()
+
+        eval_infos: list[dict[str, torch.Tensor]] = []
+        bucket_size = self.eval_buffer.bucket_size
+        steps_done = 0
+        for eval_obs in self.eval_buffer.get_batch_motions(env.num_envs, device=self.device):
+            mini_batch_size = eval_obs.shape[0]
+            eval_motions = self.eval_buffer.get_expert_state(eval_obs)
+            norm_eval_obs = self.obs_normalizer(eval_obs.view(-1))
+            # z at step t encodes the NEXT desired state, matching how the actor is conditioned
+            eval_zs = self.backward_map(norm_eval_obs).view(mini_batch_size, bucket_size, -1)[:, 1:, :]
+            rollout_steps = bucket_size - 1
+            eval_zs = pad_to_size(eval_zs, env.num_envs, dim=0)
+            # padded envs are discarded, but a zero pose is an invalid root quaternion
+            first_motions = {k: pad_to_size_repeat(v[:, 0, :], env.num_envs) for k, v in eval_motions.items()}
+            obs, _ = env.reset_to({"articulation": {"robot": first_motions}}, is_relative=True)
+            num_joints = first_motions["joint_position"].shape[1]
+            actual_qpos = torch.zeros((mini_batch_size, rollout_steps, num_joints), device=self.device)
+
+            for it in range(rollout_steps):
+                obs = self.obs_normalizer(obs)
+                actions = pad_to_size(self.actor(obs, eval_zs[:, it, :]), env.num_envs, dim=0)
+                obs, _, _, _ = env.step(actions.to(env.device))
+                actual_qpos[:, it, :] = self.eval_buffer.get_expert_state(obs)["joint_position"][:mini_batch_size].to(
+                    self.device
+                )
+                steps_done += 1
+                if max_steps is not None and steps_done >= max_steps:
+                    break
+
+            # compare against frames 1.. since actual_qpos[:, t] is the pose after targeting frame t+1
+            eval_qpos = eval_motions["joint_position"][:, 1:]
+            # padded frames hold the final pose, which is trivial to track and would deflate the EMD
+            valid = self.eval_buffer.current_eval_motion_lengths
+            emds = torch.empty((mini_batch_size,), device=self.device)
+            for i in range(mini_batch_size):
+                n = eval_qpos.shape[1] if valid is None else int(valid[i].item()) - 1
+                n = max(1, min(n, actual_qpos.shape[1]))
+                emds[i] = compute_emd(actual_qpos[i, :n], eval_qpos[i, :n])
+            eval_infos.append({"emd": emds.detach().cpu()})
+
+            if max_steps is not None and steps_done >= max_steps:
+                break
+
+        self.train_mode()
+        env.train_mode()
+        print("[INFO] Finished evaluating motions.")
+        return eval_infos
+
     def train_mode(self) -> None:
         """Set train mode for learnable models."""
         for model in self.models:
@@ -409,7 +485,7 @@ class Fb:
         forward_map_class: type[FuseModel] = resolve_callable(forward_map_cfg.pop("class_name"))  # type: ignore
         backward_map_class: type[MLPModel] = resolve_callable(backward_map_cfg.pop("class_name"))  # type: ignore
 
-        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], ["actor", "critic", "backward"])
+        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], ["actor", "critic", "backward", "expert"])
 
         actor_dist_cfg = cfg["actor"].get("distribution_cfg")
         if actor_dist_cfg is not None and actor_dist_cfg.get("class_name") == "TruncatedGaussianDistribution":
@@ -437,6 +513,13 @@ class Fb:
             key: nn.BatchNorm1d(obs[key].shape[-1], momentum=0.01, affine=False) for key in all_obs_keys
         }).to(device)
 
+        # Motions for the EMD eval: separate from the transition dataset, since tracking is scored
+        # against whole clips rather than the individual steps training reads.
+        eval_path = cfg["algorithm"].pop("eval_motion_path", None)
+        eval_buffer = None
+        if eval_path and not inference:
+            eval_buffer = TrajectoryBuffer(eval_path, cfg["obs_groups"]["expert"], cfg["storage_device"])
+
         dataset = None
         if not inference:
             dataset = OfflineTransitionDataset(
@@ -456,15 +539,17 @@ class Fb:
         else:
             cfg["algorithm"].pop("dataset_path", None)
 
-        # gamma is already baked into the dataset's per-transition discounts, and num_agent_updates is
-        # the runner's loop count; everything else must be a constructor argument or Fb will reject it
-        alg_kwargs = {k: v for k, v in cfg["algorithm"].items() if k not in ("gamma", "num_agent_updates")}
+        # gamma is baked into the dataset's per-transition discounts and the rest are the runner's to
+        # read; everything else must be a constructor argument or Fb will reject it
+        runner_owned = ("gamma", "num_agent_updates", "eval_interval", "skip_eval")
+        alg_kwargs = {k: v for k, v in cfg["algorithm"].items() if k not in runner_owned}
         return Fb(
             actor=actor,
             forward_map=forward_map,
             backward_map=backward_map,
             obs_normalizer=obs_normalizer,
             dataset=dataset,
+            eval_buffer=eval_buffer,
             device=device,
             clip_actions=cfg.get("clip_actions"),
             multi_gpu_cfg=cfg.get("multi_gpu_cfg"),
