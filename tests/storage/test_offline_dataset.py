@@ -75,6 +75,20 @@ class TestOfflineTransitionDataset:
         with pytest.raises(ValueError, match="Transition counts disagree"):
             OfflineTransitionDataset(_write(tmp_path, next_num=NUM - 1), z_dim=Z, batch_size=8)
 
+    def test_terminal_rows_are_excluded_from_sampling_by_default(self, tmp_path: Path) -> None:
+        """Their successor is the post-reset state, and the backward map encodes it for every row."""
+        term = torch.zeros(NUM, 1, dtype=torch.bool)
+        term[::2] = True
+        ds = OfflineTransitionDataset(_write(tmp_path, terminated=term), z_dim=Z, batch_size=64)
+        batch = ds.sample_mini_batch()
+        assert not batch.next_terminated.any()
+
+    def test_terminal_rows_can_be_kept_when_asked(self, tmp_path: Path) -> None:
+        """A dataset with truthful successors at terminals should not have to drop them."""
+        term = torch.ones(NUM, 1, dtype=torch.bool)
+        ds = OfflineTransitionDataset(_write(tmp_path, terminated=term), z_dim=Z, batch_size=8, sample_terminal=True)
+        assert ds.sample_mini_batch().next_terminated.all()
+
     def test_obs_groups_are_reported_for_the_contract_check(self, tmp_path: Path) -> None:
         """construct_algorithm refuses a dataset missing a group its consumers read."""
         ds = OfflineTransitionDataset(_write(tmp_path), z_dim=Z, batch_size=8)

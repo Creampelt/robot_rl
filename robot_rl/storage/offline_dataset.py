@@ -22,6 +22,7 @@ class OfflineTransitionDataset:
         batch_size: int,
         storage_device: str = "cpu",
         gamma: float = 0.99,
+        sample_terminal: bool = False,
         device: str | None = None,
     ) -> None:
         """Load the dataset and allocate the sampling scratch.
@@ -32,6 +33,9 @@ class OfflineTransitionDataset:
             batch_size: Mini-batch size returned by :meth:`sample_mini_batch`.
             storage_device: Device holding the transitions; ``"cpu"`` keeps a large set out of VRAM.
             gamma: Discount written into every sampled transition that did not terminate.
+            sample_terminal: Whether terminal transitions may be drawn. Their next state is usually the
+                post-reset observation rather than the true successor, and the backward map encodes it
+                for every row, so a bad successor pollutes the whole batch, not just its own bootstrap.
             device: Unused; accepted so the constructor matches the buffer's call signature.
         """
         del device
@@ -52,8 +56,17 @@ class OfflineTransitionDataset:
         self.context = torch.zeros(num, z_dim, device=storage_device)
         self.batch_size = batch_size
         self.obs_groups = sorted(self.observations.keys())
+        self._sampleable = (
+            torch.arange(num, device=storage_device)
+            if sample_terminal
+            else torch.nonzero(~self.next_terminated.view(-1)).view(-1)
+        )
         self._indices = torch.zeros(batch_size, dtype=torch.long, device=storage_device)
-        print(f"[INFO] Loaded {num} offline transitions with groups {self.obs_groups}.")
+        dropped = num - self._sampleable.numel()
+        print(
+            f"[INFO] Loaded {num} offline transitions with groups {self.obs_groups}"
+            f" ({dropped} terminal rows excluded from sampling)."
+        )
 
     def __len__(self) -> int:
         """Return the number of stored transitions."""
@@ -61,13 +74,14 @@ class OfflineTransitionDataset:
 
     def sample_mini_batch(self, device: str | None = None) -> ReplayBuffer.Batch:
         """Draw a uniform mini-batch, moved to ``device``."""
-        self._indices.random_(0, len(self))
+        self._indices.random_(0, self._sampleable.numel())
+        idx = self._sampleable[self._indices]
         return ReplayBuffer.Batch(
-            self.observations[self._indices].to(device),
-            self.next_observations[self._indices].to(device),
-            self.actions[self._indices].to(device),
-            self.rewards[self._indices].to(device),
-            self.gammas[self._indices].to(device),
-            self.context[self._indices].to(device),
-            self.next_terminated[self._indices].to(device),
+            self.observations[idx].to(device),
+            self.next_observations[idx].to(device),
+            self.actions[idx].to(device),
+            self.rewards[idx].to(device),
+            self.gammas[idx].to(device),
+            self.context[idx].to(device),
+            self.next_terminated[idx].to(device),
         )
