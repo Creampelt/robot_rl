@@ -485,14 +485,18 @@ class FbCpr:
             # (and so the priority) of exactly the clips that are shortest
             valid = self.expert_buffer.current_eval_motion_lengths
             emds = torch.empty((mini_batch_size,), device=self.device)
+            # EMD compares pose DISTRIBUTIONS and is blind to ordering, so a companion error that keeps
+            # the frame pairing is reported alongside it.
+            joint_errors = torch.empty((mini_batch_size,), device=self.device)
             for i in range(mini_batch_size):
                 n = eval_qpos.shape[1] if valid is None else int(valid[i].item()) - 1
                 n = max(1, min(n, actual_qpos.shape[1]))
                 emds[i] = compute_emd(actual_qpos[i, :n], eval_qpos[i, :n])
+                joint_errors[i] = (actual_qpos[i, :n] - eval_qpos[i, :n]).norm(dim=-1).mean()
             priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
             # Save priorities to expert buffer
             self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
-            eval_infos.append({"emd": emds.detach().cpu()})
+            eval_infos.append({"emd": emds.detach().cpu(), "joint_error": joint_errors.detach().cpu()})
 
             idx += mini_batch_size
             if max_steps is not None and steps_done >= max_steps:
