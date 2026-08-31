@@ -142,10 +142,19 @@ class SAC:
         if "time_outs" in extras and extras["time_outs"] is not None:
             time_outs = extras["time_outs"].view(-1).bool().to(self.device)
             if extras.get("time_outs_obs") is not None:
-                mask = time_outs[:, None]
+                # the mask must carry one trailing singleton per feature dim of each group: (N, 1) for a
+                # flat obs, (N, 1, 1, 1) for an image. A fixed (N, 1) right-aligns against a 4D group and
+                # collides with its height instead of broadcasting.
+                def _mask_for(value: torch.Tensor) -> torch.Tensor:
+                    return time_outs.view(-1, *([1] * (value.dim() - 1)))
+
                 true_next_obs = TensorDict(
                     {
-                        key: torch.where(mask, extras["time_outs_obs"][key].to(self.device), next_obs[key])
+                        key: torch.where(
+                            _mask_for(next_obs[key]),
+                            extras["time_outs_obs"][key].to(self.device),
+                            next_obs[key],
+                        )
                         for key in next_obs.keys()  # noqa: SIM118 -- TensorDict iterates its batch dim, not keys
                     },
                     batch_size=next_obs.batch_size,
