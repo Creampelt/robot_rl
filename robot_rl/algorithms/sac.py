@@ -51,6 +51,8 @@ class SAC:
         max_grad_norm: float = 1.0,
         policy_frequency: int = 1,
         n_steps: int = 1,
+        seq_len: int = 16,
+        burn_in: int = 8,
         compile_mode: str | None = None,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
@@ -97,6 +99,11 @@ class SAC:
         self.policy_frequency = policy_frequency
         self.n_steps = n_steps
         self.max_grad_norm = max_grad_norm
+        # Recurrent actors train on contiguous windows: `burn_in` steps re-derive the stale stored
+        # state without gradients, then `seq_len` steps carry the loss.
+        self.recurrent = actor.is_recurrent
+        self.seq_len = seq_len
+        self.burn_in = burn_in
         self.update_step = 0
         self.intrinsic_rewards: torch.Tensor | None = None
 
@@ -116,12 +123,16 @@ class SAC:
         self.critic_optimizer = resolve_optimizer(critic_optimizer)(self.critic_parameters, lr=critic_learning_rate)
 
         # Apply torch.compile to the forward+loss+backward paths.
-        if compile_mode not in (None, "eager", "none"):
+        if compile_mode not in (None, "eager", "none") and not self.recurrent:
             self._critic_losses_and_backward = torch.compile(self._critic_losses_and_backward, mode=compile_mode)
             self._actor_loss_and_backward = torch.compile(self._actor_loss_and_backward, mode=compile_mode)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample a stochastic action and record the transition's observation/action."""
+        if self.recurrent:
+            # the state that PRODUCES this action, captured before the forward advances it
+            hs = self.actor.get_hidden_state(batch_size=obs.batch_size[0], device=self.device)
+            self.transition.hidden_state = tuple(h.clone() for h in hs) if isinstance(hs, tuple) else hs.clone()
         with torch.no_grad():
             action = self.actor(obs, stochastic_output=True)
         self.transition.observations = obs
@@ -187,9 +198,13 @@ class SAC:
 
         self.replay_buffer.add_transitions(self.transition)
         self.transition.clear()
+        if self.recurrent:
+            self.actor.reset(dones_bool)
 
     def update(self) -> dict:
         """Run the off-policy SAC updates over sampled mini-batches; returns mean losses."""
+        if self.recurrent:
+            return self._update_recurrent()
         mean_critic_1_loss = 0.0
         mean_critic_2_loss = 0.0
         mean_actor_loss = 0.0
@@ -262,6 +277,101 @@ class SAC:
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss / n_updates
         return loss_dict
+
+    def _update_recurrent(self) -> dict:
+        """SAC updates over contiguous windows for a recurrent actor; returns mean losses.
+
+        Each window is replayed from its stored starting state: the burn-in prefix under no-grad to
+        re-derive a state consistent with the current weights, then the training steps with gradients.
+        Steps past a window's first episode end are masked out of every loss.
+        """
+        sums = {"critic_1": 0.0, "critic_2": 0.0, "actor": 0.0, "alpha": 0.0}
+        num_updates = 0
+        num_actor_updates = 0
+        for _ in range(self.num_learning_epochs * self.num_mini_batches):
+            batch = self.replay_buffer.sample_sequences(self.seq_len, self.burn_in, self.device)
+            if batch is None:
+                break
+            burn = batch.burn_in
+            obs, next_obs = batch.observations, batch.next_observations
+            with torch.no_grad():
+                h0 = batch.init_hidden
+                if burn > 0:
+                    _, h0 = self.actor.encode_sequence(obs[:burn], h0)
+                # the actor meets next_obs[burn] holding the state it reached AFTER obs[burn]
+                _, h1 = self.actor.encode_sequence(obs[burn : burn + 1], h0)
+            train_obs, train_next = obs[burn:], next_obs[burn:]
+            seq_len, batch_size = train_obs.batch_size
+            flat = seq_len * batch_size
+            mask = batch.masks[burn:].reshape(-1)
+            mask_sum = mask.sum().clamp(min=1.0)
+            flat_obs, flat_next = train_obs.reshape(flat), train_next.reshape(flat)
+            actions_b = batch.actions[burn:].reshape(flat, -1)
+            rewards_b = batch.rewards[burn:].reshape(-1)
+            not_terminated = 1.0 - batch.next_terminated[burn:].reshape(-1).float()
+
+            # Critics: bootstrapped target from the actor's next-state sample.
+            with torch.no_grad():
+                next_actions, next_logp = self.actor.act_and_log_prob(train_next, hidden_state=h1, sequence=True)
+                next_actions, next_logp = next_actions.reshape(flat, -1), next_logp.reshape(-1)
+                q1_t = self.critic_1_target(flat_next, next_actions).view(-1)
+                q2_t = self.critic_2_target(flat_next, next_actions).view(-1)
+                min_q_t = torch.min(q1_t, q2_t) - self.log_alpha.exp() * next_logp
+                target_q = rewards_b + self.gamma * not_terminated * min_q_t
+            q1 = self.critic_1(flat_obs, actions_b).view(-1)
+            q2 = self.critic_2(flat_obs, actions_b).view(-1)
+            critic_1_loss = (((q1 - target_q) ** 2) * mask).sum() / mask_sum
+            critic_2_loss = (((q2 - target_q) ** 2) * mask).sum() / mask_sum
+            self.critic_optimizer.zero_grad()
+            (critic_1_loss + critic_2_loss).backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters(self.critic_parameters)
+            nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
+            self.critic_optimizer.step()
+
+            # Alpha and actor from a fresh window sample; gradients stop at the burn-in boundary.
+            new_actions, logp = self.actor.act_and_log_prob(train_obs, hidden_state=h0, sequence=True)
+            new_actions, logp = new_actions.reshape(flat, -1), logp.reshape(-1)
+            if self.auto_alpha:
+                alpha_loss = -((self.log_alpha * (logp + self.target_entropy).detach()) * mask).sum() / mask_sum
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                if self.is_multi_gpu and self.log_alpha.grad is not None:
+                    torch.distributed.all_reduce(self.log_alpha.grad, op=torch.distributed.ReduceOp.SUM)
+                    self.log_alpha.grad /= self.gpu_world_size
+                self.alpha_optimizer.step()
+                self.alpha = self.log_alpha.exp().item()
+                sums["alpha"] += alpha_loss.item()
+            if self.update_step % self.policy_frequency == 0:
+                for p in self.critic_parameters:
+                    p.requires_grad_(False)
+                q1_pi = self.critic_1(flat_obs, new_actions).view(-1)
+                q2_pi = self.critic_2(flat_obs, new_actions).view(-1)
+                actor_loss = ((self.log_alpha.exp().detach() * logp - torch.min(q1_pi, q2_pi)) * mask).sum() / mask_sum
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                if self.is_multi_gpu:
+                    self.reduce_parameters(self.actor_parameters)
+                nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
+                self.actor_optimizer.step()
+                for p in self.critic_parameters:
+                    p.requires_grad_(True)
+                sums["actor"] += actor_loss.item()
+                num_actor_updates += 1
+            self.critic_1_target.update()
+            self.critic_2_target.update()
+            sums["critic_1"] += critic_1_loss.item()
+            sums["critic_2"] += critic_2_loss.item()
+            self.update_step += 1
+            num_updates += 1
+        n = max(num_updates, 1)
+        return {
+            "critic_1": sums["critic_1"] / n,
+            "critic_2": sums["critic_2"] / n,
+            "actor": sums["actor"] / max(num_actor_updates, 1),
+            "alpha": sums["alpha"] / n if self.auto_alpha else 0.0,
+            "alpha_value": self.alpha,
+        }
 
     def _update_critics(
         self,
@@ -384,6 +494,8 @@ class SAC:
             env.eval_mode()
 
         obs = env.get_observations() if hasattr(env, "get_observations") else env.reset()[0]
+        if self.recurrent:
+            self.actor.reset()
         action_repeat = max(1, action_repeat)
 
         with torch.inference_mode():
@@ -393,11 +505,18 @@ class SAC:
                     actions = self.actor(obs, stochastic_output=stochastic)
                 obs, _, _, _ = env.step(actions)
 
+        if self.recurrent:
+            self.actor.reset()
         if was_training:
             self.train_mode()
             if hasattr(env, "train_mode"):
                 env.train_mode()
         return []
+
+    def reset_rollout_state(self) -> None:
+        """Clear rollout-only state after the env is reset underneath the agent."""
+        if self.recurrent:
+            self.actor.reset()
 
     def save(self) -> dict:
         """Return a dict of model/optimizer/temperature states for checkpointing."""
@@ -493,6 +612,14 @@ class SAC:
         buffer_size = int(cfg["algorithm"].get("replay_buffer_size", 1_000_000))
         capacity_per_env = 1 if inference else max(buffer_size // env.num_envs, 1)
         storage_device = cfg.get("storage_device") or device
+        hidden_kwargs: dict = {}
+        if actor.is_recurrent:
+            rnn = actor.rnn.rnn  # type: ignore[attr-defined]
+            hidden_kwargs = {
+                "hidden_dim": rnn.hidden_size,
+                "hidden_layers": rnn.num_layers,
+                "hidden_is_lstm": actor.rnn.is_lstm,  # type: ignore[attr-defined]
+            }
         replay_buffer = ReplayBuffer(
             env.num_envs,
             capacity_per_env,
@@ -504,6 +631,7 @@ class SAC:
             keep_terminal=True,
             n_steps=cfg["algorithm"].get("n_steps", 1),
             gamma=cfg["algorithm"].get("gamma", 0.99),
+            **hidden_kwargs,
         )
 
         return alg_class(
