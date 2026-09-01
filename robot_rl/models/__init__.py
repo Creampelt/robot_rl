@@ -6,6 +6,7 @@
 """Neural models for the learning algorithm."""
 
 from .cnn_model import CNNModel
+from .cnn_rnn_model import CNNRNNModel
 from .fuse_model import FuseModel, ResidualFuseModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
@@ -13,6 +14,7 @@ from .txl_model import TXLModel
 
 __all__ = [
     "CNNModel",
+    "CNNRNNModel",
     "FuseModel",
     "MLPModel",
     "RNNModel",

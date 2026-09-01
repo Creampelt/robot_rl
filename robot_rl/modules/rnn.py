@@ -68,6 +68,18 @@ class RNN(nn.Module):
             out, self.hidden_state = self.rnn(input.unsqueeze(0), self.hidden_state)
         return out
 
+    def forward_sequence(
+        self, input: torch.Tensor, hidden_state: HiddenState = None
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+        """Run a time-major ``(L, B, F)`` sequence from an explicit state; returns ``(L, B, H)`` and the final state.
+
+        Unlike batch mode this neither unpads nor touches ``self.hidden_state``, so a caller can chain a
+        no-grad burn-in segment into a training segment.
+        """
+        if isinstance(hidden_state, list):
+            hidden_state = tuple(hidden_state)
+        return self.rnn(input, hidden_state)
+
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset hidden states for all or done environments."""
         if dones is None:  # Reset hidden state
