@@ -343,7 +343,9 @@ class ReplayBuffer:
             effective_n.to(device),
         )
 
-    def sample_sequences(self, seq_len: int, burn_in: int = 0, device: str | None = None) -> SequenceBatch | None:
+    def sample_sequences(
+        self, seq_len: int, burn_in: int = 0, device: str | None = None, num_windows: int | None = None
+    ) -> SequenceBatch | None:
         """Sample contiguous per-env windows for a recurrent update.
 
         A stored index is ``row * num_envs + env``, so env ``e``'s consecutive steps are ``num_envs``
@@ -356,6 +358,9 @@ class ReplayBuffer:
             burn_in: Leading steps replayed without gradients to re-derive the hidden state. Stored
                 states drift as the network trains, so off-policy this should be nonzero.
             device: Device to move the batch to.
+            num_windows: Windows per batch. Defaults to ``batch_size // (burn_in + seq_len)`` so the
+                flattened steps match the configured mini-batch; a window batch otherwise multiplies
+                the mini-batch by the window length, which with image observations is an easy OOM.
 
         Returns:
             A :class:`SequenceBatch` of ``L = burn_in + seq_len`` steps, or ``None`` while no window of
@@ -364,7 +369,7 @@ class ReplayBuffer:
         total_len = burn_in + seq_len
         if total_len < 1:
             raise ValueError("sample_sequences needs burn_in + seq_len >= 1")
-        batch_size = self._indices.shape[0]
+        batch_size = num_windows if num_windows is not None else max(self._indices.shape[0] // total_len, 1)
         cap_rows = self.capacity_per_env
         filled_rows = cap_rows if self._is_full else self._curr_idx // self.num_envs
         write_row = self._curr_idx // self.num_envs

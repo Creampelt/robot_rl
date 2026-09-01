@@ -51,7 +51,7 @@ def test_sequences_are_single_env_and_time_ordered() -> None:
     """A sampled window comes from one env and is consecutive in time."""
     buffer = _make_buffer()
     _fill(buffer, 18)
-    batch = buffer.sample_sequences(seq_len=4, burn_in=2)
+    batch = buffer.sample_sequences(seq_len=4, burn_in=2, num_windows=64)
     assert batch is not None
     assert batch.actions.shape == (6, 64, 2)
     assert batch.masks.shape == (6, 64)
@@ -107,3 +107,12 @@ def test_returns_none_when_no_window_fits() -> None:
     buffer = _make_buffer()
     _fill(buffer, 2)
     assert buffer.sample_sequences(seq_len=4, burn_in=2) is None
+
+
+def test_default_window_count_matches_mini_batch() -> None:
+    """Without num_windows, windows x steps stays at the configured mini-batch instead of multiplying it."""
+    buffer = _make_buffer(batch_size=64)
+    _fill(buffer, 18)
+    batch = buffer.sample_sequences(seq_len=4, burn_in=2)
+    assert batch is not None
+    assert batch.actions.shape[1] == 64 // 6
