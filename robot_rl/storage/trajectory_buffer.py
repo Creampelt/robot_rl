@@ -87,7 +87,8 @@ class TrajectoryBuffer(ExpertBuffer):
         """
         self.device = device
         self.obs_groups = expert_obs_groups
-        self.mirror = mirror.to(device) if mirror is not None else None
+        self.mirror = mirror
+        self._mirrors: dict[str, ObsMirror] = {}  # one copy per device the samples are consumed on
         self.mirror_prob = mirror_prob if mirror is not None else 0.0
 
         # motions file should be obs tensordict with batch shape (num_motions, bucket_size)
@@ -145,12 +146,14 @@ class TrajectoryBuffer(ExpertBuffer):
         ep_flat, seq_indices, next_ep_flat, next_seq_indices = self._get_idxs(
             self.priorities, self.valid_lengths, num_slices, seq_length, self.bucket_size, NUM_STITCH_SEGMENTS
         )
-        obs = self.motions[ep_flat, seq_indices]
-        next_obs = self.motions[next_ep_flat, next_seq_indices]
+        # mirror AFTER the device move: a host-resident buffer would otherwise pay the flip on CPU tensors
+        obs = self.motions[ep_flat, seq_indices].to(device)
+        next_obs = self.motions[next_ep_flat, next_seq_indices].to(device)
         if self.mirror_prob > 0:
-            flip = (torch.rand(num_slices, device=self.device) < self.mirror_prob).repeat_interleave(seq_length)
-            obs, next_obs = self.mirror.apply(obs, flip), self.mirror.apply(next_obs, flip)
-        return obs.to(device), next_obs.to(device)
+            mirror = self._mirror_on(obs.device)
+            flip = (torch.rand(num_slices, device=obs.device) < self.mirror_prob).repeat_interleave(seq_length)
+            obs, next_obs = mirror.apply(obs, flip), mirror.apply(next_obs, flip)
+        return obs, next_obs
 
     def sample_states(self, num_envs: int, device: str | None = None) -> dict[str, torch.Tensor]:
         """Sample states for a vectorized environment. Returns a state dictionary.
@@ -160,10 +163,21 @@ class TrajectoryBuffer(ExpertBuffer):
         ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
         # spawn only from real frames: hold-final-frame padding is a static pose, not a start state
         motion_indices = (torch.rand(num_envs, device=self.device) * self.valid_lengths[ep_indices]).long()
-        motions = self.motions[ep_indices, motion_indices]
+        motions = self.motions[ep_indices, motion_indices].to(device)
         if self.mirror_prob > 0:
-            motions = self.mirror.apply(motions, torch.rand(num_envs, device=self.device) < self.mirror_prob)
+            flip = torch.rand(num_envs, device=motions.device) < self.mirror_prob
+            motions = self._mirror_on(motions.device).apply(motions, flip)
         return self.get_expert_state(motions, device=device)
+
+    def _mirror_on(self, device: torch.device | str) -> ObsMirror:
+        key = str(device)
+        if key not in self._mirrors:
+            from robot_rl.extensions.mirror import ObsMirror
+
+            m = self.mirror
+            copy = ObsMirror(dict(m.group_perm), dict(m.group_sign), m.action_perm, m.action_sign)
+            self._mirrors[key] = copy.to(device)
+        return self._mirrors[key]
 
     def get_batch_motions(
         self,
