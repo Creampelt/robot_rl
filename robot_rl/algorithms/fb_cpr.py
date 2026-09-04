@@ -728,8 +728,21 @@ class FbCpr:
         )
         # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
         expert_device = cfg["algorithm"].get("expert_storage_device") or cfg["storage_device"]
+        # Left-right mirroring of sampled expert windows and spawn states. The mirror is derived from
+        # this env's term layout, so it matches whatever bundle was built against the same cfg.
+        symmetry_cfg = cfg["algorithm"].pop("symmetry_cfg", None)
+        mirror, mirror_prob = None, 0.0
+        if symmetry_cfg is not None and not inference:
+            from robot_rl.extensions.mirror import MirrorSpec, ObsMirror
+
+            symmetry_cfg = dict(symmetry_cfg)
+            mirror_prob = float(symmetry_cfg.pop("mirror_prob", 0.5))
+            mirror = ObsMirror.from_env(env, MirrorSpec(**symmetry_cfg))
+            print(f"[INFO] Expert mirroring: p={mirror_prob}, groups {sorted(mirror.group_perm)}")
         expert_buffer = (
-            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device)
+            TrajectoryBuffer(
+                cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device, mirror, mirror_prob
+            )
             if not inference
             else None
         )

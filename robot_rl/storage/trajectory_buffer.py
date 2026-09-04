@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import torch
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 from tensordict import TensorDict
 
 from .expert_buffer import ExpertBuffer
+
+if TYPE_CHECKING:
+    from robot_rl.extensions.mirror import ObsMirror
 
 # Rows drawn per window; only short rows consume more than one.
 NUM_STITCH_SEGMENTS = 16
@@ -65,10 +71,24 @@ class TrajectoryBuffer(ExpertBuffer):
         motion_path: str,
         expert_obs_groups: list[str],
         device: str = "cpu",
+        mirror: ObsMirror | None = None,
+        mirror_prob: float = 0.0,
     ) -> None:
-        """Initialize the buffer storage."""
+        """Initialize the buffer storage.
+
+        Args:
+            motion_path: Bundle of expert observation groups, batch shape (num_motions, bucket_size).
+            expert_obs_groups: Groups concatenated into the expert state (root pose/velocity, joints).
+            device: Storage device.
+            mirror: Left-right mirror of the stored groups; each sampled window (and spawn state) is
+                mirrored with probability ``mirror_prob``, whole, so a window's z is later derived from
+                the mirrored states and never shared with the unmirrored window.
+            mirror_prob: Probability of mirroring a sampled window or spawn state.
+        """
         self.device = device
         self.obs_groups = expert_obs_groups
+        self.mirror = mirror.to(device) if mirror is not None else None
+        self.mirror_prob = mirror_prob if mirror is not None else 0.0
 
         # motions file should be obs tensordict with batch shape (num_motions, bucket_size)
         self.motions = torch.load(motion_path, weights_only=False).to(device)
@@ -125,10 +145,12 @@ class TrajectoryBuffer(ExpertBuffer):
         ep_flat, seq_indices, next_ep_flat, next_seq_indices = self._get_idxs(
             self.priorities, self.valid_lengths, num_slices, seq_length, self.bucket_size, NUM_STITCH_SEGMENTS
         )
-        return (
-            self.motions[ep_flat, seq_indices].to(device),
-            self.motions[next_ep_flat, next_seq_indices].to(device),
-        )
+        obs = self.motions[ep_flat, seq_indices]
+        next_obs = self.motions[next_ep_flat, next_seq_indices]
+        if self.mirror_prob > 0:
+            flip = (torch.rand(num_slices, device=self.device) < self.mirror_prob).repeat_interleave(seq_length)
+            obs, next_obs = self.mirror.apply(obs, flip), self.mirror.apply(next_obs, flip)
+        return obs.to(device), next_obs.to(device)
 
     def sample_states(self, num_envs: int, device: str | None = None) -> dict[str, torch.Tensor]:
         """Sample states for a vectorized environment. Returns a state dictionary.
@@ -139,6 +161,8 @@ class TrajectoryBuffer(ExpertBuffer):
         # spawn only from real frames: hold-final-frame padding is a static pose, not a start state
         motion_indices = (torch.rand(num_envs, device=self.device) * self.valid_lengths[ep_indices]).long()
         motions = self.motions[ep_indices, motion_indices]
+        if self.mirror_prob > 0:
+            motions = self.mirror.apply(motions, torch.rand(num_envs, device=self.device) < self.mirror_prob)
         return self.get_expert_state(motions, device=device)
 
     def get_batch_motions(
