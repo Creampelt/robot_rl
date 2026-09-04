@@ -42,8 +42,22 @@ def _group_dims(nsd: dict[str, torch.Tensor]) -> dict[str, int]:
     return dims
 
 
+# The logged train cfg loses ``class_name`` -- models pop it when they build the distribution -- so a
+# hyperspherical actor is only distinguishable from a Gaussian one by the parameters it checkpointed.
+_VMF_PARAM = "distribution.log_kappa"
+
+
+def _mlp_widths(sd: dict[str, torch.Tensor]) -> tuple[int, int]:
+    """Return ``(input, output)`` widths of an ``mlp.*`` head, from its first and last weight."""
+    layers = [int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k))]
+    return sd[f"mlp.{min(layers)}.weight"].shape[1], sd[f"mlp.{max(layers)}.weight"].shape[0]
+
+
 def _num_actions(actor_sd: dict[str, torch.Tensor]) -> int:
     """Infer the action dimension from the distribution's per-action parameter vector."""
+    if _VMF_PARAM in actor_sd:
+        # vMF parameterizes spread by a single scalar; its action is the MLP output direction itself
+        return _mlp_widths(actor_sd)[1]
     for k, v in actor_sd.items():
         if "distribution" in k and isinstance(v, torch.Tensor) and v.ndim == 1:
             return v.shape[0]
@@ -92,7 +106,7 @@ def bake_normalizer(model: nn.Module, normalizer: nn.Module) -> nn.Module:
     return model
 
 
-def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
+def _rebuild_actor_critic(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.Module]:
     if "memory_state_dict" in ckpt:
         raise NotImplementedError("Export of recurrent (memory-bearing) policies is not supported.")
     cfg = copy.deepcopy(train_cfg)
@@ -104,9 +118,9 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
         model_class = resolve_callable(model_cfg.pop("class_name", default_class))
         dist_cfg = model_cfg.get("distribution_cfg")
         if dist_cfg is not None:
-            dist_cfg.setdefault("class_name", "GaussianDistribution")
-        first_idx = min(int(m.group(1)) for k in sd if (m := re.match(r"mlp\.(\d+)\.weight", k)))
-        obs_dim = sd[f"mlp.{first_idx}.weight"].shape[1]
+            default_dist = "VonMisesFisherDistribution" if _VMF_PARAM in sd else "GaussianDistribution"
+            dist_cfg.setdefault("class_name", default_dist)
+        obs_dim = _mlp_widths(sd)[0]
         obs_set = "actor" if name == "policy" else "critic"
         groups = cfg["obs_groups"][obs_set]
         # only the concatenated dim matters for layer sizes; put it all on the first group
@@ -117,6 +131,9 @@ def _rebuild_ppo(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, nn.
 
     models["policy"] = build("policy", "actor_state_dict", _num_actions(ckpt["actor_state_dict"]))
     if all_models:
+        if "critic_state_dict" not in ckpt:
+            # SAC checkpoints a pair of FuseModel critics, whose constructor this builder does not fit
+            raise NotImplementedError("--all_models is not supported for this checkpoint; the policy exports fine.")
         models["critic"] = build("critic", "critic_state_dict", 1)
     return models
 
@@ -175,7 +192,7 @@ def rebuild_models(train_cfg: dict, ckpt: dict, all_models: bool = False) -> dic
     """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name."""
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
-    return _rebuild_ppo(train_cfg, ckpt, all_models)
+    return _rebuild_actor_critic(train_cfg, ckpt, all_models)
 
 
 def save_jit(module: nn.Module, path: str, filename: str) -> str:
