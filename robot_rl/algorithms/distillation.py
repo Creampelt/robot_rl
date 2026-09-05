@@ -221,10 +221,24 @@ class Distillation:
         """Get the policy model."""
         return self._raw_student
 
-    def eval(self, env: VecEnv, max_steps: int = 200) -> list[dict[str, torch.Tensor]]:
-        """Run a deterministic student rollout for ``max_steps`` env steps.
+    def eval(
+        self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
+    ) -> list[dict[str, torch.Tensor]]:
+        """Run a student rollout for ``max_steps`` env steps.
 
-        API parity with :meth:`ppo.PPO.eval`; no learning, no transition storage.
+        Signature matches :meth:`ppo.PPO.eval` so shared eval/recording callers work for either
+        algorithm; no learning, no transition storage.
+
+        Args:
+            env: Vectorized environment to roll out in.
+            max_steps: Number of environment steps to run.
+            stochastic: When ``False`` (default), act with the student's deterministic mean. When ``True``,
+                sample as during training.
+            action_repeat: Hold each queried action for this many ``env.step`` calls, re-querying the
+                student only every ``action_repeat`` steps. Default 1 = re-query every step.
+
+        Returns:
+            A list of per-batch info dicts; empty, as this rollout collects none.
         """
         was_training = self.student.training
         self.eval_mode()
@@ -235,9 +249,13 @@ class Distillation:
         if hasattr(self.student, "reset"):
             self.student.reset()
 
+        action_repeat = max(1, action_repeat)
+
         with torch.inference_mode():
-            for _ in range(max_steps):
-                actions = self.student(obs, stochastic_output=False)
+            actions = self.student(obs, stochastic_output=stochastic)
+            for step in range(max_steps):
+                if step > 0 and step % action_repeat == 0:
+                    actions = self.student(obs, stochastic_output=stochastic)
                 obs, _, _, _ = env.step(actions)
 
         if was_training:
