@@ -188,10 +188,27 @@ def _rebuild_fbcpr(train_cfg: dict, ckpt: dict, all_models: bool) -> dict[str, n
     return {name: build(name) for name in names}
 
 
+def _rebuild_student(train_cfg: dict, ckpt: dict) -> dict[str, nn.Module]:
+    """The distilled student of a distillation checkpoint, exported under the ``policy`` name."""
+    sd = ckpt["student_state_dict"]
+    model_cfg = dict(train_cfg["student"])
+    model_class = resolve_callable(model_cfg.pop("class_name", "MLPModel"))
+    dist_cfg = model_cfg.get("distribution_cfg")
+    if dist_cfg is not None:
+        dist_cfg.setdefault("class_name", "GaussianDistribution")
+    groups = train_cfg["obs_groups"]["student"]
+    obs = {g: torch.zeros(1, _mlp_widths(sd)[0] if i == 0 else 0) for i, g in enumerate(groups)}
+    model = model_class(obs, {"student": groups}, "student", _num_actions(sd), **model_cfg)
+    model.load_state_dict(sd, strict=True)
+    return {"policy": model.eval()}
+
+
 def rebuild_models(train_cfg: dict, ckpt: dict, all_models: bool = False) -> dict[str, nn.Module]:
     """Rebuild the trained models from a checkpoint, normalizers baked in; keyed by export name."""
     if "backward_map_state_dict" in ckpt:
         return _rebuild_fbcpr(train_cfg, ckpt, all_models)
+    if "student_state_dict" in ckpt:
+        return _rebuild_student(train_cfg, ckpt)
     return _rebuild_actor_critic(train_cfg, ckpt, all_models)
 
 
