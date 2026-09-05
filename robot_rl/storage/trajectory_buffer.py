@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING
 from tensordict import TensorDict
 
@@ -73,6 +73,7 @@ class TrajectoryBuffer(ExpertBuffer):
         device: str = "cpu",
         mirror: ObsMirror | None = None,
         mirror_prob: float = 0.0,
+        half_groups: Sequence[str] = (),
     ) -> None:
         """Initialize the buffer storage.
 
@@ -84,6 +85,8 @@ class TrajectoryBuffer(ExpertBuffer):
                 mirrored with probability ``mirror_prob``, whole, so a window's z is later derived from
                 the mirrored states and never shared with the unmirrored window.
             mirror_prob: Probability of mirroring a sampled window or spawn state.
+            half_groups: Obs groups held in float16 on the storage device (halves a large corpus' footprint);
+                samples are returned in float32.
         """
         self.device = device
         self.obs_groups = expert_obs_groups
@@ -92,7 +95,11 @@ class TrajectoryBuffer(ExpertBuffer):
         self.mirror_prob = mirror_prob if mirror is not None else 0.0
 
         # motions file should be obs tensordict with batch shape (num_motions, bucket_size)
-        self.motions = torch.load(motion_path, weights_only=False).to(device)
+        self.half_groups = tuple(half_groups)
+        self.motions = torch.load(motion_path, weights_only=False)
+        for key in self.half_groups:
+            self.motions[key] = self.motions[key].half()
+        self.motions = self.motions.to(device)
         if len(self.motions.shape) != 2:
             raise ValueError(
                 "Expected motions batch size to be 2-dimensional (num_motions, bucket_size), but instead got shape "
@@ -147,8 +154,8 @@ class TrajectoryBuffer(ExpertBuffer):
             self.priorities, self.valid_lengths, num_slices, seq_length, self.bucket_size, NUM_STITCH_SEGMENTS
         )
         # mirror AFTER the device move: a host-resident buffer would otherwise pay the flip on CPU tensors
-        obs = self.motions[ep_flat, seq_indices].to(device)
-        next_obs = self.motions[next_ep_flat, next_seq_indices].to(device)
+        obs = self._restore(self.motions[ep_flat, seq_indices].to(device))
+        next_obs = self._restore(self.motions[next_ep_flat, next_seq_indices].to(device))
         if self.mirror_prob > 0:
             mirror = self._mirror_on(obs.device)
             flip = (torch.rand(num_slices, device=obs.device) < self.mirror_prob).repeat_interleave(seq_length)
@@ -163,11 +170,16 @@ class TrajectoryBuffer(ExpertBuffer):
         ep_indices = torch.multinomial(self.priorities, num_envs, replacement=True)
         # spawn only from real frames: hold-final-frame padding is a static pose, not a start state
         motion_indices = (torch.rand(num_envs, device=self.device) * self.valid_lengths[ep_indices]).long()
-        motions = self.motions[ep_indices, motion_indices].to(device)
+        motions = self._restore(self.motions[ep_indices, motion_indices].to(device))
         if self.mirror_prob > 0:
             flip = torch.rand(num_envs, device=motions.device) < self.mirror_prob
             motions = self._mirror_on(motions.device).apply(motions, flip)
         return self.get_expert_state(motions, device=device)
+
+    def _restore(self, td: TensorDict) -> TensorDict:
+        for key in self.half_groups:
+            td[key] = td[key].float()
+        return td
 
     def _mirror_on(self, device: torch.device | str) -> ObsMirror:
         key = str(device)
@@ -195,7 +207,7 @@ class TrajectoryBuffer(ExpertBuffer):
             eval_idxs = self._eval_order[idx : idx + mini_batch_size]
             # rows are yielded whole, so the caller needs the valid lengths to ignore padded frames
             self.current_eval_motion_lengths = self.valid_lengths[eval_idxs]
-            yield self.motions[eval_idxs].to(device)
+            yield self._restore(self.motions[eval_idxs].to(device))
 
     def update_priorities(self, priorities: torch.Tensor, indices: torch.Tensor | slice) -> None:
         """Update a slice of priorities. Assumes :meth:`get_batch_motions` has already been called."""

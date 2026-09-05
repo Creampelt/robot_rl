@@ -741,7 +741,12 @@ class FbCpr:
             print(f"[INFO] Expert mirroring: p={mirror_prob}, groups {sorted(mirror.group_perm)}")
         expert_buffer = (
             TrajectoryBuffer(
-                cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device, mirror, mirror_prob
+                cfg["algorithm"]["motion_path"],
+                cfg["obs_groups"]["expert"],
+                expert_device,
+                mirror,
+                mirror_prob,
+                half_groups=cfg["algorithm"].get("expert_half_groups") or (),
             )
             if not inference
             else None
