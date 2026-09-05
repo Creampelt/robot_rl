@@ -7,10 +7,12 @@
 
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .off_policy_runner import OffPolicyRunner
+from .offline_runner import OfflineRlRunner
 from .distillation_runner import DistillationRunner
 
 __all__ = [
     "DistillationRunner",
     "OffPolicyRunner",
+    "OfflineRlRunner",
     "OnPolicyRunner",
 ]

@@ -62,6 +62,21 @@ class OffPolicyRunner:
 
         self.current_learning_iteration = 0
 
+    def _dump_per_motion_eval(self, eval_infos: list[dict[str, torch.Tensor]], it: int) -> None:
+        """Write per-motion eval vectors to the log dir, in expert-buffer order.
+
+        Args:
+            eval_infos: Per-batch dicts returned by the algorithm's eval.
+            it: Iteration the eval ran at, used in the file name.
+
+        Only the means of these vectors reach the logger, so the per-motion detail a cross-policy
+        comparison needs would otherwise be lost.
+        """
+        if not eval_infos or self.logger.log_dir is None:
+            return
+        payload = {k: torch.cat([info[k] for info in eval_infos]) for k in eval_infos[0]}
+        torch.save(payload, os.path.join(self.logger.log_dir, f"eval_per_motion_{it}.pt"))
+
     def learn(self, num_learning_iterations: int, **kwargs: Any) -> None:
         """Run the learning loop: per iteration, collect env steps, then run agent updates, then log/save."""
         is_url = hasattr(self.alg, "expert_buffer")
@@ -123,6 +138,7 @@ class OffPolicyRunner:
                                 eval_extras = self.alg.eval(self.env)
                             stop = time.time()
                             eval_time += stop - start
+                            self._dump_per_motion_eval(eval_extras, it)
 
                             # reset env and rollout state (only rank 0's env was perturbed)
                             obs, _ = self.env.reset()

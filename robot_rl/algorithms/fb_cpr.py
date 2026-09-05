@@ -17,6 +17,7 @@ from robot_rl.utils import (
     eval_mode,
     forward_sliding_mean,
     pad_to_size,
+    pad_to_size_repeat,
     resolve_callable,
     resolve_dtype,
     resolve_obs_groups,
@@ -444,17 +445,29 @@ class FbCpr:
             eval_zs = self.backward_map(norm_eval_obs).view(mini_batch_size, bucket_size, -1)[:, 1:, :]
             rollout_steps = bucket_size - 1
             eval_zs = pad_to_size(eval_zs, env.num_envs, dim=0)
-            # Zero-pad motions to full number of environments (in case batch is truncated)
-            first_motions = {k: pad_to_size(v[:, 0, :], env.num_envs, dim=0) for k, v in eval_motions.items()}
+            # Padded envs are discarded, but still need a valid pose: zeros are an invalid root
+            # quaternion and spawn the robot inside the ground, which NaNs the whole sim.
+            first_motions = {k: pad_to_size_repeat(v[:, 0, :], env.num_envs) for k, v in eval_motions.items()}
             obs, _ = env.reset_to({"articulation": {"robot": first_motions}}, is_relative=True)
             num_joints = first_motions["joint_position"].shape[1]
             actual_qpos = torch.zeros((mini_batch_size, rollout_steps, num_joints), device=self.device)
+            # A recorder may visualize the clip being tracked; pad the frames it would need.
+            publish_ref = getattr(getattr(env, "unwrapped", env), "write_reference_pose", None)
+            if publish_ref is not None:
+                ref_root = pad_to_size_repeat(
+                    torch.cat([eval_motions["root_pose"], eval_motions["root_velocity"]], dim=-1), env.num_envs
+                )
+                ref_joint_pos = pad_to_size_repeat(eval_motions["joint_position"], env.num_envs)
+                ref_joint_vel = pad_to_size_repeat(eval_motions["joint_velocity"], env.num_envs)
             # Run rollouts for each trajectory latent task and save qpos at each step
             for it in range(rollout_steps):
                 obs = self.obs_normalizer(obs)
                 actions = self.actor(obs, eval_zs[:, it, :])
                 # Pad out remaining envs with zeros
                 actions = pad_to_size(actions, env.num_envs, dim=0)
+                if publish_ref is not None:
+                    # frame it+1 is what z targets this step: the pose the robot is asked to reach
+                    publish_ref(ref_root[:, it + 1], ref_joint_pos[:, it + 1], ref_joint_vel[:, it + 1])
                 obs, _, _, _ = env.step(actions.to(env.device))
                 actual_qpos[:, it, :] = self.expert_buffer.get_expert_state(obs)["joint_position"][:mini_batch_size].to(
                     self.device
@@ -465,13 +478,22 @@ class FbCpr:
             # Compute priorities as 2^{2 * emd} where emd is clamped to [0.5, 2.0]
             # Compare against frames 1..bucket_size-1 since actual_qpos[:, t] is the pose after targeting frame t+1.
             eval_qpos = eval_motions["joint_position"][:, 1:]
+            # padded frames hold the final pose, which is trivial to track and would deflate the EMD
+            # (and so the priority) of exactly the clips that are shortest
+            valid = self.expert_buffer.current_eval_motion_lengths
             emds = torch.empty((mini_batch_size,), device=self.device)
+            # EMD compares pose DISTRIBUTIONS and is blind to ordering, so a companion error that keeps
+            # the frame pairing is reported alongside it.
+            joint_errors = torch.empty((mini_batch_size,), device=self.device)
             for i in range(mini_batch_size):
-                emds[i] = compute_emd(actual_qpos[i], eval_qpos[i])
+                n = eval_qpos.shape[1] if valid is None else int(valid[i].item()) - 1
+                n = max(1, min(n, actual_qpos.shape[1]))
+                emds[i] = compute_emd(actual_qpos[i, :n], eval_qpos[i, :n])
+                joint_errors[i] = (actual_qpos[i, :n] - eval_qpos[i, :n]).norm(dim=-1).mean()
             priorities = torch.pow(2, emds.clamp(min=0.5, max=2.0) * 2)
             # Save priorities to expert buffer
             self.expert_buffer.update_priorities(priorities, slice(idx, idx + priorities.shape[0]))
-            eval_infos.append({"emd": emds.detach().cpu()})
+            eval_infos.append({"emd": emds.detach().cpu(), "joint_error": joint_errors.detach().cpu()})
 
             idx += mini_batch_size
             if max_steps is not None and steps_done >= max_steps:
@@ -527,7 +549,8 @@ class FbCpr:
         """State-dict keys sufficient to run/eval/export the policy (all other keys are resume-only).
 
         A checkpoint keeping only these can be played, video-rendered, and exported, but NOT resumed
-        for training (critics/optimizers/buffers are absent).
+        for training (critics/optimizers/buffers are absent). Used by the runner to demote old
+        checkpoints to a policy-only slim form.
         """
         return ("actor_state_dict", "backward_map_state_dict", "obs_normalizer_state_dict")
 
@@ -702,8 +725,10 @@ class FbCpr:
             cfg["algorithm"]["batch_size"],
             cfg["storage_device"],
         )
+        # A large corpus can exceed VRAM on its own, so it is placed independently of the replay buffer.
+        expert_device = cfg["algorithm"].get("expert_storage_device") or cfg["storage_device"]
         expert_buffer = (
-            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], cfg["storage_device"])
+            TrajectoryBuffer(cfg["algorithm"]["motion_path"], cfg["obs_groups"]["expert"], expert_device)
             if not inference
             else None
         )

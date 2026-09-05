@@ -6,9 +6,10 @@
 """Storage for the learning algorithms."""
 
 from .expert_buffer import ExpertBuffer
+from .offline_dataset import OfflineTransitionDataset
 from .replay_buffer import ReplayBuffer
 from .rollout_storage import RolloutStorage
 from .trajectory_buffer import TrajectoryBuffer
 from .z_buffer import ZBuffer
 
-__all__ = ["ExpertBuffer", "ReplayBuffer", "RolloutStorage", "TrajectoryBuffer", "ZBuffer"]
+__all__ = ["ExpertBuffer", "OfflineTransitionDataset", "ReplayBuffer", "RolloutStorage", "TrajectoryBuffer", "ZBuffer"]

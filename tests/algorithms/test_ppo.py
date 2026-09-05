@@ -318,3 +318,120 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+class TestSharedMemory:
+    """Tests for the shared memory module and its actor/critic latent wiring."""
+
+    H, D = 4, 8
+
+    def _build_memory_ppo(self, actor_latent: bool, critic_latent: bool, **overrides: object) -> tuple[PPO, TensorDict]:
+        """Build a PPO with a TCN memory over a stacked-history obs group and the given latent wiring."""
+        from robot_rl.models import TCNModel
+
+        obs = TensorDict(
+            {"policy": torch.randn(NUM_ENVS, self.H * self.D), "privileged": torch.randn(NUM_ENVS, 6)},
+            batch_size=[NUM_ENVS],
+        )
+        obs_groups = {"memory": ["policy"], "actor": ["policy"], "critic": ["privileged"]}
+        memory = TCNModel(
+            obs,
+            obs_groups,
+            "memory",
+            1,
+            memory_only=True,
+            tcn_history_length=self.H,
+            tcn_step_embed_dim=8,
+            tcn_channels=[4],
+            tcn_kernel_sizes=[2],
+            tcn_strides=[1],
+            tcn_encoding_dim=8,
+        )
+        actor_kwargs: dict[str, object] = (
+            {"input_dim_override": memory.latent_dim, "append_obs_groups": False} if actor_latent else {}
+        )
+        critic_kwargs: dict[str, object] = (
+            {"input_dim_override": memory.latent_dim, "append_obs_groups": True} if critic_latent else {}
+        )
+        actor = _make_actor(obs, obs_groups, NUM_ACTIONS, **actor_kwargs)
+        critic = _make_critic(obs, obs_groups, **critic_kwargs)
+        storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+        defaults = dict(
+            num_learning_epochs=2,
+            num_mini_batches=2,
+            schedule="fixed",
+            memory=memory,
+            memory_wiring={
+                "actor_latent": actor_latent,
+                "critic_latent": critic_latent,
+                "detach_actor_latent": False,
+                "detach_critic_latent": False,
+            },
+        )
+        defaults.update(overrides)
+        ppo = PPO(actor, critic, storage, **defaults)
+        return ppo, obs
+
+    def _rollout_and_update(self, ppo: PPO, obs: TensorDict) -> dict[str, float]:
+        """Run one rollout + update cycle."""
+        for _ in range(NUM_STEPS):
+            actions = ppo.act(obs)
+            assert actions.shape == (NUM_ENVS, NUM_ACTIONS)
+            ppo.process_env_step(obs, torch.randn(NUM_ENVS), torch.zeros(NUM_ENVS).byte(), {})
+        ppo.compute_returns(obs)
+        return ppo.update()
+
+    def test_actor_only_latent(self) -> None:
+        """Actor consumes the latent, critic stays a plain model on its own obs (asymmetric wiring)."""
+        ppo, obs = self._build_memory_ppo(actor_latent=True, critic_latent=False)
+        loss_dict = self._rollout_and_update(ppo, obs)
+        assert "value" in loss_dict
+        # memory trains through the actor loss only
+        assert any(p.grad is not None for p in ppo.memory.parameters())
+
+    def test_both_latent(self) -> None:
+        """Both heads consume the latent; the critic appends its own obs groups."""
+        ppo, obs = self._build_memory_ppo(actor_latent=True, critic_latent=True)
+        self._rollout_and_update(ppo, obs)
+
+    def test_detached_latents_leave_memory_untrained(self) -> None:
+        """With both consumers detached, no gradient reaches the memory."""
+        ppo, obs = self._build_memory_ppo(
+            actor_latent=True,
+            critic_latent=True,
+            memory_wiring={
+                "actor_latent": True,
+                "critic_latent": True,
+                "detach_actor_latent": True,
+                "detach_critic_latent": True,
+            },
+        )
+        self._rollout_and_update(ppo, obs)
+        assert all(p.grad is None for p in ppo.memory.parameters())
+
+    def test_non_recurrent_memory_uses_flat_minibatches(self) -> None:
+        """A TCN memory must not force the recurrent trajectory generator."""
+        ppo, obs = self._build_memory_ppo(actor_latent=True, critic_latent=False)
+        calls: list[str] = []
+        flat_gen, rec_gen = ppo.storage.mini_batch_generator, ppo.storage.recurrent_mini_batch_generator
+        ppo.storage.mini_batch_generator = lambda *a, **k: (calls.append("flat"), flat_gen(*a, **k))[1]
+        ppo.storage.recurrent_mini_batch_generator = lambda *a, **k: (calls.append("recurrent"), rec_gen(*a, **k))[1]
+        self._rollout_and_update(ppo, obs)
+        assert calls == ["flat"]
+
+    def test_no_consumer_raises(self) -> None:
+        """A memory nobody consumes is a configuration error."""
+        import pytest
+
+        with pytest.raises(ValueError, match="neither the actor nor the critic"):
+            self._build_memory_ppo(actor_latent=False, critic_latent=False)
+
+    def test_get_policy_chains_memory_only_for_consuming_actor(self) -> None:
+        """get_policy wraps the actor with the memory iff the actor consumes the latent."""
+        ppo, obs = self._build_memory_ppo(actor_latent=True, critic_latent=False)
+        policy = ppo.get_policy()
+        actions = policy(obs)
+        assert actions.shape == (NUM_ENVS, NUM_ACTIONS)
+        assert policy.is_recurrent is False  # TCN memory is window-based
+        ppo2, _obs2 = self._build_memory_ppo(actor_latent=False, critic_latent=True)
+        assert ppo2.get_policy() is ppo2._raw_actor

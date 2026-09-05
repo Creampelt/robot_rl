@@ -22,12 +22,11 @@ from robot_rl.utils import compile_model, resolve_callable, resolve_obs_groups, 
 class _SharedMemoryInferencePolicy(nn.Module):
     """Adapter that chains a shared memory module into actor inference."""
 
-    is_recurrent: bool = True
-
     def __init__(self, memory: nn.Module, actor: MLPModel) -> None:
         super().__init__()
         self.memory = memory
         self.actor = actor
+        self.is_recurrent: bool = getattr(memory, "is_recurrent", True)
 
     @property
     def output_mean(self) -> torch.Tensor:
@@ -51,7 +50,8 @@ class _SharedMemoryInferencePolicy(nn.Module):
 
     def forward(self, obs: TensorDict, *args: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         latent = self.memory(obs)
-        return self.actor.forward_from_latent(latent, *args, **kwargs)
+        # obs is also passed through so heads that append their own obs groups can extract them
+        return self.actor.forward_from_latent(latent, *args, obs=obs, **kwargs)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         self.memory.reset(dones)
@@ -94,8 +94,9 @@ class PPO:
         normalize_advantage_per_mini_batch: bool = False,
         adaptive_lr_once_per_iteration: bool = False,
         device: str = "cpu",
-        # Optional shared memory module (consumed by both actor and critic as heads)
+        # Optional shared memory module and its consumption wiring (see ``memory_wiring`` below)
         memory: nn.Module | None = None,
+        memory_wiring: dict | None = None,
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -129,23 +130,33 @@ class PPO:
 
         # Meta RL components
         self.meta_rl = meta_rl_cfg is not None
-        self.detach_critic_memory = False
         if meta_rl_cfg is not None:
             self.num_episodes_per_trial: int = meta_rl_cfg["num_episodes_per_trial"]
-            self.detach_critic_memory = meta_rl_cfg.get("detach_critic_memory", False)
             # Wait to initialize episode counter since we use data shape to get num_envs
             self.ep_counter: torch.Tensor | None = None
 
         # PPO components
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
-        # Shared memory (optional). When set, actor/critic must be MLP heads on top of the memory's latent.
+        # Shared memory (optional). Latent-consuming models must be MLP heads on top of the memory's latent.
         if memory is not None and (actor.is_recurrent or critic.is_recurrent):
             raise ValueError(
                 "Shared memory is not supported with recurrent actor/critic models. "
-                "When `meta_rl_cfg.memory` is set, actor and critic must be plain MLP heads."
+                "When a shared memory is configured, actor and critic must be plain MLP heads."
             )
         self.memory: nn.Module | None = memory.to(self.device) if memory is not None else None
+        # Wiring: which heads consume the latent and whether their losses backpropagate into the memory.
+        # Defaults preserve the legacy `meta_rl_cfg.memory` behavior (both heads consume, nothing detached).
+        wiring = memory_wiring or {}
+        self._mem_actor_latent: bool = wiring.get("actor_latent", True)
+        self._mem_critic_latent: bool = wiring.get("critic_latent", True)
+        self._detach_actor_latent: bool = wiring.get("detach_actor_latent", False)
+        self._detach_critic_latent: bool = wiring.get(
+            "detach_critic_latent",
+            meta_rl_cfg.get("detach_critic_memory", False) if isinstance(meta_rl_cfg, dict) else False,
+        )
+        if self.memory is not None and not (self._mem_actor_latent or self._mem_critic_latent):
+            raise ValueError("A shared memory is configured but neither the actor nor the critic consumes its latent.")
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.actor`` / ``self.critic`` / ``self.memory``.
@@ -195,9 +206,17 @@ class PPO:
                 self.transition.memory_hidden_state = self.memory.get_hidden_state()
             self.transition.hidden_states = (None, None)
             latent = self.memory(obs).detach()
-            self.transition.actions = self.actor.forward_from_latent(latent, stochastic_output=True).detach()
-            # Include additional critic obs for asymmetric actor-critic
-            self.transition.values = self.critic.forward_from_latent(latent, obs=obs).detach()
+            if self._mem_actor_latent:
+                self.transition.actions = self.actor.forward_from_latent(
+                    latent, obs=obs, stochastic_output=True
+                ).detach()
+            else:
+                self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+            if self._mem_critic_latent:
+                # Include additional critic obs for asymmetric actor-critic
+                self.transition.values = self.critic.forward_from_latent(latent, obs=obs).detach()
+            else:
+                self.transition.values = self.critic(obs).detach()
         else:
             try:
                 actor_hs = self.actor.get_hidden_state(batch_size=batch_size, device=device)
@@ -277,7 +296,7 @@ class PPO:
         """Compute return and advantage targets from stored transitions."""
         st = self.storage
         # Compute value for the last step
-        if self.memory is not None:
+        if self.memory is not None and self._mem_critic_latent:
             # Save the shared memory's hidden state before the extra forward pass
             memory_hidden_state = self.memory.get_hidden_state()
             latent = self.memory(obs).detach()
@@ -325,8 +344,9 @@ class PPO:
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
 
-        # Get mini-batch generator
-        if self.actor.is_recurrent or self.critic.is_recurrent or self.memory is not None:
+        # Get mini-batch generator. A non-recurrent (window-based) memory needs no trajectory batching.
+        memory_recurrent = self.memory is not None and getattr(self.memory, "is_recurrent", True)
+        if self.actor.is_recurrent or self.critic.is_recurrent or memory_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs, device=self.device
             )
@@ -353,17 +373,31 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with new parameters
             if self.memory is not None:
-                # Run shared memory once per mini-batch; both heads consume the same unpadded latent.
+                # Run shared memory once per mini-batch; all consuming heads share the same unpadded latent.
                 latent = self.memory(
                     batch.observations,
                     masks=batch.masks,
                     hidden_state=batch.memory_hidden_state,
                 )
-                self.actor.forward_from_latent(latent, stochastic_output=True)
+                if self._mem_actor_latent:
+                    actor_latent = latent.detach() if self._detach_actor_latent else latent
+                    self.actor.forward_from_latent(
+                        actor_latent, obs=batch.observations, masks=batch.masks, stochastic_output=True
+                    )
+                else:
+                    self.actor(
+                        batch.observations,
+                        masks=batch.masks,
+                        hidden_state=batch.hidden_states[0],
+                        stochastic_output=True,
+                    )
                 actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-                # Optionally stop the value loss from backpropagating into the shared memory
-                critic_latent = latent.detach() if self.detach_critic_memory else latent
-                values = self.critic.forward_from_latent(critic_latent, obs=batch.observations, masks=batch.masks)
+                if self._mem_critic_latent:
+                    # Optionally stop the value loss from backpropagating into the shared memory
+                    critic_latent = latent.detach() if self._detach_critic_latent else latent
+                    values = self.critic.forward_from_latent(critic_latent, obs=batch.observations, masks=batch.masks)
+                else:
+                    values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             else:
                 self.actor(
                     batch.observations,
@@ -581,8 +615,8 @@ class PPO:
 
         def query_actions() -> torch.Tensor:
             # query the actor (advancing the recurrent memory, if any) for one high-level decision
-            if self.memory is not None:
-                return self.actor.forward_from_latent(self.memory(obs), stochastic_output=stochastic)
+            if self.memory is not None and self._mem_actor_latent:
+                return self.actor.forward_from_latent(self.memory(obs), obs=obs, stochastic_output=stochastic)
             return self.actor(obs, stochastic_output=stochastic)
 
         with torch.inference_mode():
@@ -653,10 +687,10 @@ class PPO:
     def get_policy(self) -> nn.Module:
         """Get the policy model.
 
-        Wraps the actor with the shared memory module when configured, since the actor is then a head over a
-        precomputed latent and cannot consume raw obs.
+        Wraps the actor with the shared memory module when it consumes the memory latent, since the actor is
+        then a head over a precomputed latent and cannot consume raw obs alone.
         """
-        if self.memory is not None:
+        if self.memory is not None and self._mem_actor_latent:
             return _SharedMemoryInferencePolicy(self._raw_memory, self._raw_actor)
         return self._raw_actor
 
@@ -681,9 +715,22 @@ class PPO:
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
         critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
 
-        # Optional shared memory config
+        # Optional shared memory: top-level ``memory_cfg`` with consumption declared in ``obs_groups`` via the
+        # "memory_latent" pseudo-group; ``meta_rl_cfg.memory`` is the deprecated equivalent (actor consumes the
+        # latent alone, critic consumes latent + its own obs).
+        memory_cfg: dict | None = cfg.get("memory_cfg")
         meta_rl_cfg = cfg["algorithm"].get("meta_rl_cfg")
-        shared_memory_cfg: dict | None = meta_rl_cfg.get("memory") if isinstance(meta_rl_cfg, dict) else None
+        legacy_memory_cfg: dict | None = meta_rl_cfg.get("memory") if isinstance(meta_rl_cfg, dict) else None
+
+        # Strip "memory_latent" markers before group resolution; remember who consumes and who kept own groups.
+        latent_consumers = {s for s, groups in cfg["obs_groups"].items() if "memory_latent" in groups}
+        stripped = {s: [g for g in groups if g != "memory_latent"] for s, groups in cfg["obs_groups"].items()}
+        consumer_has_own_groups = {s: bool(stripped[s]) for s in latent_consumers}
+        cfg["obs_groups"] = {s: groups for s, groups in stripped.items() if groups}
+        if latent_consumers and memory_cfg is None:
+            raise ValueError("'memory_latent' appears in obs_groups but no 'memory_cfg' is configured.")
+        if memory_cfg is not None and not latent_consumers:
+            raise ValueError("'memory_cfg' is configured but no obs set lists 'memory_latent'.")
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
@@ -697,18 +744,45 @@ class PPO:
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
-        # Build the optional shared memory module first so we can size actor/critic heads from its latent_dim
+        # Build the optional shared memory module first so we can size the consuming heads from its latent_dim
         memory: nn.Module | None = None
+        memory_wiring: dict | None = None
         head_kwargs: dict = {}
         critic_head_kwargs: dict = {}
+        shared_memory_cfg: dict | None = None
+        if memory_cfg is not None:
+            shared_memory_cfg = dict(memory_cfg["model"])
+            # The memory reads its own "memory" obs set when declared, else the actor's
+            memory_set = "memory" if "memory" in cfg["obs_groups"] else "actor"
+            memory_wiring = {
+                "actor_latent": "actor" in latent_consumers,
+                "critic_latent": "critic" in latent_consumers,
+                "detach_actor_latent": memory_cfg.get("detach_actor_latent", False),
+                "detach_critic_latent": memory_cfg.get("detach_critic_latent", False),
+            }
+            actor_appends = consumer_has_own_groups.get("actor", False)
+            critic_appends = consumer_has_own_groups.get("critic", False)
+        elif legacy_memory_cfg is not None:
+            shared_memory_cfg = dict(legacy_memory_cfg)
+            memory_set = "actor"
+            memory_wiring = {
+                "actor_latent": True,
+                "critic_latent": True,
+                "detach_actor_latent": False,
+                "detach_critic_latent": meta_rl_cfg.get("detach_critic_memory", False),
+            }
+            actor_appends = False
+            critic_appends = True
         if shared_memory_cfg is not None:
             mem_class: type[MLPModel] = resolve_callable(shared_memory_cfg.pop("class_name"))  # type: ignore
-            memory = mem_class(obs, cfg["obs_groups"], "actor", 1, memory_only=True, **shared_memory_cfg).to(device)
+            memory = mem_class(obs, cfg["obs_groups"], memory_set, 1, memory_only=True, **shared_memory_cfg).to(device)
             print(f"Shared Memory Model: {memory}")
-            head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
-            # Critic consumes privileged obs + memory latent
-            critic_head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
-            critic_head_kwargs["append_obs_groups"] = True
+            if memory_wiring["actor_latent"]:
+                head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
+                head_kwargs["append_obs_groups"] = actor_appends
+            if memory_wiring["critic_latent"]:
+                critic_head_kwargs["input_dim_override"] = memory.latent_dim  # type: ignore[attr-defined]
+                critic_head_kwargs["append_obs_groups"] = critic_appends
 
         # Initialize the policy
         actor: MLPModel = actor_class(
@@ -739,6 +813,7 @@ class PPO:
             storage,
             device=device,
             memory=memory,
+            memory_wiring=memory_wiring,
             **cfg["algorithm"],
             multi_gpu_cfg=cfg["multi_gpu"],
         )

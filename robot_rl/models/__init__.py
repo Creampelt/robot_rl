@@ -11,6 +11,7 @@ from .cref_model import CrefModel
 from .fuse_model import FuseModel, ResidualFuseModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
+from .tcn_model import TCNModel
 from .txl_model import TXLModel
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     "MLPModel",
     "RNNModel",
     "ResidualFuseModel",
+    "TCNModel",
     "TXLModel",
 ]
