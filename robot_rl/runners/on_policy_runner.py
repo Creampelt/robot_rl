@@ -265,10 +265,10 @@ class OnPolicyRunner:
             raise ValueError(
                 f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
             )
-        # Validate multi-GPU configuration
-        if self.gpu_local_rank >= self.gpu_world_size:
+        # Validate multi-GPU configuration: the local rank is a GPU index, which a group sharing a node may offset
+        if self.gpu_local_rank >= torch.cuda.device_count():
             raise ValueError(
-                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+                f"Local rank '{self.gpu_local_rank}' has no GPU (device count {torch.cuda.device_count()})."
             )
         if self.gpu_global_rank >= self.gpu_world_size:
             raise ValueError(
