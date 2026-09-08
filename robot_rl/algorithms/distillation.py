@@ -61,6 +61,8 @@ class Distillation:
         # Distillation components
         self.student = student.to(self.device)
         self.teacher = teacher.to(self.device)
+        # a parameter-free teacher (its action comes from the observations) has no checkpoint to load
+        self.teacher_loaded = not any(True for _ in self.teacher.parameters())
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.student`` / ``self.teacher``.
