@@ -211,9 +211,13 @@ class Distillation:
         if load_cfg.get("student"):
             self._raw_student.load_state_dict(loaded_dict["student_state_dict"], strict=strict)
         if load_cfg.get("teacher"):
-            self._raw_teacher.load_state_dict(
-                loaded_dict.get("teacher_state_dict") or loaded_dict["actor_state_dict"], strict=strict
+            # an empty teacher_state_dict (parameter-free teacher) is still the teacher's, not an RL actor
+            teacher_sd = (
+                loaded_dict["teacher_state_dict"]
+                if "teacher_state_dict" in loaded_dict
+                else loaded_dict["actor_state_dict"]
             )
+            self._raw_teacher.load_state_dict(teacher_sd, strict=strict)
             self.teacher_loaded = True
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
