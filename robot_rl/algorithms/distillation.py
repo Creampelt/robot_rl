@@ -39,6 +39,8 @@ class Distillation:
         learning_rate: float = 1e-3,
         max_grad_norm: float | None = None,
         loss_type: str = "mse",
+        aux_obs_group: str | None = None,
+        aux_loss_weight: float = 1.0,
         optimizer: str = "adam",
         device: str = "cpu",
         # Distributed training parameters
@@ -60,9 +62,12 @@ class Distillation:
 
         # Distillation components
         self.student = student.to(self.device)
-        self.teacher = teacher.to(self.device)
+        # privileged supervision of the student's encoder (e.g. ball position), as in the SAC actor's aux head
+        self.aux_obs_group = aux_obs_group
+        self.aux_loss_weight = aux_loss_weight
         # a parameter-free teacher (its action comes from the observations) has no checkpoint to load
         self.teacher_loaded = not any(True for _ in self.teacher.parameters())
+        self.teacher = teacher.to(self.device)
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.student`` / ``self.teacher``.
@@ -128,6 +133,7 @@ class Distillation:
         """Run optimization epochs over stored batches and return mean losses."""
         self.num_updates += 1
         mean_behavior_loss = 0
+        mean_aux_loss = 0
         loss = 0
         cnt = 0
 
@@ -137,7 +143,8 @@ class Distillation:
             self.student.detach_hidden_state()
             for batch in self.storage.generator():
                 # Inference of the student for gradient computation
-                actions = self.student(batch.observations)
+                latent = self.student.get_latent(batch.observations)
+                actions = self.student.forward_from_latent(latent)
 
                 # Behavior cloning loss
                 behavior_loss = self.loss_fn(actions, batch.privileged_actions)
@@ -145,6 +152,11 @@ class Distillation:
                 # Total loss
                 loss = loss + behavior_loss
                 mean_behavior_loss += behavior_loss.item()
+                if self.aux_obs_group is not None:
+                    aux_pred = self.student.aux_prediction(latent)  # type: ignore[attr-defined]
+                    aux_loss = nn.functional.mse_loss(aux_pred, batch.observations[self.aux_obs_group])
+                    loss = loss + self.aux_loss_weight * aux_loss
+                    mean_aux_loss += aux_loss.item()
                 cnt += 1
 
                 # Gradient step
@@ -165,12 +177,15 @@ class Distillation:
                 self.student.detach_hidden_state(batch.dones.view(-1))
 
         mean_behavior_loss /= cnt
+        mean_aux_loss /= cnt
         self.storage.clear()
         self.last_hidden_states = (self.student.get_hidden_state(), self.teacher.get_hidden_state())
         self.student.detach_hidden_state()
 
         # Construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
+        if self.aux_obs_group is not None:
+            loss_dict["aux"] = mean_aux_loss
 
         return loss_dict
 
@@ -230,21 +245,13 @@ class Distillation:
     def eval(
         self, env: VecEnv, max_steps: int = 200, stochastic: bool = False, action_repeat: int = 1
     ) -> list[dict[str, torch.Tensor]]:
-        """Run a student rollout for ``max_steps`` env steps.
-
-        Signature matches :meth:`ppo.PPO.eval` so shared eval/recording callers work for either
-        algorithm; no learning, no transition storage.
+        """Roll out the student for ``max_steps`` env steps; API parity with :meth:`sac.SAC.eval`.
 
         Args:
             env: Vectorized environment to roll out in.
             max_steps: Number of environment steps to run.
-            stochastic: When ``False`` (default), act with the student's deterministic mean. When ``True``,
-                sample as during training.
-            action_repeat: Hold each queried action for this many ``env.step`` calls, re-querying the
-                student only every ``action_repeat`` steps. Default 1 = re-query every step.
-
-        Returns:
-            A list of per-batch info dicts; empty, as this rollout collects none.
+            stochastic: Act with the deterministic mean when False; sample the action when True.
+            action_repeat: Hold each queried action for this many ``env.step`` calls before re-querying.
         """
         was_training = self.student.training
         self.eval_mode()
@@ -254,7 +261,6 @@ class Distillation:
         obs = env.get_observations() if hasattr(env, "get_observations") else env.reset()[0]
         if hasattr(self.student, "reset"):
             self.student.reset()
-
         action_repeat = max(1, action_repeat)
 
         with torch.inference_mode():
@@ -302,6 +308,9 @@ class Distillation:
         cfg["algorithm"]["symmetry_cfg"] = None
 
         # Initialize the policy
+        aux_group = cfg["algorithm"].get("aux_obs_group")
+        if aux_group is not None:
+            cfg["student"]["aux_target_dim"] = obs[aux_group].shape[-1]
         student: MLPModel = student_class(obs, cfg["obs_groups"], "student", env.num_actions, **cfg["student"]).to(
             device
         )

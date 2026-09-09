@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from collections.abc import Callable, Iterable
@@ -71,6 +72,9 @@ class SAC:
         attn_target_group: str | None = None,
         attn_loss_weight: float = 1.0,
         perception_warmup_updates: int = 0,
+        reference_bc_weight: float = 0.0,
+        reference_bc_decay_updates: int = 0,
+        freeze_actor_encoder: bool = False,
         compile_mode: str | None = None,
         device: str = "cpu",
         rnd_cfg: dict | None = None,
@@ -131,6 +135,11 @@ class SAC:
         # updates during which the actor trains on its supervised targets only (RL term and alpha frozen),
         # so the head keeps its initial exploration until the encoder can see
         self.perception_warmup_updates = perception_warmup_updates
+        # fine-tuning a cloned student: pull the actor mean toward a frozen copy of it, fading out over
+        # reference_bc_decay_updates, so the first RL steps cannot exploit critic error off the student's data
+        self.reference_bc_weight = reference_bc_weight
+        self.reference_bc_decay_updates = reference_bc_decay_updates
+        self.reference_actor: nn.Module | None = None
         # mean |h| over rollout steps since the last update, to compare against the training-side state
         self._rollout_hidden_abs = torch.zeros((), device=device)
         self._rollout_hidden_steps = 0
@@ -145,6 +154,12 @@ class SAC:
         self.log_alpha.requires_grad_(auto_alpha)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_learning_rate) if auto_alpha else None
 
+        # head-only fine-tuning: the distilled encoder (CNN, RNN, normalizers) stays, RL moves the policy head alone
+        self.freeze_actor_encoder = freeze_actor_encoder
+        if freeze_actor_encoder:
+            for name, p in self.actor.named_parameters():
+                if not name.startswith(("mlp.", "distribution.", "aux_head.")):
+                    p.requires_grad_(False)
         # Optimizers over the trainable (online) parameters. Target params are frozen and excluded.
         self.actor_parameters = [p for p in self.actor.parameters() if p.requires_grad]
         self.critic_parameters = [
@@ -211,7 +226,9 @@ class SAC:
             next_terminated = dones_bool
 
         # Update normalizers on the observed next states.
-        self.actor.update_normalization(true_next_obs)
+        # a fine-tuned student keeps its normalizer: adapting it alone moves the actor off the frozen reference
+        if self.reference_actor is None:
+            self.actor.update_normalization(true_next_obs)
         self.critic_1.update_normalization(true_next_obs)
         self.critic_2.update_normalization(true_next_obs)
         if self.rnd:
@@ -353,6 +370,18 @@ class SAC:
             latent = latent.reshape(flat, -1)
             new_actions, logp = self.actor.act_and_log_prob_from_latent(latent)
             logp = logp.reshape(-1)
+            ref_bc = None
+            if self.reference_actor is not None:
+                with torch.no_grad():
+                    ref = self.reference_actor
+                    h0_ref = batch.init_hidden
+                    if burn > 0:
+                        _, h0_ref = ref.encode_sequence(obs[:burn], h0_ref, resets[:burn])
+                    ref_latent, _ = ref.encode_sequence(train_obs, h0_ref, train_resets)
+                    ref.distribution.update(ref.mlp(ref_latent.reshape(flat, -1)))  # type: ignore[attr-defined]
+                    ref_mean = ref.distribution.mean  # type: ignore[attr-defined]
+                # summed over action dims (TD3+BC scale): a per-dim mean was 256x too weak against the Q term
+                ref_bc = (self.actor.distribution.mean - ref_mean).pow(2).sum(-1).mean()  # type: ignore[attr-defined]
             with torch.no_grad():
                 _acc("Actor/logp", logp.mean())
                 attn_entropy = getattr(self.actor, "attention_entropy", lambda: None)()
@@ -380,6 +409,11 @@ class SAC:
                 rl_term = (self.log_alpha.exp().detach() * logp - min_q_pi).mean()
                 actor_loss = rl_term * 0.0 if warming_up else rl_term
                 _acc("Actor/warming_up", float(warming_up))
+                if ref_bc is not None:
+                    w = self._reference_bc_weight()
+                    actor_loss = actor_loss + w * ref_bc
+                    _acc("Actor/ref_bc_loss", ref_bc.detach())
+                    _acc("Actor/ref_bc_weight", w)
                 if self.aux_obs_group is not None:
                     target = train_obs[self.aux_obs_group].reshape(flat, -1)
                     pred = self.actor.aux_prediction(latent)  # type: ignore[attr-defined]
@@ -555,10 +589,22 @@ class SAC:
         critic_loss.backward()
         return critic_1_loss.detach(), critic_2_loss.detach()
 
+    def _reference_bc_weight(self) -> float:
+        """Return the current weight of the pull toward the frozen student (linear decay to zero, or constant)."""
+        if self.reference_bc_decay_updates <= 0:
+            return self.reference_bc_weight
+        return self.reference_bc_weight * max(0.0, 1.0 - self.update_step / self.reference_bc_decay_updates)
+
     def _update_actor(self, obs_b: TensorDict, new_actions: torch.Tensor, logp: torch.Tensor) -> torch.Tensor:
         """One actor gradient step against the frozen critics; returns the actor loss."""
         self.actor_optimizer.zero_grad()
         actor_loss = self._actor_loss_and_backward(obs_b, new_actions, logp).clone()
+        if self.reference_actor is not None:
+            with torch.no_grad():
+                ref_mean = self.reference_actor(obs_b)
+            ref_bc = self._reference_bc_weight() * (self.actor.distribution.mean - ref_mean).pow(2).sum(-1).mean()  # type: ignore[attr-defined]
+            ref_bc.backward()
+            actor_loss = actor_loss + ref_bc.detach()
         if self.is_multi_gpu:
             self.reduce_parameters(self.actor_parameters)
         nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
@@ -660,14 +706,32 @@ class SAC:
             saved["alpha_optimizer_state_dict"] = self.alpha_optimizer.state_dict()
         if self.rnd:
             saved["rnd_state_dict"] = self.rnd.state_dict()
+        if self.reference_actor is not None:
+            saved["reference_actor_state_dict"] = self.reference_actor.state_dict()
         return saved
 
     def load(self, loaded_dict: dict, load_cfg: dict | None = None, strict: bool = True) -> bool:
         """Load model/optimizer/temperature states; targets are re-synced from the loaded critics."""
+        from_student = "actor_state_dict" not in loaded_dict and "student_state_dict" in loaded_dict
+        if from_student:
+            # a distillation checkpoint: its student becomes the actor, everything else starts fresh
+            loaded_dict = {**loaded_dict, "actor_state_dict": loaded_dict["student_state_dict"]}
         if load_cfg is None:
-            load_cfg = {"actor": True, "critic": True, "optimizer": True, "iteration": True, "rnd": True}
-        if load_cfg.get("actor"):
+            full = "critic_1_state_dict" in loaded_dict
+            load_cfg = {"actor": True, "critic": full, "optimizer": full, "iteration": full, "rnd": full}
+        if load_cfg.get("actor") and from_student:
+            # the BC student has no aux head, so that stays fresh; any other mismatch is a wrong architecture
+            result = self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=False)
+            bad = [k for k in result.missing_keys if not k.startswith("aux_head")] + list(result.unexpected_keys)
+            if bad:
+                raise RuntimeError(f"student checkpoint does not match the actor: {bad}")
+        elif load_cfg.get("actor"):
             self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+        if load_cfg.get("actor") and self.reference_bc_weight > 0.0:
+            # the pull's target survives a resume; a checkpoint without one falls back to the actor as loaded
+            self.reference_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
+            if "reference_actor_state_dict" in loaded_dict:
+                self.reference_actor.load_state_dict(loaded_dict["reference_actor_state_dict"], strict=False)
         if load_cfg.get("critic"):
             self.critic_1.load_state_dict(loaded_dict["critic_1_state_dict"], strict=strict)
             self.critic_2.load_state_dict(loaded_dict["critic_2_state_dict"], strict=strict)
