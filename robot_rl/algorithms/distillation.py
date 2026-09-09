@@ -65,9 +65,9 @@ class Distillation:
         # privileged supervision of the student's encoder (e.g. ball position), as in the SAC actor's aux head
         self.aux_obs_group = aux_obs_group
         self.aux_loss_weight = aux_loss_weight
+        self.teacher = teacher.to(self.device)
         # a parameter-free teacher (its action comes from the observations) has no checkpoint to load
         self.teacher_loaded = not any(True for _ in self.teacher.parameters())
-        self.teacher = teacher.to(self.device)
 
         # Handles to the uncompiled modules for state_dict operations and export. If compilation is disabled, these
         # simply alias ``self.student`` / ``self.teacher``.
